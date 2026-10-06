@@ -25,11 +25,16 @@ import { useTranslation } from 'react-i18next'
 
 import { StatusBadge } from '@/components/status-badge'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
+import { toIntlLocale } from '@/i18n/languages'
 import { getUserAvatarFallback, getUserAvatarStyle } from '@/lib/avatar'
-import { formatTimestampToDate } from '@/lib/format'
+import {
+  formatLogQuota,
+  formatNumber,
+  formatTimestampToDate,
+} from '@/lib/format'
 import { cn } from '@/lib/utils'
 
-import { taskActionMapper, taskStatusMapper } from '../../lib/mappers'
+import { taskStatusMapper } from '../../lib/mappers'
 import type { TaskLog } from '../../types'
 import { TaskDetailsDialog } from '../dialogs/task-details-dialog'
 import { PluginAuthorLink } from '../plugin-author-link'
@@ -86,31 +91,30 @@ export function useTaskLogsColumns(
   isAdmin: boolean,
   isRoot: boolean
 ): ColumnDef<TaskLog>[] {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   return useMemo(() => {
     const columns: ColumnDef<TaskLog>[] = [
       {
         accessorKey: 'submit_time',
-        header: t('Submit Time'),
-        cell: ({ row }) => {
-          const log = row.original
-          const submitTime = row.getValue('submit_time') as number
-
-          return (
-            <div className='flex min-w-0 flex-col gap-0.5'>
-              <span className='truncate font-mono text-xs tabular-nums'>
-                {formatTimestampToDate(submitTime, 'seconds')}
-              </span>
-              {log.finish_time ? (
-                <span className='text-muted-foreground/60 truncate font-mono text-[11px] tabular-nums'>
-                  {formatTimestampToDate(log.finish_time, 'seconds')}
-                </span>
-              ) : (
-                <span className='text-muted-foreground/50 text-[11px]'>-</span>
-              )}
-            </div>
-          )
-        },
+        header: t('Created At'),
+        cell: ({ row }) => (
+          <span className='truncate font-mono text-xs tabular-nums'>
+            {formatTimestampToDate(row.original.submit_time, 'seconds')}
+          </span>
+        ),
+        size: 180,
+      },
+      {
+        accessorKey: 'finish_time',
+        header: t('Finished At'),
+        cell: ({ row }) => (
+          <span className='truncate font-mono text-xs tabular-nums'>
+            {row.original.finish_time
+              ? formatTimestampToDate(row.original.finish_time, 'seconds')
+              : '-'}
+          </span>
+        ),
         size: 180,
       },
     ]
@@ -202,7 +206,6 @@ export function useTaskLogsColumns(
         accessorKey: 'task_id',
         header: t('Task ID'),
         cell: ({ row }) => {
-          const log = row.original
           const taskId = row.getValue('task_id') as string
           if (!taskId) {
             return <span className='text-muted-foreground/60 text-xs'>-</span>
@@ -216,13 +219,57 @@ export function useTaskLogsColumns(
                 size='sm'
                 className='border-border/60 bg-muted/30 !text-foreground max-w-full truncate rounded-md border px-1.5 py-0.5 font-mono'
               />
-              <span className='text-muted-foreground/60 truncate text-[11px]'>
-                {t(log.platform)} · {t(taskActionMapper.getLabel(log.action))}
-              </span>
             </div>
           )
         },
         meta: { mobileTitle: true },
+      },
+      {
+        id: 'model',
+        header: t('Model'),
+        accessorFn: (log) => {
+          const properties = log.properties
+          if (isAdmin) {
+            return (
+              properties?.upstream_model_name ||
+              properties?.origin_model_name ||
+              '-'
+            )
+          }
+          return properties?.origin_model_name || '-'
+        },
+        cell: ({ row }) => {
+          const properties = row.original.properties
+          if (!isAdmin) {
+            return (
+              <span className='block max-w-[200px] truncate text-xs'>
+                {properties?.origin_model_name || '-'}
+              </span>
+            )
+          }
+          return (
+            <div className='flex max-w-[240px] flex-col gap-0.5 text-xs'>
+              <span className='truncate'>
+                {t('Request Model')}: {properties?.origin_model_name || '-'}
+              </span>
+              <span className='text-muted-foreground truncate'>
+                {t('Actual Model')}: {properties?.upstream_model_name || '-'}
+              </span>
+            </div>
+          )
+        },
+      },
+      {
+        id: 'cost',
+        header: t('Cost'),
+        accessorFn: (log) => log.quota,
+        cell: ({ row }) => (
+          <span className='font-mono text-xs tabular-nums'>
+            {['SUCCESS', 'FAILURE'].includes(row.original.status)
+              ? formatLogQuota(row.original.quota)
+              : '—'}
+          </span>
+        ),
       },
       createDurationColumn<TaskLog>({
         submitTimeKey: 'submit_time',
@@ -251,6 +298,52 @@ export function useTaskLogsColumns(
       },
       createProgressColumn<TaskLog>({ headerLabel: t('Progress') }),
       {
+        id: 'resolution',
+        header: t('Resolution'),
+        accessorFn: (log) => log.video_info?.resolution,
+        cell: ({ row }) => (
+          <span className='text-xs'>
+            {row.original.video_info?.resolution || '-'}
+          </span>
+        ),
+      },
+      {
+        id: 'duration_seconds',
+        header: t('Duration (seconds)'),
+        accessorFn: (log) => log.video_info?.duration_seconds,
+        cell: ({ row }) => (
+          <span className='font-mono text-xs tabular-nums'>
+            {formatNumber(row.original.video_info?.duration_seconds, locale)}
+          </span>
+        ),
+      },
+      {
+        id: 'has_reference_video',
+        header: t('Has Reference Video'),
+        accessorFn: (log) => log.video_info?.has_reference_video,
+        cell: ({ row }) => {
+          const hasReferenceVideo = row.original.video_info?.has_reference_video
+          if (hasReferenceVideo == null) {
+            return <span className='text-xs'>-</span>
+          }
+          return (
+            <span className='text-xs'>
+              {hasReferenceVideo ? t('Yes') : t('No')}
+            </span>
+          )
+        },
+      },
+      {
+        id: 'consumed_tokens',
+        header: t('Consumed Tokens'),
+        accessorFn: (log) => log.video_info?.consumed_tokens,
+        cell: ({ row }) => (
+          <span className='font-mono text-xs tabular-nums'>
+            {formatNumber(row.original.video_info?.consumed_tokens, locale)}
+          </span>
+        ),
+      },
+      {
         id: 'artifacts',
         header: t('Artifacts'),
         cell: ({ row }) => (
@@ -275,6 +368,33 @@ export function useTaskLogsColumns(
       }
     )
 
-    return columns
-  }, [t, isAdmin, isRoot])
+    const columnOrder = [
+      'task_id',
+      'user',
+      'model',
+      'cost',
+      'duration',
+      'status',
+      'progress',
+      'resolution',
+      'duration_seconds',
+      'has_reference_video',
+      'consumed_tokens',
+      'channel_id',
+      'plugin',
+      'submit_time',
+      'finish_time',
+      'artifacts',
+      'fail_reason',
+    ]
+    return columns.sort((left, right) => {
+      const leftId = left.id ?? ('accessorKey' in left ? left.accessorKey : '')
+      const rightId =
+        right.id ?? ('accessorKey' in right ? right.accessorKey : '')
+      return (
+        columnOrder.indexOf(String(leftId)) -
+        columnOrder.indexOf(String(rightId))
+      )
+    })
+  }, [t, locale, isAdmin, isRoot])
 }

@@ -47,6 +47,7 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet'
 import { Skeleton } from '@/components/ui/skeleton'
+import { TableCell, TableRow } from '@/components/ui/table'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { getPerfMetrics } from '@/features/performance-metrics/api'
 import {
@@ -73,6 +74,7 @@ import {
   getDynamicPricingSummary,
   getDynamicPricingTiers,
   getTaskUsageQuantityUnitLabelKey,
+  hasDynamicRequestRules,
   isDynamicPricingModel,
   isUnconfiguredTaskUsageModel,
   type DynamicPriceEntry,
@@ -86,9 +88,13 @@ import {
   getTaskEnumFields,
   getTaskNumberFields,
 } from '../lib/task-expr'
-import { getTaskPricingDisplayTiers } from '../lib/task-matrix-display'
+import {
+  getTaskMatrixDisplayTiers,
+  getTaskPricingDisplayTiers,
+} from '../lib/task-matrix-display'
 import {
   hasSimpleTaskPricing,
+  taskEnumLabel,
   taskPriceLabel,
   taskUsageUnitLabel,
   taskTierConditions,
@@ -717,27 +723,33 @@ function PriceSection(props: {
       return (
         <section>
           <SectionTitle>{t('Base Price')}</SectionTitle>
-          <div className='rounded-lg border border-amber-200/70 bg-amber-50/70 p-3 dark:border-amber-500/20 dark:bg-amber-500/10'>
-            <div className='text-sm font-medium text-amber-800 dark:text-amber-200'>
-              {t('Special billing expression')}
-            </div>
-            <p className='text-muted-foreground mt-1 text-xs'>
-              {t(
-                pricingDisplayFallbackKey(
-                  dynamicSummary.rawExpression,
-                  props.model.billing_usage_schema
-                )
-              )}
+          {dynamicSummary.isTaskUsage ? (
+            <p className='text-muted-foreground text-sm'>
+              {t('Pricing details cannot be displayed for this model.')}
             </p>
-            <div className='mt-3'>
-              <div className='text-muted-foreground mb-1 text-[10px] font-medium tracking-wider uppercase'>
-                {t('Raw expression')}
+          ) : (
+            <div className='rounded-lg border border-amber-200/70 bg-amber-50/70 p-3 dark:border-amber-500/20 dark:bg-amber-500/10'>
+              <div className='text-sm font-medium text-amber-800 dark:text-amber-200'>
+                {t('Special billing expression')}
               </div>
-              <code className='text-muted-foreground bg-background/80 block max-h-28 overflow-auto rounded-md border px-2 py-1.5 font-mono text-xs break-all'>
-                {dynamicSummary.rawExpression}
-              </code>
+              <p className='text-muted-foreground mt-1 text-xs'>
+                {t(
+                  pricingDisplayFallbackKey(
+                    dynamicSummary.rawExpression,
+                    props.model.billing_usage_schema
+                  )
+                )}
+              </p>
+              <div className='mt-3'>
+                <div className='text-muted-foreground mb-1 text-[10px] font-medium tracking-wider uppercase'>
+                  {t('Raw expression')}
+                </div>
+                <code className='text-muted-foreground bg-background/80 block max-h-28 overflow-auto rounded-md border px-2 py-1.5 font-mono text-xs break-all'>
+                  {dynamicSummary.rawExpression}
+                </code>
+              </div>
             </div>
-          </div>
+          )}
         </section>
       )
     }
@@ -1064,6 +1076,12 @@ function ProviderGroupPricingSection(
 
   const isTokenBased = isTokenBasedModel(props.model)
   const tokenUnitLabel = props.tokenUnit === 'K' ? '1K' : '1M'
+  const currency = useSystemConfigStore((state) => state.config.currency)
+  let currencySymbol = '$'
+  if (currency.quotaDisplayType === 'CNY') currencySymbol = '¥'
+  if (currency.quotaDisplayType === 'CUSTOM') {
+    currencySymbol = currency.customCurrencySymbol || '¤'
+  }
 
   const extraPriceTypes = useMemo(() => {
     const types: { label: string; type: PriceType }[] = []
@@ -1110,12 +1128,65 @@ function ProviderGroupPricingSection(
   )
 
   if (isDynamicPricingModel(props.model)) {
-    const dynamicTiers = props.model.billing_usage_schema
-      ? getTaskPricingDisplayTiers(
-          props.model.billing_expr,
-          props.model.billing_usage_schema
-        )
-      : getDynamicPricingTiers(props.model)
+    const taskMatrix =
+      props.model.billing_usage_schema && !hasSimpleTaskPricing(props.model)
+        ? getTaskMatrixDisplayTiers(
+            props.model.billing_expr,
+            props.model.billing_usage_schema
+          )
+        : null
+    const matrixFields = taskMatrix
+      ? Object.entries(props.model.billing_usage_schema ?? {})
+          .filter(
+            ([field, definition]) =>
+              (definition.type === 'boolean' || definition.enum?.length) &&
+              taskMatrix.some((tier) =>
+                tier.conditions.some((condition) => condition.field === field)
+              )
+          )
+          .sort(([left, leftDefinition], [right, rightDefinition]) => {
+            if (leftDefinition.type !== rightDefinition.type) {
+              if (leftDefinition.type === 'boolean') return -1
+              if (rightDefinition.type === 'boolean') return 1
+            }
+            if (left === 'video_input') return -1
+            if (right === 'video_input') return 1
+            return left.localeCompare(right)
+          })
+      : []
+    let dynamicTiers: DynamicPricingTier[]
+    if (taskMatrix) {
+      dynamicTiers = [...taskMatrix].sort((left, right) => {
+        for (const [field, definition] of matrixFields) {
+          const leftValue = left.conditions.find(
+            (condition) => condition.field === field
+          )?.value
+          const rightValue = right.conditions.find(
+            (condition) => condition.field === field
+          )?.value
+          if (leftValue !== rightValue) {
+            if (definition.type === 'boolean') {
+              return leftValue === 'true' ? -1 : 1
+            }
+            if (field === 'video_input') {
+              return leftValue === 'video' ? -1 : 1
+            }
+          }
+          const order =
+            (definition.enum?.indexOf(leftValue ?? '') ?? -1) -
+            (definition.enum?.indexOf(rightValue ?? '') ?? -1)
+          if (order) return order
+        }
+        return 0
+      })
+    } else if (props.model.billing_usage_schema) {
+      dynamicTiers = getTaskPricingDisplayTiers(
+        props.model.billing_expr,
+        props.model.billing_usage_schema
+      )
+    } else {
+      dynamicTiers = getDynamicPricingTiers(props.model)
+    }
     const hasRequestPrice = dynamicTiers.some(
       (tier) => !('unitPrices' in tier) && tier.billingUnit === 'request'
     )
@@ -1127,27 +1198,33 @@ function ProviderGroupPricingSection(
             <SectionTitle>{t('Pricing by Group')}</SectionTitle>
           )}
           <AutoGroupChain model={props.model} autoGroups={props.autoGroups} />
-          <div className='rounded-lg border border-amber-200/70 bg-amber-50/70 p-3 dark:border-amber-500/20 dark:bg-amber-500/10'>
-            <div className='text-sm font-medium text-amber-800 dark:text-amber-200'>
-              {t('Special billing expression')}
-            </div>
-            <p className='text-muted-foreground mt-1 text-xs'>
-              {t(
-                pricingDisplayFallbackKey(
-                  props.model.billing_expr || '',
-                  props.model.billing_usage_schema
-                )
-              )}
+          {props.model.billing_usage_schema ? (
+            <p className='text-muted-foreground text-sm'>
+              {t('Pricing details cannot be displayed for this model.')}
             </p>
-            <div className='mt-3'>
-              <div className='text-muted-foreground mb-1 text-[10px] font-medium tracking-wider uppercase'>
-                {t('Raw expression')}
+          ) : (
+            <div className='rounded-lg border border-amber-200/70 bg-amber-50/70 p-3 dark:border-amber-500/20 dark:bg-amber-500/10'>
+              <div className='text-sm font-medium text-amber-800 dark:text-amber-200'>
+                {t('Special billing expression')}
               </div>
-              <code className='text-muted-foreground bg-background/80 block max-h-28 overflow-auto rounded-md border px-2 py-1.5 font-mono text-xs break-all'>
-                {props.model.billing_expr}
-              </code>
+              <p className='text-muted-foreground mt-1 text-xs'>
+                {t(
+                  pricingDisplayFallbackKey(
+                    props.model.billing_expr || '',
+                    props.model.billing_usage_schema
+                  )
+                )}
+              </p>
+              <div className='mt-3'>
+                <div className='text-muted-foreground mb-1 text-[10px] font-medium tracking-wider uppercase'>
+                  {t('Raw expression')}
+                </div>
+                <code className='text-muted-foreground bg-background/80 block max-h-28 overflow-auto rounded-md border px-2 py-1.5 font-mono text-xs break-all'>
+                  {props.model.billing_expr}
+                </code>
+              </div>
             </div>
-          </div>
+          )}
         </section>
       )
     }
@@ -1165,6 +1242,27 @@ function ProviderGroupPricingSection(
       groupRatioMultiplier: 1,
       usageSchema: props.model.billing_usage_schema,
     })
+    const videoInputField = matrixFields.find(([field]) =>
+      ['has_video_input', 'video_input'].includes(field)
+    )
+    const resolutionField = matrixFields.find(([field]) =>
+      ['resolution_tier', 'resolution'].includes(field)
+    )
+    const tokenPriceField = priceFields.find(
+      (field) => field.unit === 'token' && field.labelKind === 'schema'
+    )
+    const showVideoPriceTable = Boolean(
+      taskMatrix &&
+      videoInputField &&
+      resolutionField &&
+      tokenPriceField &&
+      matrixFields.length === 2 &&
+      priceFields.length === 1 &&
+      (videoInputField[1].type === 'boolean' ||
+        (videoInputField[1].enum?.length === 2 &&
+          videoInputField[1].enum.includes('video') &&
+          videoInputField[1].enum.includes('none')))
+    )
     const formattedPricesByGroup = new Map(
       availableGroups.map((group) => {
         const ratio = props.groupRatio[group] || 1
@@ -1211,10 +1309,123 @@ function ProviderGroupPricingSection(
                   getRowKey={(tier, tierIndex) =>
                     `${group}-${tier.label}-${tierIndex}`
                   }
+                  renderRow={
+                    showVideoPriceTable &&
+                    videoInputField &&
+                    resolutionField &&
+                    tokenPriceField
+                      ? (tier, tierIndex) => {
+                          const rows = dynamicTiers as ParsedTaskTier[]
+                          const inputValue = rows[tierIndex].conditions.find(
+                            (condition) =>
+                              condition.field === videoInputField[0]
+                          )?.value
+                          const previousTier = rows[tierIndex - 1]
+                          const isFirstRow =
+                            !previousTier ||
+                            previousTier.conditions.find(
+                              (condition) =>
+                                condition.field === videoInputField[0]
+                            )?.value !== inputValue
+                          let rowSpan = 0
+                          if (isFirstRow) {
+                            for (
+                              let index = tierIndex;
+                              index < rows.length;
+                              index++
+                            ) {
+                              if (
+                                rows[index].conditions.find(
+                                  (condition) =>
+                                    condition.field === videoInputField[0]
+                                )?.value !== inputValue
+                              ) {
+                                break
+                              }
+                              rowSpan++
+                            }
+                          }
+                          const includesVideo =
+                            videoInputField[1].type === 'boolean'
+                              ? inputValue === 'true'
+                              : inputValue === 'video'
+                          const resolution = rows[tierIndex].conditions.find(
+                            (condition) =>
+                              condition.field === resolutionField[0]
+                          )?.value
+                          return (
+                            <TableRow>
+                              {isFirstRow && (
+                                <TableCell
+                                  rowSpan={rowSpan}
+                                  className='text-muted-foreground border-r py-2.5 align-middle'
+                                >
+                                  {includesVideo
+                                    ? t('Includes video')
+                                    : t('Excludes video')}
+                                </TableCell>
+                              )}
+                              <TableCell className='text-muted-foreground py-2.5'>
+                                {resolution
+                                  ? taskEnumLabel(
+                                      resolutionField[1],
+                                      resolution,
+                                      i18n.language
+                                    )
+                                  : '-'}
+                              </TableCell>
+                              <TableCell className='py-2.5 text-right font-mono'>
+                                {formattedPricesByTier
+                                  .get(tier)
+                                  ?.get(tokenPriceField.field) ?? '-'}
+                              </TableCell>
+                            </TableRow>
+                          )
+                        }
+                      : undefined
+                  }
                   columns={[
-                    ...(hasSimpleTaskPricing(props.model)
-                      ? []
-                      : [
+                    ...matrixFields.map(([field, definition]) => {
+                      let header = taskPriceLabel(
+                        definition.description,
+                        field,
+                        i18n.language
+                      )
+                      if (
+                        showVideoPriceTable &&
+                        field === videoInputField?.[0]
+                      ) {
+                        header = t('Input type')
+                      } else if (
+                        showVideoPriceTable &&
+                        field === resolutionField?.[0]
+                      ) {
+                        header = t('Output resolution')
+                      }
+                      return {
+                        id: field,
+                        header,
+                        className: thClass,
+                        cellClassName: 'text-muted-foreground py-2.5',
+                        cell: (tier: DynamicPricingTier) => {
+                          if (!('unitPrices' in tier)) return '-'
+                          const value = (
+                            tier as ParsedTaskTier
+                          ).conditions.find(
+                            (condition) => condition.field === field
+                          )?.value
+                          if (definition.type === 'boolean') {
+                            return value === 'true' ? t('Yes') : t('No')
+                          }
+                          return value
+                            ? taskEnumLabel(definition, value, i18n.language)
+                            : '-'
+                        },
+                      }
+                    }),
+                    ...(matrixFields.length === 0 &&
+                    !hasSimpleTaskPricing(props.model)
+                      ? [
                           {
                             id: 'tier',
                             header: props.model.billing_usage_schema
@@ -1245,7 +1456,8 @@ function ProviderGroupPricingSection(
                               return tier.label || t('Default')
                             },
                           },
-                        ]),
+                        ]
+                      : []),
                     ...priceFields.map((fieldEntry) => {
                       const unitLabelKey =
                         getDynamicPriceUnitLabelKey(fieldEntry)
@@ -1265,16 +1477,25 @@ function ProviderGroupPricingSection(
                         ) : (
                           t(fieldEntry.shortLabel)
                         )
-                      return {
-                        id: fieldEntry.field,
-                        header: unitLabel ? (
+                      let header: React.ReactNode = fieldLabel
+                      if (
+                        showVideoPriceTable &&
+                        fieldEntry.field === tokenPriceField?.field
+                      ) {
+                        header = t('Output ({{symbol}}/1M token)', {
+                          symbol: currencySymbol,
+                        })
+                      } else if (unitLabel) {
+                        header = (
                           <>
                             {fieldLabel}
                             {` / ${unitLabel}`}
                           </>
-                        ) : (
-                          fieldLabel
-                        ),
+                        )
+                      }
+                      return {
+                        id: fieldEntry.field,
+                        header,
                         className: `${thClass} text-right`,
                         cellClassName: 'py-2.5 text-right font-mono',
                         cell: (tier: (typeof dynamicTiers)[number]) =>
@@ -1481,6 +1702,10 @@ export function ModelDetailsContent(props: ModelDetailsContentProps) {
     props.model.billing_expr,
     props.model.billing_usage_schema
   )
+  const taskMatrix = getTaskMatrixDisplayTiers(
+    props.model.billing_expr,
+    props.model.billing_usage_schema
+  )
   const showBasePrices =
     !props.model.billing_usage_schema ||
     simpleTaskPricing ||
@@ -1521,17 +1746,21 @@ export function ModelDetailsContent(props: ModelDetailsContentProps) {
                 showRechargePrice={showRechargePrice}
               />
             )}
-            {isDynamic && !simpleTaskPricing && (
-              <DynamicPricingBreakdown
-                billingExpr={props.model.billing_expr}
-                usageSchema={props.model.billing_usage_schema}
-                taskPriceOptions={{
-                  showRechargePrice,
-                  priceRate: props.priceRate,
-                  usdExchangeRate: props.usdExchangeRate,
-                }}
-              />
-            )}
+            {isDynamic &&
+              !simpleTaskPricing &&
+              (!props.model.billing_usage_schema ||
+                (taskTiers.length > 0 &&
+                  (!taskMatrix || hasDynamicRequestRules(props.model)))) && (
+                <DynamicPricingBreakdown
+                  billingExpr={props.model.billing_expr}
+                  usageSchema={props.model.billing_usage_schema}
+                  taskPriceOptions={{
+                    showRechargePrice,
+                    priceRate: props.priceRate,
+                    usdExchangeRate: props.usdExchangeRate,
+                  }}
+                />
+              )}
             <GroupPricingSection
               model={props.model}
               groupRatio={props.groupRatio}

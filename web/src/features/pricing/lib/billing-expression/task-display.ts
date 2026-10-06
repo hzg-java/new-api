@@ -50,6 +50,16 @@ function taskDisplayCondition(
     if (value === null) return null
     return typeof value === 'boolean' ? !value : `!(${value})`
   }
+  if (
+    node.kind === 'call' &&
+    node.name === 'u' &&
+    node.args[0].kind === 'literal' &&
+    typeof node.args[0].value === 'string' &&
+    context.schema[node.args[0].value]?.type === 'boolean'
+  ) {
+    const value = context.facts[node.args[0].value]
+    return typeof value === 'boolean' ? value : null
+  }
   if (node.kind !== 'binary') return null
   if (node.operator === '&&' || node.operator === '||') {
     const left = taskDisplayCondition(node.left, context)

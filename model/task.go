@@ -5,13 +5,16 @@ import (
 	"context"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	hostdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"gorm.io/gorm"
 )
 
 type TaskStatus string
@@ -115,6 +118,7 @@ type TaskPrivateData struct {
 	// Execution records safe, immutable request provenance. It lives next to
 	// other private task state so public task DTOs cannot expose it by accident.
 	Execution *TaskExecutionSnapshot `json:"execution,omitempty"`
+	VideoInfo *hostdto.TaskVideoInfo `json:"video_info,omitempty"`
 	// 计费上下文：用于异步退款/差额结算（轮询阶段读取）
 	BillingSource  string              `json:"billing_source,omitempty"`  // "wallet" 或 "subscription"
 	SubscriptionId int                 `json:"subscription_id,omitempty"` // 订阅 ID，用于订阅退款
@@ -211,7 +215,7 @@ func (p *TaskPrivateData) Scan(val any) error {
 
 func (p TaskPrivateData) Value() (driver.Value, error) {
 	if p.Key == "" && p.UpstreamTaskID == "" && p.ResultURL == "" &&
-		p.Execution == nil && p.BillingSource == "" && p.SubscriptionId == 0 &&
+		p.Execution == nil && p.VideoInfo == nil && p.BillingSource == "" && p.SubscriptionId == 0 &&
 		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil &&
 		!p.ResponsesBackground && len(p.PluginState) == 0 && p.PollFailures == 0 &&
 		!p.ResultDiscarded {
@@ -494,7 +498,26 @@ func (Task *Task) InsertWithContext(ctx context.Context, omitColumns ...string) 
 	if len(omitColumns) > 0 {
 		tx = tx.Omit(omitColumns...)
 	}
-	return tx.Create(Task).Error
+	if Task.PrivateData.VideoInfo == nil {
+		return tx.Create(Task).Error
+	}
+	info := Task.PrivateData.VideoInfo
+	payload, err := common.Marshal(map[string]any{
+		"model":      Task.Properties.OriginModelName,
+		"video_info": &hostdto.TaskVideoInfo{Resolution: info.Resolution, DurationSeconds: info.DurationSeconds, HasReferenceVideo: info.HasReferenceVideo},
+	})
+	if err != nil {
+		return err
+	}
+	if len(payload) > 4096 {
+		return errors.New("task event exceeds storage limit")
+	}
+	return tx.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(Task).Error; err != nil {
+			return err
+		}
+		return tx.Create(&TaskEvent{TaskID: Task.ID, Kind: "request", Timestamp: Task.SubmitTime, Payload: string(payload)}).Error
+	})
 }
 
 type taskSnapshot struct {
@@ -556,10 +579,19 @@ func (t *Task) UpdateQuota() error {
 // zero rows, which silently bypasses the CAS guard.
 func (t *Task) UpdateWithStatus(fromStatus TaskStatus) (bool, error) {
 	result := DB.Model(t).Where("status = ?", fromStatus).Select("*").Updates(t)
-	if result.Error != nil {
+	if result.Error != nil || result.RowsAffected == 0 {
 		return false, result.Error
 	}
-	return result.RowsAffected > 0, nil
+	if fromStatus != t.Status && (t.Status == TaskStatusSuccess || t.Status == TaskStatusFailure) {
+		timestamp := t.FinishTime
+		if timestamp == 0 {
+			timestamp = time.Now().Unix()
+		}
+		if err := RecordTaskEvent(t.ID, "result", timestamp, TaskResultEventPayload(t)); err != nil {
+			common.SysError("record task result event: " + err.Error())
+		}
+	}
+	return true, nil
 }
 
 // TaskBulkUpdateByID performs an unconditional bulk UPDATE by primary key IDs.
@@ -571,9 +603,22 @@ func TaskBulkUpdateByID(ids []int64, params map[string]any) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	return DB.Model(&Task{}).
-		Where("id in (?)", ids).
-		Updates(params).Error
+	var pending []Task
+	if params["status"] == string(TaskStatusFailure) {
+		if err := DB.Select("id", "task_id", "status").Where("id IN ? AND status NOT IN ?", ids, []TaskStatus{TaskStatusFailure, TaskStatusSuccess}).Find(&pending).Error; err != nil {
+			return err
+		}
+	}
+	if err := DB.Model(&Task{}).Where("id in (?)", ids).Updates(params).Error; err != nil {
+		return err
+	}
+	for i := range pending {
+		pending[i].Status = TaskStatusFailure
+		if err := RecordTaskEvent(pending[i].ID, "result", time.Now().Unix(), TaskResultEventPayload(&pending[i])); err != nil {
+			common.SysError("record bulk task result event: " + err.Error())
+		}
+	}
+	return nil
 }
 
 type TaskQuotaUsage struct {

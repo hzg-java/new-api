@@ -280,6 +280,19 @@ describe('task artifact projection', () => {
 })
 
 describe('legacy task preview compatibility', () => {
+  test('preserves audio preview when the user log omits its platform and data', () => {
+    assert.equal(
+      resolveTaskPreviewMode(
+        taskFixture({
+          platform: '',
+          data: undefined,
+          legacy_audio_available: true,
+          admin_info: undefined,
+        })
+      ),
+      'legacy-suno'
+    )
+  })
   test('preserves old Suno and video previews without duplicating plugin previews', () => {
     assert.equal(
       resolveTaskPreviewMode(

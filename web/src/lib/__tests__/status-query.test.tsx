@@ -22,6 +22,7 @@ import type { ReactNode } from 'react'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 
 import { useStatus } from '@/hooks/use-status'
+import { useTopNavLinks } from '@/hooks/use-top-nav-links'
 import { api } from '@/lib/api'
 import {
   getModuleAccessForGuard,
@@ -90,6 +91,44 @@ afterEach(() => {
 })
 
 describe('shared status query deduplication', () => {
+  test.each([
+    ['https://docs.newapi.ai/', '/docs'],
+    ['', '/docs'],
+  ])(
+    'keeps Docs visible when disabled by backend with address %s',
+    (docsLink, expected) => {
+      const queryClient = createQueryClient()
+      queryClient.setQueryData(STATUS_QUERY_KEY, {
+        HeaderNavModules: { docs: false },
+        docs_link: docsLink,
+      })
+      const hook = renderHook(() => useTopNavLinks(), {
+        wrapper: wrapper(queryClient),
+      })
+      expect(
+        hook.result.current.find((link) => link.title === 'Docs')
+      ).toMatchObject({
+        href: expected,
+        external: false,
+      })
+    }
+  )
+
+  test.each([
+    [undefined, '/qiyuan-logo.svg'],
+    ['', '/qiyuan-logo.svg'],
+    ['/custom-logo.svg', '/custom-logo.svg'],
+  ])(
+    'uses the site logo fallback while preserving custom logo %s',
+    async (logo, expected) => {
+      apiClient.get = async () => ({
+        data: { success: true, data: { system_name: '启元', logo } },
+      })
+      await ensureStatus(createQueryClient())
+      expect(useSystemConfigStore.getState().config.logo).toBe(expected)
+    }
+  )
+
   test.each(['cold', 'stale'] as const)(
     'deduplicates %s cache requests across guards and hook consumers',
     async (cacheState) => {

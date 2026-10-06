@@ -22,6 +22,7 @@ import userEvent from '@testing-library/user-event'
 import i18next from 'i18next'
 import { afterEach, expect, it, vi } from 'vitest'
 
+import zhCN from '@/i18n/locales/zh.json'
 import { api } from '@/lib/api'
 import {
   DEFAULT_CURRENCY_CONFIG,
@@ -163,6 +164,298 @@ it('explains missing task metadata while retaining the original expression', () 
   expect(screen.getByText(expression)).toBeVisible()
 })
 
+it('shows task token prices by input type and output resolution without exposing the expression', () => {
+  vi.spyOn(api, 'get').mockResolvedValue({ data: { data: { groups: [] } } })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  const expression =
+    'u("resolution") == "4k" && u("video_input") == "video" ? tier("4k_video", u("tokens") * 16 / 1000000) : u("resolution") == "4k" ? tier("4k", u("tokens") * 26 / 1000000) : u("resolution") == "1080p" && u("video_input") == "video" ? tier("1080p_video", u("tokens") * 31 / 1000000) : u("resolution") == "1080p" ? tier("1080p", u("tokens") * 51 / 1000000) : u("video_input") == "video" ? tier("video", u("tokens") * 28 / 1000000) : tier("base", u("tokens") * 46 / 1000000)'
+  render(
+    <QueryClientProvider client={client}>
+      <ModelDetailsContent
+        model={{
+          ...model,
+          billing_expr: expression,
+          billing_usage_schema: {
+            tokens: {
+              type: 'number',
+              unit: 'token',
+              description: 'Output price',
+            },
+            video_input: {
+              enum: ['none', 'video'],
+              enumLabels: { video: 'With video', none: 'Without video' },
+              description: 'Input type',
+            },
+            resolution: {
+              enum: ['480p', '720p', '1080p'],
+              description: 'Output resolution',
+            },
+          },
+        }}
+        groupRatio={{ default: 1 }}
+        usableGroup={{ default: { desc: '', ratio: 1 } }}
+        endpointMap={{}}
+        autoGroups={[]}
+        priceRate={1}
+        usdExchangeRate={1}
+        tokenUnit='M'
+      />
+    </QueryClientProvider>
+  )
+  const inputHeader = screen.getByRole('columnheader', { name: 'Input type' })
+  const table = inputHeader.closest('table')
+  expect(table).not.toBeNull()
+  if (!table) return
+  expect(inputHeader).toBeVisible()
+  expect(
+    within(table).getByRole('columnheader', { name: 'Output resolution' })
+  ).toBeVisible()
+  expect(
+    within(table).getByRole('columnheader', { name: 'Output ($/1M token)' })
+  ).toBeVisible()
+  expect(within(table).getAllByRole('row')).toHaveLength(7)
+  const rows = within(table).getAllByRole('row').slice(1)
+  expect(
+    rows.map((row) =>
+      within(row)
+        .getAllByRole('cell')
+        .map((cell) => cell.textContent)
+    )
+  ).toEqual([
+    ['Includes video', '480p', '$28'],
+    ['720p', '$28'],
+    ['1080p', '$31'],
+    ['Excludes video', '480p', '$46'],
+    ['720p', '$46'],
+    ['1080p', '$51'],
+  ])
+  expect(
+    within(rows[0]).getByRole('cell', { name: 'Includes video' })
+  ).toHaveAttribute('rowspan', '3')
+  expect(
+    within(rows[3]).getByRole('cell', { name: 'Excludes video' })
+  ).toHaveAttribute('rowspan', '3')
+  expect(screen.queryByText(expression)).not.toBeInTheDocument()
+  expect(screen.queryByText('Raw expression')).not.toBeInTheDocument()
+})
+
+it('expands nested boolean video-input pricing into a token price table', async () => {
+  vi.spyOn(api, 'get').mockResolvedValue({ data: { data: { groups: [] } } })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  const expression =
+    'u("resolution_tier") == "1080p" ? (u("has_video_input") ? tier("1080p_video_in", u("tokens") * 31 / 1000000) : tier("1080p", u("tokens") * 51 / 1000000)) : (u("has_video_input") ? tier("sd_video_in", u("tokens") * 28 / 1000000) : tier("sd", u("tokens") * 46 / 1000000))'
+  render(
+    <QueryClientProvider client={client}>
+      <ModelDetailsContent
+        model={{
+          ...model,
+          billing_expr: expression,
+          billing_usage_schema: {
+            has_video_input: {
+              type: 'boolean',
+              description: 'Contains video input',
+            },
+            resolution_tier: {
+              enum: ['480p', '720p', '1080p', '4k'],
+              description: 'Output resolution',
+            },
+            tokens: {
+              type: 'number',
+              unit: 'token',
+              description: 'Output price',
+            },
+          },
+        }}
+        groupRatio={{ default: 1 }}
+        usableGroup={{ default: { desc: '', ratio: 1 } }}
+        endpointMap={{}}
+        autoGroups={[]}
+        priceRate={1}
+        usdExchangeRate={1}
+        tokenUnit='M'
+      />
+    </QueryClientProvider>
+  )
+  const header = screen.getByRole('columnheader', { name: 'Input type' })
+  const table = header.closest('table')
+  expect(table).not.toBeNull()
+  if (!table) return
+  expect(
+    within(table).getByRole('columnheader', { name: 'Output resolution' })
+  ).toBeVisible()
+  expect(
+    within(table).getByRole('columnheader', { name: 'Output ($/1M token)' })
+  ).toBeVisible()
+  const rows = within(table).getAllByRole('row').slice(1)
+  expect(
+    rows.map((row) =>
+      within(row)
+        .getAllByRole('cell')
+        .map((cell) => cell.textContent)
+    )
+  ).toEqual([
+    ['Includes video', '480p', '$28'],
+    ['720p', '$28'],
+    ['1080p', '$31'],
+    ['Excludes video', '480p', '$46'],
+    ['720p', '$46'],
+    ['1080p', '$51'],
+  ])
+  expect(
+    within(rows[0]).getByRole('cell', { name: 'Includes video' })
+  ).toHaveAttribute('rowspan', '3')
+  expect(
+    within(rows[3]).getByRole('cell', { name: 'Excludes video' })
+  ).toHaveAttribute('rowspan', '3')
+  expect(screen.queryByText(expression)).not.toBeInTheDocument()
+  i18next.addResourceBundle('zhCN', 'translation', zhCN.translation)
+  await act(() => i18next.changeLanguage('zhCN'))
+  expect(
+    within(table).getByRole('columnheader', { name: '输入类型' })
+  ).toBeVisible()
+  expect(
+    within(table).getByRole('columnheader', { name: '输出分辨率' })
+  ).toBeVisible()
+  expect(
+    within(table).getByRole('columnheader', { name: '输出 ($/1M token)' })
+  ).toBeVisible()
+  expect(within(table).getByRole('cell', { name: '包含视频' })).toHaveAttribute(
+    'rowspan',
+    '3'
+  )
+  expect(
+    within(table).getByRole('cell', { name: '不包含视频' })
+  ).toHaveAttribute('rowspan', '3')
+  const previousCurrency = useSystemConfigStore.getState().config.currency
+  try {
+    act(() =>
+      useSystemConfigStore.getState().setConfig({
+        currency: {
+          ...previousCurrency,
+          quotaDisplayType: 'CNY',
+          usdExchangeRate: 2,
+        },
+      })
+    )
+    expect(
+      within(table).getByRole('columnheader', { name: '输出 (¥/1M token)' })
+    ).toBeVisible()
+    expect(within(table).getAllByRole('row')[1]).toHaveTextContent('¥56')
+  } finally {
+    act(() =>
+      useSystemConfigStore.getState().setConfig({ currency: previousCurrency })
+    )
+  }
+})
+
+it('keeps distinct input labels when a task declares more than video and no-video options', () => {
+  vi.spyOn(api, 'get').mockResolvedValue({ data: { data: { groups: [] } } })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  render(
+    <QueryClientProvider client={client}>
+      <ModelDetailsContent
+        model={{
+          ...model,
+          billing_expr:
+            'u("video_input") == "video" ? tier("video", u("tokens") * 28 / 1000000) : tier("other", u("tokens") * 46 / 1000000)',
+          billing_usage_schema: {
+            video_input: {
+              enum: ['none', 'video', 'image'],
+              enumLabels: { image: 'Image input' },
+            },
+            resolution: { enum: ['480p', '720p'] },
+            tokens: { type: 'number', unit: 'token' },
+          },
+        }}
+        groupRatio={{ default: 1 }}
+        usableGroup={{ default: { desc: '', ratio: 1 } }}
+        endpointMap={{}}
+        autoGroups={[]}
+        priceRate={1}
+        usdExchangeRate={1}
+        tokenUnit='M'
+      />
+    </QueryClientProvider>
+  )
+  expect(screen.getAllByText('Image input').length).toBeGreaterThan(0)
+  expect(screen.queryByText('Excludes video')).not.toBeInTheDocument()
+})
+
+it('does not expose unsupported task expressions when no exact price table is available', () => {
+  vi.spyOn(api, 'get').mockResolvedValue({ data: { data: { groups: [] } } })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  const expression = 'tier("base", max(u("clips"), 2) * 0.22)'
+  render(
+    <QueryClientProvider client={client}>
+      <ModelDetailsContent
+        model={{ ...model, billing_expr: expression }}
+        groupRatio={{ default: 1 }}
+        usableGroup={{ default: { desc: '', ratio: 1 } }}
+        endpointMap={{}}
+        autoGroups={[]}
+        priceRate={1}
+        usdExchangeRate={1}
+        tokenUnit='M'
+      />
+    </QueryClientProvider>
+  )
+  expect(
+    screen.getAllByText('Pricing details cannot be displayed for this model.')
+      .length
+  ).toBeGreaterThan(0)
+  expect(screen.queryByText(expression)).not.toBeInTheDocument()
+  expect(screen.queryByText('Raw expression')).not.toBeInTheDocument()
+})
+
+it('does not expose unsupported provider task expressions in the base price', () => {
+  vi.spyOn(api, 'get').mockResolvedValue({ data: { data: { groups: [] } } })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  const expression = 'tier("base", max(u("clips"), 2) * 0.22)'
+  render(
+    <QueryClientProvider client={client}>
+      <ModelDetailsContent
+        model={{
+          ...model,
+          billing_expr: undefined,
+          billing_usage_schema: undefined,
+          billing_plugin_variants: [
+            {
+              plugin_key: 'alpha',
+              plugin_name: 'Alpha',
+              billing_expr: expression,
+              billing_usage_schema: model.billing_usage_schema ?? {},
+            },
+          ],
+        }}
+        groupRatio={{ default: 1 }}
+        usableGroup={{ default: { desc: '', ratio: 1 } }}
+        endpointMap={{}}
+        autoGroups={[]}
+        priceRate={1}
+        usdExchangeRate={1}
+        tokenUnit='M'
+      />
+    </QueryClientProvider>
+  )
+  expect(screen.queryByText(expression)).not.toBeInTheDocument()
+  expect(screen.queryByText('Raw expression')).not.toBeInTheDocument()
+})
+
 it('falls back for omitted count labels and preserves canonical units for other quantities', () => {
   expect(taskUsageUnitLabel({ unit: 'count' }, 'zhCN', '次')).toBe('次')
   expect(
@@ -262,6 +555,7 @@ afterEach(async () => {
   clients.length = 0
   vi.restoreAllMocks()
   await i18next.changeLanguage('en')
+  i18next.removeResourceBundle('zhCN', 'translation')
 })
 
 it('refreshes memoized provider prices when the group or display currency changes', () => {

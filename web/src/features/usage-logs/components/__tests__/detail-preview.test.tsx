@@ -83,7 +83,7 @@ function DetailPreview(props: { other: LogOtherData; isAdmin: boolean }) {
     .getRowModel()
     .rows[0].getAllCells()
     .find((item) => item.column.id === 'content')
-  if (!cell) throw new Error('The log must have a content column')
+  if (!cell) return null
   return flexRender(cell.column.columnDef.cell, cell.getContext())
 }
 const plugin = {
@@ -126,6 +126,18 @@ function renderPreview(other: LogOtherData, isAdmin = true) {
   )
   return screen.getByRole('button', { name: /./ })
 }
+
+test('does not expose the details column to ordinary users', () => {
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <DetailPreview other={{ model_price: 0.25 }} isAdmin={false} />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  expect(screen.queryByRole('button')).not.toBeInTheDocument()
+  expect(screen.queryByText(/Per-call/)).not.toBeInTheDocument()
+})
 
 test('keeps log details open when the parent refreshes with unchanged data', async () => {
   const other = { model_price: 0.25 }
@@ -208,7 +220,7 @@ test('quota saturation remains first and only billing adds to the counter', () =
   expect(preview.textContent).toBe('Quota clamped+1')
 })
 
-test.each([true, false])(
+test.each([true])(
   'plugin information in the opened dialog respects admin=%s',
   async (isAdmin) => {
     const preview = renderPreview(

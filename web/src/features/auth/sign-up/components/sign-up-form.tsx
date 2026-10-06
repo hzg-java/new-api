@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
-import { Loader2 } from 'lucide-react'
+import { Loader2, LockKeyhole, UserRound } from 'lucide-react'
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
@@ -248,7 +248,10 @@ export function SignUpForm({
     <Form {...form}>
       <form
         onSubmit={form.handleSubmit(onSubmit)}
-        className={cn('grid gap-4', className)}
+        className={cn(
+          'grid gap-4 text-[#40516c] dark:text-slate-200',
+          className
+        )}
         {...props}
       >
         {/* Username Field */}
@@ -257,10 +260,23 @@ export function SignUpForm({
           name='username'
           render={({ field }) => (
             <FormItem>
-              <FormLabel>{t('Username')}</FormLabel>
-              <FormControl>
-                <Input placeholder={t('Enter your username')} {...field} />
-              </FormControl>
+              <FormLabel className='text-xs font-semibold'>
+                {t('Username')}
+              </FormLabel>
+              <div className='relative'>
+                <UserRound
+                  aria-hidden='true'
+                  className='pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-[#9ba9bd]'
+                />
+                <FormControl>
+                  <Input
+                    placeholder={t('Enter your username')}
+                    autoComplete='username'
+                    className='h-12 rounded-lg border-[#e0e6f0] bg-white pl-10 text-sm dark:border-white/20 dark:bg-transparent'
+                    {...field}
+                  />
+                </FormControl>
+              </div>
               <FormMessage />
             </FormItem>
           )}
@@ -272,13 +288,23 @@ export function SignUpForm({
           name='password'
           render={({ field }) => (
             <FormItem>
-              <FormLabel>{t('Password')}</FormLabel>
-              <FormControl>
-                <PasswordInput
-                  placeholder={t('Enter password (8–128 characters)')}
-                  {...field}
+              <FormLabel className='text-xs font-semibold'>
+                {t('Password')}
+              </FormLabel>
+              <div className='relative'>
+                <LockKeyhole
+                  aria-hidden='true'
+                  className='pointer-events-none absolute top-1/2 left-3 z-10 h-4 w-4 -translate-y-1/2 text-[#9ba9bd]'
                 />
-              </FormControl>
+                <FormControl>
+                  <PasswordInput
+                    placeholder={t('Enter password (8–128 characters)')}
+                    autoComplete='new-password'
+                    className='[&_input]:h-12 [&_input]:rounded-lg [&_input]:border-[#e0e6f0] [&_input]:bg-white [&_input]:pl-10 [&_input]:text-sm dark:[&_input]:border-white/20 dark:[&_input]:bg-transparent'
+                    {...field}
+                  />
+                </FormControl>
+              </div>
               <FormMessage />
             </FormItem>
           )}
@@ -290,10 +316,23 @@ export function SignUpForm({
           name='confirmPassword'
           render={({ field }) => (
             <FormItem>
-              <FormLabel>{t('Confirm password')}</FormLabel>
-              <FormControl>
-                <PasswordInput placeholder={t('Confirm password')} {...field} />
-              </FormControl>
+              <FormLabel className='text-xs font-semibold'>
+                {t('Confirm password')}
+              </FormLabel>
+              <div className='relative'>
+                <LockKeyhole
+                  aria-hidden='true'
+                  className='pointer-events-none absolute top-1/2 left-3 z-10 h-4 w-4 -translate-y-1/2 text-[#9ba9bd]'
+                />
+                <FormControl>
+                  <PasswordInput
+                    placeholder={t('Confirm password')}
+                    autoComplete='new-password'
+                    className='[&_input]:h-12 [&_input]:rounded-lg [&_input]:border-[#e0e6f0] [&_input]:bg-white [&_input]:pl-10 [&_input]:text-sm dark:[&_input]:border-white/20 dark:[&_input]:bg-transparent'
+                    {...field}
+                  />
+                </FormControl>
+              </div>
               <FormMessage />
             </FormItem>
           )}
@@ -308,13 +347,15 @@ export function SignUpForm({
               name='email'
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>
+                  <FormLabel className='text-xs font-semibold'>
                     {t('Email (required for verification)')}
                   </FormLabel>
                   <FormControl>
                     <Input
                       placeholder={t('name@example.com')}
                       type='email'
+                      autoComplete='email'
+                      className='h-12 rounded-lg border-[#e0e6f0] bg-white text-sm dark:border-white/20 dark:bg-transparent'
                       {...field}
                     />
                   </FormControl>
@@ -328,6 +369,9 @@ export function SignUpForm({
               <div className='flex-1'>
                 <Input
                   placeholder={t('Verification code')}
+                  aria-label={t('Verification code')}
+                  autoComplete='one-time-code'
+                  className='h-12 rounded-lg border-[#e0e6f0] bg-white text-sm dark:border-white/20 dark:bg-transparent'
                   value={verificationCode}
                   onChange={(e) => setVerificationCode(e.target.value)}
                 />
@@ -343,6 +387,7 @@ export function SignUpForm({
                   !turnstileReady
                 }
                 onClick={handleSendVerificationCode}
+                className='h-12 rounded-lg'
               >
                 {verificationCodeAction}
               </Button>
@@ -365,13 +410,13 @@ export function SignUpForm({
           status={status}
           checked={agreedToLegal}
           onCheckedChange={setAgreedToLegal}
-          className='mt-1'
+          className='mt-1 border-0 bg-transparent p-0 dark:[&_[data-slot=checkbox]]:border-slate-400'
         />
 
         {/* Submit Button */}
         <Button
           type='submit'
-          className='mt-2 w-full justify-center gap-2'
+          className='mt-1 h-12 w-full justify-center gap-2 rounded-lg bg-[linear-gradient(105deg,#6080ea,#4266dd)] text-white shadow-[0_8px_18px_rgba(69,107,213,0.22)] hover:brightness-105'
           disabled={
             isLoading ||
             (requiresLegalConsent && !agreedToLegal) ||

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -75,6 +76,37 @@ func GetTaskArtifacts(c *gin.Context) {
 		return
 	}
 	writeTaskArtifacts(c, task, false)
+}
+
+func GetDashboardTaskEvents(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
+	taskID, parseErr := strconv.ParseInt(c.Param("task_id"), 10, 64)
+	if parseErr != nil || taskID <= 0 {
+		c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "Task not found"})
+		return
+	}
+	var task *model.Task
+	var exists bool
+	var err error
+	if c.GetInt("token_id") == 0 && c.GetInt("role") >= common.RoleAdminUser {
+		task, exists, err = model.GetTaskByID(taskID, 0)
+	} else if c.GetInt("id") > 0 {
+		task, exists, err = model.GetTaskByID(taskID, c.GetInt("id"))
+	}
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if !exists || task == nil {
+		c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "Task not found"})
+		return
+	}
+	events, err := model.GetTaskEvents(task.ID)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, events)
 }
 
 func GetDashboardTaskArtifacts(c *gin.Context) {
@@ -445,6 +477,47 @@ func tasksToDto(tasks []*model.Task, fillUser bool, viewerRole int) []*dto.TaskD
 			}
 		}
 	}
+	// List queries intentionally omit data. Load completion snapshots only for
+	// video rows needing actual token display, in one bounded page query. Never
+	// attach these payloads to the public DTO or mutate the listed tasks.
+	requestSnapshots := make(map[int64]*dto.TaskVideoInfo)
+	var taskIDs []int64
+	for _, task := range tasks {
+		if task.ID != 0 && taskVideoRequestSnapshot(nil, task.Action) != nil {
+			taskIDs = append(taskIDs, task.ID)
+		}
+	}
+	if len(taskIDs) > 0 && model.DB != nil {
+		var events []model.TaskEvent
+		if model.DB.Where("task_id IN ? AND kind = ?", taskIDs, "request").Find(&events).Error == nil {
+			for _, event := range events {
+				var payload struct {
+					VideoInfo *dto.TaskVideoInfo `json:"video_info"`
+				}
+				if common.UnmarshalJsonStr(event.Payload, &payload) == nil && payload.VideoInfo != nil {
+					requestSnapshots[event.TaskID] = payload.VideoInfo
+				}
+			}
+		}
+	}
+	videoData := make(map[int64]json.RawMessage)
+	var videoIDs []int64
+	for _, task := range tasks {
+		if task.ID != 0 && (task.PrivateData.VideoInfo != nil || taskVideoRequestSnapshot(nil, task.Action) != nil) && task.Status == model.TaskStatusSuccess && len(task.Data) == 0 {
+			videoIDs = append(videoIDs, task.ID)
+		}
+	}
+	if len(videoIDs) > 0 && model.DB != nil {
+		var snapshots []struct {
+			ID   int64
+			Data json.RawMessage
+		}
+		if model.DB.Model(&model.Task{}).Select("id", "data").Where("id IN ?", videoIDs).Find(&snapshots).Error == nil {
+			for _, snapshot := range snapshots {
+				videoData[snapshot.ID] = snapshot.Data
+			}
+		}
+	}
 	result := make([]*dto.TaskDto, len(tasks))
 	for i, task := range tasks {
 		if fillUser {
@@ -453,8 +526,34 @@ func tasksToDto(tasks []*model.Task, fillUser bool, viewerRole int) []*dto.TaskD
 			}
 		}
 		item := relay.TaskModel2Dto(task)
+		if billing := task.PrivateData.BillingContext; billing != nil {
+			switch {
+			case billing.TieredSnapshot != nil:
+				item.BillingMode = "tiered_expr"
+			case billing.PerCallBilling:
+				item.BillingMode = "per_call"
+			default:
+				item.BillingMode = "per_token"
+			}
+		}
+		videoTask := *task
+		if snapshot := requestSnapshots[task.ID]; snapshot != nil {
+			videoTask.PrivateData.VideoInfo = snapshot
+		}
+		if len(videoTask.Data) == 0 {
+			videoTask.Data = videoData[task.ID]
+		}
+		item.VideoInfo = taskVideoLogInfo(&videoTask)
 		item.LegacyVideoAvailable = legacyVideoAvailable(task)
 		item.ResultDiscarded = task.PrivateData.ResultDiscarded
+		item.LegacyAudioAvailable = task.Platform == "suno"
+		if viewerRole < common.RoleAdminUser {
+			properties := task.Properties
+			properties.UpstreamModelName = ""
+			item.Properties = properties
+			item.Platform = ""
+			item.Data = nil
+		}
 		if task.Status == model.TaskStatusSuccess {
 			item.ResultURL = ""
 			if taskFailReasonIsLegacyResultURL(task.FailReason) {
@@ -506,6 +605,230 @@ func tasksToDto(tasks []*model.Task, fillUser bool, viewerRole int) []*dto.TaskD
 		result[i] = item
 	}
 	return result
+}
+
+// Only recognized video actions qualify; dimensions on image or arbitrary
+// plugin requests must not manufacture video metadata.
+func taskVideoRequestSnapshot(request any, action string) *dto.TaskVideoInfo {
+	switch constant.NormalizeTaskAction(action) {
+	case constant.TaskActionTextToVideo, constant.TaskActionImageToVideo,
+		constant.TaskActionFirstTailToVideo, constant.TaskActionReferenceToVideo, constant.TaskActionRemix:
+	default:
+		return nil
+	}
+	info := &dto.TaskVideoInfo{}
+	if request == nil {
+		return info
+	}
+	encoded, err := common.Marshal(request)
+	if err != nil {
+		return info
+	}
+	var body map[string]any
+	if common.Unmarshal(encoded, &body) != nil {
+		return info
+	}
+	// These are normalized provider containers (Ark metadata, Ali input and
+	// parameters, and Veo parameters), not arbitrary user-defined subtrees.
+	containers := []map[string]any{body}
+	for i := 0; i < len(containers) && i < 16; i++ {
+		for _, key := range []string{"metadata", "parameters", "input"} {
+			if child, ok := containers[i][key].(map[string]any); ok && len(containers) < 16 {
+				containers = append(containers, child)
+			}
+		}
+	}
+	for _, fields := range containers {
+		if info.DurationSeconds == nil {
+			for _, key := range []string{"seconds", "duration", "duration_seconds", "durationSeconds"} {
+				if value, exists := fields[key]; exists {
+					if n, ok := taskVideoDisplayNumber(value, relaycommon.MaxTaskDurationSeconds); ok {
+						info.DurationSeconds = &n
+					}
+					break
+				}
+			}
+		}
+		if info.Resolution == "" {
+			for _, key := range []string{"resolution", "size"} {
+				if text, ok := fields[key].(string); ok {
+					info.Resolution = taskVideoDisplayResolution(text)
+					if info.Resolution != "" {
+						break
+					}
+				}
+			}
+			if info.Resolution == "" {
+				w, wok := taskVideoDisplayNumber(fields["width"], 16384)
+				h, hok := taskVideoDisplayNumber(fields["height"], 16384)
+				if wok && hok && w > 0 && h > 0 && w == math.Trunc(w) && h == math.Trunc(h) {
+					info.Resolution = fmt.Sprintf("%.0fx%.0f", w, h)
+				}
+			}
+		}
+		for _, key := range []string{"video_url", "video_urls", "reference_video", "reference_videos", "reference_video_url", "reference_video_urls"} {
+			if value, exists := fields[key]; exists {
+				present, known := taskVideoReferencePresent(value)
+				if known && (info.HasReferenceVideo == nil || present) {
+					info.HasReferenceVideo = &present
+				}
+			}
+		}
+		for _, key := range []string{"content", "media"} {
+			items, ok := fields[key].([]any)
+			if !ok {
+				continue
+			}
+			known, present := true, false
+			for _, item := range items {
+				entry, ok := item.(map[string]any)
+				if !ok {
+					known = false
+					continue
+				}
+				typ, _ := entry["type"].(string)
+				switch typ {
+				case "video_url", "reference_video":
+					value := entry[typ]
+					if value == nil {
+						value = entry["url"]
+					}
+					p, k := taskVideoReferencePresent(value)
+					present = present || p
+					known = known && k
+				case "text", "image_url", "reference_image", "first_frame", "last_frame", "audio_url", "reference_audio":
+				default:
+					known = false
+				}
+			}
+			if present || known && info.HasReferenceVideo == nil {
+				info.HasReferenceVideo = &present
+			}
+		}
+	}
+	// The basic DTO accepts only an image reference, never a reference video.
+	switch request.(type) {
+	case dto.VideoRequest, *dto.VideoRequest:
+		if info.HasReferenceVideo == nil {
+			present := false
+			info.HasReferenceVideo = &present
+		}
+	}
+	return info
+}
+
+func taskVideoDisplayNumber(value any, limit float64) (float64, bool) {
+	var n float64
+	switch v := value.(type) {
+	case float64:
+		n = v
+	case string:
+		var err error
+		n, err = strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return 0, false
+		}
+	default:
+		return 0, false
+	}
+	return n, !math.IsNaN(n) && !math.IsInf(n, 0) && n >= 0 && n <= limit
+}
+
+var taskVideoResolutionPattern = regexp.MustCompile(`^(?:[1-9][0-9]{1,3}[pP]|[1248][kK]|[1-9][0-9]{0,4}[xX*][1-9][0-9]{0,4})$`)
+
+func taskVideoDisplayResolution(value string) string {
+	value = strings.TrimSpace(value)
+	if !taskVideoResolutionPattern.MatchString(value) {
+		return ""
+	}
+	value = strings.ToLower(strings.ReplaceAll(value, "*", "x"))
+	if w, h, ok := strings.Cut(value, "x"); ok {
+		width, _ := strconv.Atoi(w)
+		height, _ := strconv.Atoi(h)
+		if width > 16384 || height > 16384 {
+			return ""
+		}
+	}
+	return value
+}
+
+func taskVideoReferencePresent(value any) (bool, bool) {
+	switch v := value.(type) {
+	case nil:
+		return false, true
+	case string:
+		return strings.TrimSpace(v) != "", true
+	case bool:
+		return v, true
+	case map[string]any:
+		if url, exists := v["url"]; exists {
+			return taskVideoReferencePresent(url)
+		}
+		return false, false
+	case []any:
+		known := true
+		for _, item := range v {
+			present, valid := taskVideoReferencePresent(item)
+			if present {
+				return true, true
+			}
+			known = known && valid
+		}
+		return false, known
+	default:
+		return false, false
+	}
+}
+
+func taskVideoLogInfo(task *model.Task) *dto.TaskVideoInfo {
+	snapshot := task.PrivateData.VideoInfo
+	if snapshot == nil {
+		snapshot = taskVideoRequestSnapshot(nil, task.Action)
+		if snapshot == nil {
+			return nil
+		}
+	}
+	info := &dto.TaskVideoInfo{Resolution: taskVideoDisplayResolution(snapshot.Resolution)}
+	if snapshot.DurationSeconds != nil {
+		if n, ok := taskVideoDisplayNumber(*snapshot.DurationSeconds, relaycommon.MaxTaskDurationSeconds); ok {
+			info.DurationSeconds = &n
+		}
+	}
+	if snapshot.HasReferenceVideo != nil {
+		present := *snapshot.HasReferenceVideo
+		info.HasReferenceVideo = &present
+	}
+	// Do not trust stored estimates, plugin usage units or credits. Only the
+	// succeeded upstream response's explicit usage token counts are actual.
+	if task.Status == model.TaskStatusSuccess {
+		var response struct {
+			Resolution string         `json:"resolution"`
+			Duration   any            `json:"duration"`
+			Usage      map[string]any `json:"usage"`
+		}
+		if common.Unmarshal(task.Data, &response) == nil {
+			if info.Resolution == "" {
+				info.Resolution = taskVideoDisplayResolution(response.Resolution)
+			}
+			if info.DurationSeconds == nil {
+				if n, ok := taskVideoDisplayNumber(response.Duration, relaycommon.MaxTaskDurationSeconds); ok {
+					info.DurationSeconds = &n
+				}
+			}
+			for _, key := range []string{"total_tokens", "completion_tokens"} {
+				value, ok := response.Usage[key].(float64)
+				if !ok {
+					continue
+				}
+				if n, valid := taskVideoDisplayNumber(value, math.MaxInt32); valid && n == math.Trunc(n) {
+					tokens := common.QuotaFromFloat(n)
+					info.ConsumedTokens = &tokens
+					break
+				}
+			}
+		}
+	}
+	return info
 }
 
 func taskFailReasonIsLegacyResultURL(value string) bool {

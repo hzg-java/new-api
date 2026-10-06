@@ -19,42 +19,31 @@ For commercial licensing, please contact support@quantumnous.com
 import { Link } from '@tanstack/react-router'
 import { useTranslation } from 'react-i18next'
 
-import { useStatus } from '@/hooks/use-status'
-
 import { AuthLayout } from '../auth-layout'
-import { TermsFooter } from '../components/terms-footer'
 import { SignUpForm } from './components/sign-up-form'
 
 export function SignUp() {
   const { t } = useTranslation()
-  const { status } = useStatus()
 
   return (
-    <AuthLayout>
-      <div className='w-full space-y-8'>
-        <div className='space-y-2'>
-          <h2 className='text-center text-2xl font-semibold tracking-tight sm:text-left'>
-            {t('Create an account')}
-          </h2>
-          <p className='text-muted-foreground text-left text-sm sm:text-base'>
-            {t('Already have an account?')}{' '}
-            <Link
-              to='/sign-in'
-              className='hover:text-primary font-medium underline underline-offset-4'
-            >
-              {t('Sign in')}
-            </Link>
-            .
-          </p>
-        </div>
-
+    <AuthLayout variant='sign-up'>
+      <div className='w-full'>
+        <h2 className='text-[34px] leading-tight font-bold tracking-tight text-[#14213b] dark:text-white'>
+          {t('Create an account')}
+        </h2>
+        <p className='mt-3 mb-7 text-sm leading-6 text-[#8390a5] dark:text-slate-300'>
+          {t('Fill in your account details to start using AI models.')}
+        </p>
         <SignUpForm />
-
-        <TermsFooter
-          variant='sign-up'
-          status={status}
-          className='text-center'
-        />
+        <p className='mt-6 border-t border-[#ecf0f5] pt-5 text-center text-sm text-[#8491a5] dark:border-white/10 dark:text-slate-300'>
+          {t('Already have an account?')}{' '}
+          <Link
+            to='/sign-in'
+            className='font-semibold text-[#486fe2] hover:underline dark:text-[#9ab7ff]'
+          >
+            {t('Sign in')}
+          </Link>
+        </p>
       </div>
     </AuthLayout>
   )

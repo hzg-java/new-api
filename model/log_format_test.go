@@ -199,6 +199,37 @@ func TestLegacyRejectReasonHandlesNullAdminInfo(t *testing.T) {
 	assert.Equal(t, "legacy-value", adminInfo["reject_reason"])
 }
 
+func TestModelMappingLogVisibilityIsRoleSeparated(t *testing.T) {
+	const other = `{"is_model_mapped":true,"upstream_model_name":"private-model","response_model":{"requested_model":"public-model","upstream_model":"private-model","returned_model":"returned-private-model"},"request_path":"/v1/chat/completions","admin_info":{"billing_model":"private-model"}}`
+	for _, visibility := range []logOtherVisibility{logOtherVisibilityUser, logOtherVisibilityAdmin, logOtherVisibilityRoot} {
+		t.Run([]string{"user", "admin", "root"}[visibility], func(t *testing.T) {
+			logs := []*Log{{ModelName: "public-model", Other: other}}
+			switch visibility {
+			case logOtherVisibilityUser:
+				formatUserLogs(logs, 0)
+			case logOtherVisibilityAdmin:
+				FormatAdminLogs(logs)
+			case logOtherVisibilityRoot:
+				FormatRootLogs(logs)
+			}
+			parsed, err := common.StrToMap(logs[0].Other)
+			require.NoError(t, err)
+			assert.Equal(t, "public-model", logs[0].ModelName)
+			assert.Equal(t, "/v1/chat/completions", parsed["request_path"])
+			for _, key := range []string{"is_model_mapped", "upstream_model_name", "response_model"} {
+				if visibility == logOtherVisibilityUser {
+					assert.NotContains(t, parsed, key)
+				} else {
+					assert.Contains(t, parsed, key)
+				}
+			}
+			if visibility == logOtherVisibilityUser {
+				assert.NotContains(t, logs[0].Other, "private-model")
+			}
+		})
+	}
+}
+
 func TestLogFormattingPreservesLargeIntegerLexemes(t *testing.T) {
 	const other = `{"public_id":9007199254740993,"admin_info":{"admin_id":9007199254740995},"root_info":{"generation":18446744073709551615}}`
 

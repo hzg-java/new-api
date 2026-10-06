@@ -254,6 +254,8 @@ export interface LogOtherData {
   fee_quota?: number
   // Task-related fields (for refund logs, type=6)
   is_task?: boolean
+  task_billing_pending?: boolean
+  task_status?: string
   // The submitting request returned the task result itself (an immediate
   // result, or an OpenAI Images request the gateway waited on).
   task_sync?: boolean
@@ -313,6 +315,18 @@ export interface MidjourneyLog {
 // Task Logs Types
 // ============================================================================
 
+export interface TaskEvent {
+  kind: 'request' | 'accepted' | 'result'
+  timestamp: number
+  payload: string
+}
+
+export interface TaskEventsResponse {
+  success: boolean
+  message?: string
+  data?: TaskEvent[]
+}
+
 export interface TaskLog {
   id: number
   user_id: number
@@ -323,6 +337,7 @@ export interface TaskLog {
   channel_id: number
   group: string
   quota: number
+  billing_mode?: 'per_call' | 'per_token' | 'tiered_expr'
   submit_time: number // seconds
   start_time?: number // seconds
   finish_time?: number // seconds
@@ -334,7 +349,14 @@ export interface TaskLog {
     upstream_model_name?: string
     origin_model_name?: string
   }
+  video_info?: {
+    resolution?: string
+    duration_seconds?: number
+    has_reference_video?: boolean
+    consumed_tokens?: number
+  }
   legacy_video_available?: boolean
+  legacy_audio_available?: boolean
   // A synchronous result returned inline and never persisted; artifact
   // retrieval is not offered for it.
   result_discarded?: boolean

@@ -619,6 +619,8 @@ func executeTaskSubmissionWith(
 	stage = "insert"
 	task := model.InitTask(result.Platform, relayInfo)
 	task.PrivateData.Execution = service.TaskExecutionSnapshotFromContext(c)
+	requestBody, _ := c.Get("task_request")
+	task.PrivateData.VideoInfo = taskVideoRequestSnapshot(requestBody, relayInfo.Action)
 	task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
 	task.PrivateData.BillingSource = relayInfo.BillingSource
 	task.PrivateData.SubscriptionId = relayInfo.SubscriptionId
@@ -706,6 +708,21 @@ func executeTaskSubmissionWith(
 	}
 	service.LogTaskConsumption(c, relayInfo, task)
 	diagnostics.complete(task, result.Quota)
+	if err := model.RecordTaskEvent(task.ID, "request", task.SubmitTime, map[string]any{"model": relayInfo.OriginModelName}); err != nil {
+		common.SysError("record task request event: " + err.Error())
+	}
+	acceptedStatus := "queued"
+	if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
+		acceptedStatus = string(task.Status)
+	}
+	if err := model.RecordTaskEvent(task.ID, "accepted", time.Now().Unix(), map[string]any{"id": task.TaskID, "status": acceptedStatus, "model": relayInfo.OriginModelName}); err != nil {
+		common.SysError("record task accepted event: " + err.Error())
+	}
+	if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
+		if err := model.RecordTaskEvent(task.ID, "result", task.FinishTime, model.TaskResultEventPayload(task)); err != nil {
+			common.SysError("record task result event: " + err.Error())
+		}
+	}
 
 	return &taskSubmissionOutcome{Result: result, Task: task, RelayInfo: relayInfo}, nil
 }

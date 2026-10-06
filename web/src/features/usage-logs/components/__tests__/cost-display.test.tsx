@@ -115,7 +115,29 @@ describe('log cost display', () => {
 
     expect(screen.getByText('$0.025')).toBeVisible()
     expect(screen.getByRole('img', { name: 'Subscription' })).toBeVisible()
-    expect(screen.queryByRole('img', { name: 'Wallet' })).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('img', { name: 'Wallet' })
+    ).not.toBeInTheDocument()
+  })
+
+  test('hides pending video cost including subscription estimates', () => {
+    renderCost({
+      quota: 5000,
+      other: {
+        task_billing_pending: true,
+        billing_source: 'subscription',
+        subscription_consumed: 12500,
+      },
+    })
+
+    expect(screen.getByText('—')).toBeVisible()
+    expect(screen.queryByText('$0.025')).not.toBeInTheDocument()
+    expect(screen.queryByText('$0.01')).not.toBeInTheDocument()
+  })
+
+  test.each([12500, 0])('shows finalized video total %s', (quota) => {
+    renderCost({ quota, other: { task_billing_pending: false } })
+    expect(screen.getByText(quota === 0 ? '$0' : '$0.025')).toBeVisible()
   })
 
   test('keeps legacy cost visible without inventing a funding source', () => {

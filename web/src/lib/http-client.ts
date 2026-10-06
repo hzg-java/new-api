@@ -16,7 +16,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import axios, { type AxiosRequestConfig } from 'axios'
+import axios, {
+  type AxiosRequestConfig,
+  type InternalAxiosRequestConfig,
+} from 'axios'
 import { t } from 'i18next'
 
 import {
@@ -41,6 +44,7 @@ declare module 'axios' {
     authRetry?: boolean
     acceptAuthRotation?: boolean
     singleUseAuthorization?: boolean
+    requestSessionSID?: string
   }
 }
 
@@ -92,21 +96,34 @@ api.interceptors.response.use(
     return response
   },
   async (error) => {
-    const config = error?.config as ApiRequestConfig | undefined
+    const config = error?.config as InternalAxiosRequestConfig | undefined
     const skipErrorHandler = config?.skipErrorHandler
     const status = error?.response?.status
 
     if (status === 401) {
+      if (
+        config?.requestSessionSID &&
+        config.requestSessionSID !== useAuthStore.getState().auth.session?.sid
+      ) {
+        throw new axios.CanceledError('Authentication session changed', config)
+      }
       if (config && !config.skipAuthRefresh && !config.authRetry) {
         config.authRetry = true
         const outcome = await refreshAuthentication()
+        if (
+          outcome.kind === 'transient_error' &&
+          config.requestSessionSID &&
+          config.requestSessionSID !== useAuthStore.getState().auth.session?.sid
+        ) {
+          throw new axios.CanceledError(
+            'Authentication session changed',
+            config
+          )
+        }
         if (outcome.kind === 'authenticated') {
           const token = useAuthStore.getState().auth.accessToken
           if (token) {
-            config.headers = {
-              ...config.headers,
-              Authorization: `Bearer ${token}`,
-            }
+            config.headers.set('Authorization', `Bearer ${token}`)
           }
           return api.request(config)
         }
@@ -156,9 +173,12 @@ api.interceptors.request.use(async (config) => {
     } catch (error) {
       throw axios.AxiosError.from(error, undefined, config)
     }
+    config.requestSessionSID = useAuthStore.getState().auth.session?.sid
     return config
   }
-  const accessToken = useAuthStore.getState().auth.accessToken
+  const auth = useAuthStore.getState().auth
+  config.requestSessionSID = auth.session?.sid
+  const accessToken = auth.accessToken
   if (accessToken) {
     config.headers.Authorization = `Bearer ${accessToken}`
   }

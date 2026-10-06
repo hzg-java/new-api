@@ -28,6 +28,7 @@ import type {
   GetMidjourneyLogsParams,
   GetTaskLogsParams,
   TaskArtifactsResponse,
+  TaskEventsResponse,
   UserInfo,
 } from './types'
 
@@ -112,6 +113,15 @@ export const getAllTaskLogs = (params: GetTaskLogsParams) =>
 
 export const getUserTaskLogs = (params: GetTaskLogsParams) =>
   fetchLogs('/api/task', params, false)
+
+export async function getTaskEvents(
+  taskId: number
+): Promise<TaskEventsResponse> {
+  const response = await api.get<TaskEventsResponse>(
+    `/api/task/${taskId}/events`
+  )
+  return response.data
+}
 
 const taskArtifactRequestConfig = {
   skipBusinessError: true,

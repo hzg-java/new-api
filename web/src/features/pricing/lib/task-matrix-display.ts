@@ -23,37 +23,94 @@ import {
   type ParsedTaskTier,
   type TaskTierCondition,
 } from './billing-expr'
+import { compileBillingExpression } from './billing-expression/parser'
 import { readConditionalTaskPricing } from './billing-expression/task-display'
+import { visitExpression } from './billing-expression/types'
 import {
   getTaskEnumFields,
   taskMatrixRowLabel,
   tryParseTaskMatrixConfig,
 } from './task-expr'
 
-/**
- * Marketplace display helper: expand a recognized task matrix (flat/uniform
- * or a full enum partition) into one row per combination. Returns null when
- * the schema has no enum fields or the expression is not a recognized matrix,
- * so callers keep the raw parsed-tier display.
- */
 export function getTaskMatrixDisplayTiers(
   expression: string | null | undefined,
   schema: BillingUsageSchema | null | undefined
 ): ParsedTaskTier[] | null {
   if (!schema) return null
-  if (getTaskEnumFields(schema).length === 0) return null
+  if (
+    getTaskEnumFields(schema).length === 0 &&
+    !Object.values(schema).some((definition) => definition.type === 'boolean')
+  ) {
+    return null
+  }
 
   const matrix = tryParseTaskMatrixConfig(expression, schema)
-  if (!matrix) return null
+  let tiers: ParsedTaskTier[]
+  if (!matrix) {
+    const { billingExpr } = splitBillingExprAndRequestRules(expression || '')
+    const conditionalTiers = readConditionalTaskPricing(billingExpr, schema)
+    if (
+      !conditionalTiers?.length ||
+      conditionalTiers.some((tier) => tier.conditionText) ||
+      conditionalTiers.every((tier) => tier.conditions.length === 0)
+    ) {
+      return null
+    }
+    tiers = conditionalTiers
+  } else {
+    tiers = matrix.rows.map((row) => ({
+      label: taskMatrixRowLabel(row.combination),
+      conditions: Object.entries(row.combination)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([field, value]) => ({ field, value })),
+      constant: row.constant,
+      unitPrices: { ...row.unitPrices },
+    }))
+  }
 
-  return matrix.rows.map((row) => ({
-    label: taskMatrixRowLabel(row.combination),
-    conditions: Object.entries(row.combination)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([field, value]) => ({ field, value })),
-    constant: row.constant,
-    unitPrices: { ...row.unitPrices },
-  }))
+  const resolutionFields = new Set(
+    ['resolution', 'resolution_tier'].filter((field) =>
+      schema[field]?.enum?.some((value) => value.toLowerCase() === '4k')
+    )
+  )
+  if (resolutionFields.size === 0) return tiers
+
+  const { billingExpr } = splitBillingExprAndRequestRules(expression || '')
+  const compiled = compileBillingExpression(billingExpr)
+  if (compiled.status !== 'ready') return tiers
+
+  let hasResolutionCondition = false
+  let hasExplicit4k = false
+  visitExpression(compiled.ast, (node) => {
+    if (node.kind !== 'binary' || !['==', '!='].includes(node.operator)) return
+    for (const [probe, literal] of [
+      [node.left, node.right],
+      [node.right, node.left],
+    ]) {
+      if (probe.kind !== 'call' || probe.name !== 'u') continue
+      const key = probe.args[0]
+      if (
+        key?.kind !== 'literal' ||
+        typeof key.value !== 'string' ||
+        !resolutionFields.has(key.value) ||
+        literal.kind !== 'literal' ||
+        typeof literal.value !== 'string'
+      ) {
+        continue
+      }
+      hasResolutionCondition = true
+      if (literal.value.toLowerCase() === '4k') hasExplicit4k = true
+    }
+  })
+  if (!hasResolutionCondition || hasExplicit4k) return tiers
+  return tiers.filter(
+    (tier) =>
+      !tier.conditions.some(
+        (condition) =>
+          resolutionFields.has(condition.field) &&
+          condition.value.toLowerCase() === '4k'
+      )
+  )
 }
 
 /** Display explicit conditions for a fallback only when its complement is unique.

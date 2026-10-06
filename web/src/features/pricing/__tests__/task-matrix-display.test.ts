@@ -167,6 +167,85 @@ describe('conditional task price display', () => {
 })
 
 describe('task matrix marketplace display rows', () => {
+  test('expands nested boolean and resolution conditions into exact token prices', () => {
+    const rows = getTaskMatrixDisplayTiers(
+      'u("resolution_tier") == "1080p" ? (u("has_video_input") ? tier("1080p_video", u("tokens") * 31 / 1000000) : tier("1080p", u("tokens") * 51 / 1000000)) : (u("has_video_input") ? tier("sd_video", u("tokens") * 28 / 1000000) : tier("sd", u("tokens") * 46 / 1000000))',
+      {
+        resolution_tier: { enum: ['480p', '720p', '1080p', '4k'] },
+        has_video_input: { type: 'boolean' },
+        tokens: { type: 'number', unit: 'token' },
+      }
+    )
+    expect(
+      rows?.map((row) => [
+        row.conditions.map(
+          (condition) => `${condition.field}:${condition.value}`
+        ),
+        row.unitPrices.tokens,
+      ])
+    ).toEqual([
+      [['resolution_tier:480p', 'has_video_input:false'], 46],
+      [['resolution_tier:480p', 'has_video_input:true'], 28],
+      [['resolution_tier:720p', 'has_video_input:false'], 46],
+      [['resolution_tier:720p', 'has_video_input:true'], 28],
+      [['resolution_tier:1080p', 'has_video_input:false'], 51],
+      [['resolution_tier:1080p', 'has_video_input:true'], 31],
+    ])
+  })
+
+  test('keeps explicitly priced 4k rows and their expression-derived token prices', () => {
+    const rows = getTaskMatrixDisplayTiers(
+      'u("resolution_tier") == "4k" ? tier("ultra", u("tokens") * 16 / 1000000) : u("resolution_tier") == "1080p" ? tier("hd", u("tokens") * 31 / 1000000) : tier("sd", u("tokens") * 28 / 1000000)',
+      {
+        resolution_tier: { enum: ['480p', '720p', '1080p', '4k'] },
+        tokens: { type: 'number', unit: 'token' },
+      }
+    )
+    expect(
+      rows?.map((row) => [row.conditions[0].value, row.unitPrices.tokens])
+    ).toEqual([
+      ['480p', 28],
+      ['720p', 28],
+      ['1080p', 31],
+      ['4k', 16],
+    ])
+  })
+
+  test('does not mistake 4k in an unrelated input field for an explicit 4k resolution price', () => {
+    const rows = getTaskMatrixDisplayTiers(
+      'u("resolution_tier") == "1080p" ? tier("hd", u("tokens") * 31 / 1000000) : u("video_input") == "4k" ? tier("video", u("tokens") * 28 / 1000000) : tier("base", u("tokens") * 46 / 1000000)',
+      {
+        resolution_tier: { enum: ['480p', '720p', '1080p', '4k'] },
+        video_input: { enum: ['none', '4k'] },
+        tokens: { type: 'number', unit: 'token' },
+      }
+    )
+    expect(rows?.map((row) => row.conditions[0].value)).toEqual([
+      '480p',
+      '480p',
+      '720p',
+      '720p',
+      '1080p',
+      '1080p',
+    ])
+  })
+
+  test('keeps all resolutions, including 4k, when the expression prices them uniformly', () => {
+    const rows = getTaskMatrixDisplayTiers(
+      'tier("base", u("tokens") * 10 / 1000000)',
+      {
+        resolution_tier: { enum: ['480p', '720p', '1080p', '4k'] },
+        tokens: { type: 'number', unit: 'token' },
+      }
+    )
+    expect(rows?.map((row) => row.conditions[0].value)).toEqual([
+      '480p',
+      '720p',
+      '1080p',
+      '4k',
+    ])
+  })
+
   test('expands a uniform flat expression into every enum combination', () => {
     const rows = getTaskMatrixDisplayTiers(
       'tier("base", u("seconds") * 0.4)',

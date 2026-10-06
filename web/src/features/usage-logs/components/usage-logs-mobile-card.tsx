@@ -46,6 +46,7 @@ const logTypeRowTint: Record<number, string> = {
 interface UsageLogsMobileListProps<TData> {
   table: Table<TData>
   isLoading?: boolean
+  isAdmin?: boolean
   emptyTitle?: string
   emptyDescription?: string
   logCategory: LogCategory
@@ -239,6 +240,7 @@ function DrawingLogsCard<TData>({
 export function UsageLogsMobileList<TData>({
   table,
   isLoading = false,
+  isAdmin = false,
   emptyTitle,
   emptyDescription,
   logCategory,
@@ -303,6 +305,7 @@ export function UsageLogsMobileList<TData>({
             {logCategory === 'common' && (
               <CommonLogMobileCard
                 log={row.original as UsageLog}
+                isAdmin={isAdmin}
                 cells={cells}
               />
             )}

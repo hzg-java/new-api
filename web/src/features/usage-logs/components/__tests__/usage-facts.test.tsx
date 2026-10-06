@@ -64,7 +64,11 @@ function makeLog(other: LogOtherData): UsageLog {
   }
 }
 
-function renderDetails(other: LogOtherData, promptTokens = 0): QueryClient {
+function renderDetails(
+  other: LogOtherData,
+  promptTokens = 0,
+  isAdmin = false
+): QueryClient {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
@@ -80,7 +84,7 @@ function renderDetails(other: LogOtherData, promptTokens = 0): QueryClient {
     <QueryClientProvider client={queryClient}>
       <DetailsDialog
         log={{ ...makeLog(other), prompt_tokens: promptTokens }}
-        isAdmin={false}
+        isAdmin={isAdmin}
         isRoot={false}
         open
         onOpenChange={() => undefined}
@@ -94,14 +98,40 @@ function rowValue(label: string): string | null {
   return screen.getByText(label).nextElementSibling?.textContent ?? null
 }
 
-test('shows the recorded request and response models in log details', () => {
-  const queryClient = renderDetails({
-    response_model: {
-      requested_model: 'requested-model',
-      upstream_model: 'mapped-model',
-      returned_model: 'unexpected-model',
+test.each([false, true])(
+  'hides model mapping in user details (response observed: %s)',
+  (observed) => {
+    const queryClient = renderDetails({
+      is_model_mapped: true,
+      upstream_model_name: 'mapped-model',
+      response_model: observed
+        ? {
+            requested_model: 'requested-model',
+            upstream_model: 'mapped-model',
+            returned_model: 'unexpected-model',
+          }
+        : undefined,
+    })
+    expect(screen.queryByText('Model Mapping')).not.toBeInTheDocument()
+    expect(screen.queryAllByText('Response Model')).toHaveLength(0)
+    expect(screen.queryByText('mapped-model')).not.toBeInTheDocument()
+    expect(screen.queryByText('unexpected-model')).not.toBeInTheDocument()
+    queryClient.clear()
+  }
+)
+
+test('shows the recorded request and response models in admin log details', () => {
+  const queryClient = renderDetails(
+    {
+      response_model: {
+        requested_model: 'requested-model',
+        upstream_model: 'mapped-model',
+        returned_model: 'unexpected-model',
+      },
     },
-  })
+    0,
+    true
+  )
   expect(screen.getByText('Response model: unexpected-model')).toBeVisible()
   expect(rowValue('Request Model')).toBe('requested-model')
   expect(rowValue('Upstream Model')).toBe('mapped-model')

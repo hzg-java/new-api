@@ -25,22 +25,22 @@ import { ForgotPasswordForm } from './components/forgot-password-form'
 export function ForgotPassword() {
   const { t } = useTranslation()
   return (
-    <AuthLayout>
+    <AuthLayout variant='sign-in' formLabel={t('Forgot password')}>
       <div className='w-full space-y-8'>
         <div className='space-y-3'>
-          <h2 className='text-center text-2xl font-semibold tracking-tight sm:text-left'>
+          <h2 className='text-[34px] leading-tight font-bold tracking-tight text-[#14213b] dark:text-white'>
             {t('Forgot password')}
           </h2>
-          <p className='text-muted-foreground text-left text-sm sm:text-base'>
+          <p className='text-sm leading-6 text-[#8390a5] dark:text-slate-300'>
             {t(
               'Enter your registered email and we will send you a link to reset your password.'
             )}
           </p>
-          <p className='text-muted-foreground text-left text-sm sm:text-base'>
+          <p className='text-sm leading-6 text-[#8390a5] dark:text-slate-300'>
             {t("Don't have an account?")}{' '}
             <Link
               to='/sign-up'
-              className='hover:text-primary font-medium underline underline-offset-4'
+              className='font-semibold text-[#486fe2] hover:underline dark:text-[#9ab7ff]'
             >
               {t('Sign up')}
             </Link>
@@ -48,7 +48,15 @@ export function ForgotPassword() {
           </p>
         </div>
 
-        <ForgotPasswordForm className='space-y-0' />
+        <ForgotPasswordForm />
+        <div className='border-t border-[#ecf0f5] pt-5 text-center dark:border-white/10'>
+          <Link
+            to='/sign-in'
+            className='text-sm font-semibold text-[#486fe2] hover:underline dark:text-[#9ab7ff]'
+          >
+            {t('Back to login')}
+          </Link>
+        </div>
       </div>
     </AuthLayout>
   )

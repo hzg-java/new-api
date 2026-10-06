@@ -222,7 +222,7 @@ export function resolveTaskPreviewMode(
   if (log.result_discarded === true) return 'discarded'
   if (hasProjectedArtifacts) return 'plugin'
   if (log.admin_info?.task_plugin) return 'plugin'
-  if (log.platform === 'suno') return 'legacy-suno'
+  if (log.legacy_audio_available || log.platform === 'suno') return 'legacy-suno'
   if (log.legacy_video_available) return 'legacy-video'
   return 'plugin'
 }

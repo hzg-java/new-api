@@ -98,22 +98,21 @@ export function Stats(_props: StatsProps) {
   const { t } = useTranslation()
 
   const stats: StatItem[] = [
-    { end: 50, suffix: '+', label: t('upstream services integrated') },
     { end: 100, suffix: '+', label: t('model billing support') },
     { end: 50, suffix: '+', label: t('compatible API routes') },
     { end: 10, suffix: '+', label: t('scheduling controls') },
   ]
 
   return (
-    <div className='border-border/40 bg-muted/10 relative z-10 border-y'>
+    <div className='relative z-10 border-y border-[#e7ebf5] bg-[#f8f9ff] dark:border-slate-700 dark:bg-[#121b32]'>
       <div className='mx-auto max-w-6xl px-6 py-10 md:py-12'>
-        <div className='grid grid-cols-2 gap-8 md:grid-cols-4 md:gap-12'>
+        <div className='grid grid-cols-1 gap-8 sm:grid-cols-3 md:gap-12'>
           {stats.map((s) => (
             <div
               key={s.label}
               className='flex flex-col items-center text-center'
             >
-              <span className='text-2xl font-bold tracking-tight md:text-3xl'>
+              <span className='text-2xl font-bold tracking-tight text-[#3468eb] md:text-3xl dark:text-blue-400'>
                 <Counter end={s.end} suffix={s.suffix} decimals={s.decimals} />
               </span>
               <span className='text-muted-foreground mt-1.5 text-xs'>

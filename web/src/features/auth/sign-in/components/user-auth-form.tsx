@@ -18,7 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
 import { Link } from '@tanstack/react-router'
-import { Loader2, LogIn, KeyRound } from 'lucide-react'
+import { Loader2, LogIn, KeyRound, UserRound, LockKeyhole } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
@@ -346,10 +346,17 @@ export function UserAuthForm({
     <Form {...form}>
       <form
         onSubmit={form.handleSubmit(onSubmit)}
-        className={cn('grid gap-4', className)}
+        className={cn(
+          'grid gap-4 text-[#40516c] dark:text-slate-200',
+          className
+        )}
         {...props}
       >
-        {hasAlternativeLogin && alternativeLoginMethods}
+        {passwordLoginEnabled && (
+          <div className='mb-1 border-b border-[#e7ebf3] pb-3 text-sm font-semibold text-[#3c65da] dark:border-white/10 dark:text-[#9ab7ff]'>
+            {t('Password Login')}
+          </div>
+        )}
 
         {passwordLoginEnabled && (
           <>
@@ -359,13 +366,23 @@ export function UserAuthForm({
               name='username'
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>{t('Username or Email')}</FormLabel>
-                  <FormControl>
-                    <Input
-                      placeholder={t('Enter your username or email')}
-                      {...field}
+                  <FormLabel className='text-xs font-semibold'>
+                    {t('Username or Email')}
+                  </FormLabel>
+                  <div className='relative'>
+                    <UserRound
+                      aria-hidden='true'
+                      className='pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-[#9ba9bd]'
                     />
-                  </FormControl>
+                    <FormControl>
+                      <Input
+                        placeholder={t('Enter your username or email')}
+                        autoComplete='username'
+                        className='h-12 rounded-lg border-[#e0e6f0] bg-white pl-10 text-sm focus-visible:border-[#708eef] focus-visible:ring-[#6488ea]/20 dark:border-white/20 dark:bg-transparent'
+                        {...field}
+                      />
+                    </FormControl>
+                  </div>
                   <FormMessage />
                 </FormItem>
               )}
@@ -377,33 +394,33 @@ export function UserAuthForm({
               name='password'
               render={({ field }) => (
                 <FormItem className='relative'>
-                  <FormLabel>{t('Password')}</FormLabel>
-                  <FormControl>
-                    <PasswordInput
-                      placeholder={t('Enter password')}
-                      {...field}
+                  <FormLabel className='text-xs font-semibold'>
+                    {t('Password')}
+                  </FormLabel>
+                  <div className='relative'>
+                    <LockKeyhole
+                      aria-hidden='true'
+                      className='pointer-events-none absolute top-1/2 left-3 z-10 h-4 w-4 -translate-y-1/2 text-[#9ba9bd]'
                     />
-                  </FormControl>
+                    <FormControl>
+                      <PasswordInput
+                        placeholder={t('Enter password')}
+                        autoComplete='current-password'
+                        className='[&_input]:h-12 [&_input]:rounded-lg [&_input]:border-[#e0e6f0] [&_input]:bg-white [&_input]:pl-10 [&_input]:text-sm dark:[&_input]:border-white/20 dark:[&_input]:bg-transparent'
+                        {...field}
+                      />
+                    </FormControl>
+                  </div>
                   <FormMessage />
                   <Link
                     to='/forgot-password'
-                    className='text-muted-foreground absolute end-0 -top-0.5 z-10 text-sm font-medium hover:opacity-75'
+                    className='absolute end-0 -top-0.5 z-10 text-xs font-medium text-[#5275da] hover:underline dark:text-[#9ab7ff]'
                   >
                     {t('Forgot password?')}
                   </Link>
                 </FormItem>
               )}
             />
-
-            {/* Submit Button */}
-            <Button
-              type='submit'
-              className='mt-2 w-full justify-center gap-2'
-              disabled={isLoading || (requiresLegalConsent && !agreedToLegal)}
-            >
-              {isLoading ? <Loader2 className='animate-spin' /> : <LogIn />}
-              {t('Sign in')}
-            </Button>
 
             {/* Turnstile */}
             {isTurnstileEnabled && (
@@ -423,10 +440,31 @@ export function UserAuthForm({
           status={status}
           checked={agreedToLegal}
           onCheckedChange={setAgreedToLegal}
-          className='mt-1'
+          className='mt-1 border-0 bg-transparent p-0 dark:[&_[data-slot=checkbox]]:border-slate-400'
         />
 
-        {!hasAlternativeLogin && alternativeLoginMethods}
+        {passwordLoginEnabled && (
+          <Button
+            type='submit'
+            className='mt-1 h-12 w-full justify-center gap-2 rounded-lg bg-[linear-gradient(105deg,#6080ea,#4266dd)] text-white shadow-[0_8px_18px_rgba(69,107,213,0.22)] hover:brightness-105'
+            disabled={isLoading || (requiresLegalConsent && !agreedToLegal)}
+          >
+            {isLoading ? <Loader2 className='animate-spin' /> : <LogIn />}
+            {t('Sign in')}
+          </Button>
+        )}
+
+        {hasAlternativeLogin && (
+          <div
+            className={cn(
+              'mt-2',
+              passwordLoginEnabled &&
+                'border-t border-[#ecf0f5] pt-3 dark:border-white/10'
+            )}
+          >
+            {alternativeLoginMethods}
+          </div>
+        )}
       </form>
 
       {hasWeChatLogin && (

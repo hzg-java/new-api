@@ -60,6 +60,7 @@ type LogField = {
 /** Mobile summaries use tappable fields; desktop tooltip cells cannot reveal full text on touch. */
 export function CommonLogMobileCard<TData>(props: {
   log: UsageLog
+  isAdmin: boolean
   cells: Map<string, Cell<TData, unknown>>
 }) {
   const { t } = useTranslation()
@@ -69,7 +70,7 @@ export function CommonLogMobileCard<TData>(props: {
   const other = parseLogOther(log.other)
   const displayable = isDisplayableLogType(log.type)
   const timing = isTimingLogType(log.type)
-  const model = formatModelName(log)
+  const model = formatModelName(log, props.isAdmin)
   const config = getLogTypeConfig(log.type)
   const group = log.group || other?.group || ''
   const groupRatio =
@@ -84,7 +85,7 @@ export function CommonLogMobileCard<TData>(props: {
     },
     cost: {
       label: t('Cost'),
-      value: formatLogQuota(log.quota),
+      value: other?.task_billing_pending ? '—' : formatLogQuota(log.quota),
       visible: displayable && props.cells.has('quota'),
     },
     time: {

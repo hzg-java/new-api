@@ -674,7 +674,7 @@ export function useCommonLogsColumns(
           const log = row.original
           if (!isDisplayableLogType(log.type)) return null
 
-          const modelInfo = formatModelName(log)
+          const modelInfo = formatModelName(log, isAdmin)
 
           return (
             <div className='flex w-fit flex-col gap-0.5'>
@@ -889,7 +889,12 @@ export function useCommonLogsColumns(
       }
     )
 
-    return columns
+    return isAdmin
+      ? columns
+      : columns.filter(
+          (column) =>
+            !('accessorKey' in column && column.accessorKey === 'content')
+        )
     // Log formatters read currency settings from the store.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [t, isAdmin, isRoot, showBillingSource, currency])

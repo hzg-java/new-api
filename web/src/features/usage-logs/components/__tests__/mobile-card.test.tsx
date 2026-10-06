@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import {
+  flexRender,
   getCoreRowModel,
   useReactTable,
   type VisibilityState,
@@ -57,6 +58,7 @@ const log = usageLogSchema.parse({
 
 function Fixture(props: {
   admin?: boolean
+  desktop?: boolean
   visibility?: VisibilityState
   logs?: UsageLog[]
   loading?: boolean
@@ -69,6 +71,23 @@ function Fixture(props: {
     getCoreRowModel: getCoreRowModel(),
     state: { columnVisibility: props.visibility ?? {} },
   })
+  if (props.desktop) {
+    return (
+      <>
+        {table.getRowModel().rows.map((row) => {
+          const cell = row
+            .getVisibleCells()
+            .find((cell) => cell.column.id === 'model_name')
+          if (!cell) throw new Error('Missing model column')
+          return (
+            <div key={row.id}>
+              {flexRender(cell.column.columnDef.cell, cell.getContext())}
+            </div>
+          )
+        })}
+      </>
+    )
+  }
   return (
     <>
       <button type='button' onClick={() => context.setSensitiveVisible(false)}>
@@ -77,6 +96,7 @@ function Fixture(props: {
       <UsageLogsMobileList
         table={table}
         logCategory='common'
+        isAdmin={props.admin ?? true}
         isLoading={props.loading}
       />
     </>
@@ -96,6 +116,68 @@ function renderLogs(props: Parameters<typeof Fixture>[0] = {}) {
     </QueryClientProvider>
   )
 }
+
+it.each([false, true])(
+  'shows only the request model for mobile user logs (response observed: %s)',
+  async (observed) => {
+    const user = userEvent.setup()
+    const copy = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue()
+    renderLogs({
+      admin: false,
+      logs: [
+        {
+          ...log,
+          other: JSON.stringify({
+            is_model_mapped: true,
+            upstream_model_name: 'mapped-model',
+            response_model: observed
+              ? {
+                  requested_model: longName,
+                  upstream_model: 'mapped-model',
+                  returned_model: 'unexpected-model',
+                }
+              : undefined,
+          }),
+        },
+      ],
+    })
+    await user.click(screen.getByRole('button', { name: `Model: ${longName}` }))
+    expect(copy).toHaveBeenCalledWith(longName)
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(screen.queryByText('mapped-model')).not.toBeInTheDocument()
+    expect(screen.queryByText('unexpected-model')).not.toBeInTheDocument()
+  }
+)
+
+it.each([false, true])(
+  'desktop model cells expose response models only to admins (admin: %s)',
+  (admin) => {
+    renderLogs({
+      admin,
+      desktop: true,
+      logs: [
+        {
+          ...log,
+          other: JSON.stringify({
+            response_model: {
+              requested_model: longName,
+              upstream_model: 'mapped-model',
+              returned_model: 'unexpected-model',
+            },
+          }),
+        },
+      ],
+    })
+    expect(screen.getByText(longName)).toBeVisible()
+    if (admin) {
+      expect(screen.getByText('Response model: unexpected-model')).toBeVisible()
+    } else {
+      expect(
+        screen.queryByText('Response model: unexpected-model')
+      ).not.toBeInTheDocument()
+    }
+  }
+)
 
 it('shows model mismatch evidence when tapping the mobile model badge', async () => {
   const user = userEvent.setup()

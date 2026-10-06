@@ -41,11 +41,13 @@ type TaskDto struct {
 	Group                string `json:"group"`
 	ChannelId            int    `json:"channel_id"`
 	Quota                int    `json:"quota"`
+	BillingMode          string `json:"billing_mode,omitempty"`
 	Action               string `json:"action"`
 	Status               string `json:"status"`
 	FailReason           string `json:"fail_reason"`
 	ResultURL            string `json:"result_url,omitempty"` // 任务结果 URL（视频地址等）
 	LegacyVideoAvailable bool   `json:"legacy_video_available,omitempty"`
+	LegacyAudioAvailable bool   `json:"legacy_audio_available,omitempty"`
 	// ResultDiscarded marks a synchronous result that was returned inline and
 	// never persisted; the UI must not offer artifact retrieval for it.
 	ResultDiscarded bool            `json:"result_discarded,omitempty"`
@@ -58,6 +60,15 @@ type TaskDto struct {
 	Data            json.RawMessage `json:"data"`
 	AdminInfo       *TaskAdminInfo  `json:"admin_info,omitempty"`
 	RootInfo        *TaskRootInfo   `json:"root_info,omitempty"`
+	VideoInfo       *TaskVideoInfo  `json:"video_info,omitempty"`
+}
+
+// TaskVideoInfo is a credential-free display snapshot, never a billing input.
+type TaskVideoInfo struct {
+	Resolution        string   `json:"resolution,omitempty"`
+	DurationSeconds   *float64 `json:"duration_seconds,omitempty"`
+	HasReferenceVideo *bool    `json:"has_reference_video,omitempty"`
+	ConsumedTokens    *int     `json:"consumed_tokens,omitempty"`
 }
 
 type TaskPluginInfo struct {

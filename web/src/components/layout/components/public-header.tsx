@@ -59,6 +59,7 @@ export interface PublicHeaderProps {
   showNavigation?: boolean
   showAuthButtons?: boolean
   showNotifications?: boolean
+  landingNavigation?: boolean
   className?: string
 }
 
@@ -98,6 +99,28 @@ export function PublicHeader(props: PublicHeaderProps) {
   const isAuthenticated = !!user
   const displaySiteName = customSiteName || systemName
   const links = dynamicLinks.length > 0 ? dynamicLinks : navLinks
+  let headerWidthClass = scrolled
+    ? 'max-w-[52rem] px-3 pt-3'
+    : 'max-w-7xl px-4 pt-0 md:px-6'
+  let headerSurfaceClass = scrolled
+    ? 'bg-background/60 ring-border/50 h-12 rounded-2xl pr-1.5 pl-4 shadow-[0_2px_16px_-6px_rgba(0,0,0,0.08),0_0_0_0.5px_rgba(0,0,0,0.02)] ring-[0.5px] backdrop-blur-2xl dark:shadow-[0_2px_16px_-6px_rgba(0,0,0,0.4)]'
+    : 'h-16 px-2'
+  if (props.landingNavigation) {
+    headerWidthClass = 'max-w-[1440px] px-5 sm:px-7'
+    headerSurfaceClass = 'h-14 md:h-16'
+  }
+  const landingLinks: TopNavLink[] = props.landingNavigation
+    ? [
+        ...links.filter((link) => link.href === '/'),
+        ...links
+          .filter((link) => link.href === '/pricing')
+          .map((link) => ({ ...link, title: t('Model Square') })),
+        ...links.filter((link) => link.href === '/dashboard'),
+        ...links.filter(
+          (link) => !['/', '/pricing', '/dashboard'].includes(link.href)
+        ),
+      ]
+    : links
 
   let logoContent: ReactNode = (
     <HeaderLogo
@@ -199,32 +222,42 @@ export function PublicHeader(props: PublicHeaderProps) {
 
   return (
     <>
-      <header className='pointer-events-none fixed inset-x-0 top-0 z-50'>
+      <header
+        className={cn(
+          'pointer-events-none fixed inset-x-0 top-0 z-50',
+          props.landingNavigation &&
+            'border-b border-white/50 bg-[#f4f6ff]/80 backdrop-blur-xl dark:border-slate-700/50 dark:bg-[#0d1224]/85'
+        )}
+      >
         <div
           className={cn(
             'pointer-events-auto mx-auto transition-all duration-700 ease-[cubic-bezier(0.16,1,0.3,1)]',
-            scrolled ? 'max-w-[52rem] px-3 pt-3' : 'max-w-7xl px-4 pt-0 md:px-6'
+            headerWidthClass
           )}
         >
           <nav
             className={cn(
               'flex items-center justify-between gap-2 transition-all duration-700 ease-[cubic-bezier(0.16,1,0.3,1)]',
-              scrolled
-                ? 'bg-background/60 ring-border/50 h-12 rounded-2xl pr-1.5 pl-4 shadow-[0_2px_16px_-6px_rgba(0,0,0,0.08),0_0_0_0.5px_rgba(0,0,0,0.02)] ring-[0.5px] backdrop-blur-2xl dark:shadow-[0_2px_16px_-6px_rgba(0,0,0,0.4)]'
-                : 'h-16 px-2'
+              headerSurfaceClass
             )}
           >
             {/* Logo */}
             <div className='@container/system-brand flex min-w-0 flex-1 items-center gap-1 lg:min-w-36'>
               <Link
                 to={homeUrl}
-                className='group flex min-w-0 items-center gap-2.5'
+                className={cn(
+                  'group flex min-w-0 items-center gap-2.5',
+                  props.landingNavigation && 'text-[#456ad7] dark:text-blue-300'
+                )}
               >
                 <div className='flex size-7 shrink-0 items-center justify-center transition-all duration-300 group-hover:scale-105'>
                   {logoContent}
                 </div>
                 <span
-                  className='max-w-48 truncate text-sm font-semibold tracking-tight'
+                  className={cn(
+                    'max-w-48 truncate font-semibold tracking-tight',
+                    props.landingNavigation ? 'text-lg' : 'text-sm'
+                  )}
                   title={displaySiteName}
                 >
                   {loading ? (
@@ -234,12 +267,21 @@ export function PublicHeader(props: PublicHeaderProps) {
                   )}
                 </span>
               </Link>
-              <SystemUpdateAction presentation='version' />
+              {!props.landingNavigation && (
+                <SystemUpdateAction presentation='version' />
+              )}
             </div>
 
             {/* Desktop nav */}
-            <div className='hidden min-w-0 items-center gap-0.5 lg:flex'>
-              {links.map((link) => {
+            <div
+              className={cn(
+                'hidden min-w-0 items-center lg:flex',
+                props.landingNavigation
+                  ? 'absolute left-1/2 -translate-x-1/2 gap-1 rounded-xl bg-white/65 p-1 shadow-[0_3px_18px_rgba(66,89,155,.08)] dark:bg-slate-800/70'
+                  : 'gap-0.5'
+              )}
+            >
+              {landingLinks.map((link) => {
                 const isActive = pathname === link.href
                 if (link.external) {
                   return (
@@ -247,13 +289,19 @@ export function PublicHeader(props: PublicHeaderProps) {
                       key={`${link.title}:${link.href}`}
                       href={link.href}
                       title={t(link.title)}
-                      target='_blank'
-                      rel='noopener noreferrer'
+                      target={link.href.startsWith('/') ? undefined : '_blank'}
+                      rel={
+                        link.href.startsWith('/')
+                          ? undefined
+                          : 'noopener noreferrer'
+                      }
                       aria-disabled={link.disabled}
                       tabIndex={link.disabled ? -1 : undefined}
                       onClick={(event) => handleNavLinkClick(event, link)}
                       className={cn(
                         'text-muted-foreground hover:text-foreground min-w-0 truncate rounded-lg px-3 py-1.5 text-sm font-medium transition-colors duration-200',
+                        props.landingNavigation &&
+                          'px-4 text-[13px] text-slate-700 hover:bg-blue-50 dark:text-slate-200 dark:hover:bg-slate-700',
                         link.disabled && 'pointer-events-none opacity-50'
                       )}
                     >
@@ -270,9 +318,14 @@ export function PublicHeader(props: PublicHeaderProps) {
                     onClick={(event) => handleNavLinkClick(event, link)}
                     className={cn(
                       'min-w-0 truncate rounded-lg px-3 py-1.5 text-sm font-medium transition-colors duration-200',
+                      props.landingNavigation && 'px-4 text-[13px]',
                       isActive
                         ? 'text-foreground'
                         : 'text-muted-foreground hover:text-foreground',
+                      props.landingNavigation &&
+                        (isActive
+                          ? 'bg-[#e7edff] text-[#456ad7] dark:bg-blue-500/20 dark:text-blue-300'
+                          : 'text-slate-700 hover:bg-blue-50 dark:text-slate-200 dark:hover:bg-slate-700'),
                       link.disabled && 'pointer-events-none opacity-50'
                     )}
                   >
@@ -281,15 +334,18 @@ export function PublicHeader(props: PublicHeaderProps) {
                 )
               })}
 
-              {(showLanguageSwitcher ||
-                showThemeSwitch ||
-                showNotifications) && (
-                <div className='bg-border/40 mx-2 h-4 w-px' />
-              )}
+              {!props.landingNavigation &&
+                (showLanguageSwitcher ||
+                  showThemeSwitch ||
+                  showNotifications) && (
+                  <div className='bg-border/40 mx-2 h-4 w-px' />
+                )}
 
-              {showLanguageSwitcher && <LanguageSwitcher />}
-              {showThemeSwitch && <ThemeSwitch />}
-              {showNotifications && (
+              {!props.landingNavigation && showLanguageSwitcher && (
+                <LanguageSwitcher />
+              )}
+              {!props.landingNavigation && showThemeSwitch && <ThemeSwitch />}
+              {!props.landingNavigation && showNotifications && (
                 <NotificationPopover
                   open={notifications.popoverOpen}
                   onOpenChange={notifications.setPopoverOpen}
@@ -302,13 +358,30 @@ export function PublicHeader(props: PublicHeaderProps) {
                 />
               )}
 
-              {showAuthButtons && (
+              {showAuthButtons && !props.landingNavigation && (
                 <>
                   <div className='bg-border/40 mx-1 h-4 w-px' />
                   {authContent}
                 </>
               )}
             </div>
+
+            {props.landingNavigation && (
+              <div className='hidden min-w-0 items-center gap-3 lg:flex'>
+                {showLanguageSwitcher && <LanguageSwitcher />}
+                {showThemeSwitch && <ThemeSwitch />}
+                {showAuthButtons && (
+                  <div className='flex items-center gap-2 rounded-full bg-white/60 px-2 py-1 dark:bg-slate-800/60'>
+                    {authContent}
+                    {isAuthenticated && (
+                      <span className='max-w-28 truncate pr-1 text-xs font-medium text-slate-700 dark:text-slate-200'>
+                        {user?.username}
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Mobile: compact actions + hamburger */}
             <div className='flex shrink-0 items-center gap-2 lg:hidden'>
@@ -361,7 +434,7 @@ export function PublicHeader(props: PublicHeaderProps) {
       >
         <div className='flex h-full flex-col justify-between px-8 pt-20 pb-10'>
           <nav className='flex flex-col gap-1'>
-            {links.map((link, i) => {
+            {landingLinks.map((link, i) => {
               const isActive = pathname === link.href
               const linkClassName = cn(
                 'flex items-center gap-3 py-3 text-base font-medium tracking-tight transition-all duration-500 ease-[cubic-bezier(0.16,1,0.3,1)]',
@@ -379,8 +452,12 @@ export function PublicHeader(props: PublicHeaderProps) {
                   <a
                     key={`${link.title}:${link.href}`}
                     href={link.href}
-                    target='_blank'
-                    rel='noopener noreferrer'
+                    target={link.href.startsWith('/') ? undefined : '_blank'}
+                    rel={
+                      link.href.startsWith('/')
+                        ? undefined
+                        : 'noopener noreferrer'
+                    }
                     aria-disabled={link.disabled}
                     tabIndex={link.disabled ? -1 : undefined}
                     onClick={(event) => handleNavLinkClick(event, link, true)}

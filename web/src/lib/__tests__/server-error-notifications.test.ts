@@ -30,6 +30,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 
 import { saveModelPricing } from '@/features/model-pricing/api'
 import { useUpdateOption } from '@/features/system-settings/hooks/use-update-option'
+import { clearAuthenticatedClientState } from '@/lib/auth-session'
 import { handleServerError } from '@/lib/handle-server-error'
 import { api } from '@/lib/http-client'
 import { createAppQueryClient } from '@/lib/query-client'
@@ -277,8 +278,8 @@ it('handles circular error causes and prioritizes translated stable error codes'
   expect(notify).toHaveBeenCalledTimes(1)
 })
 
-it.each([200, 401])(
-  'refreshes a 401 through the real auth client and only reports a terminal failure (refresh HTTP %i)',
+it.each([200, 401, 'logout'] as const)(
+  'refreshes a 401 through the real auth client and only reports a terminal failure (refresh result %s)',
   async (refreshStatus) => {
     window.history.replaceState({}, '', '/sign-in')
     const original: AuthBundle = {
@@ -306,8 +307,14 @@ it.each([200, 401])(
     const open = vi.spyOn(XMLHttpRequest.prototype, 'open')
     vi.spyOn(XMLHttpRequest.prototype, 'send').mockImplementation(
       function (this: XMLHttpRequest) {
+        if (refreshStatus === 'logout') {
+          clearAuthenticatedClientState(client, false)
+        }
         Object.defineProperties(this, {
-          status: { value: refreshStatus, configurable: true },
+          status: {
+            value: refreshStatus === 'logout' ? 401 : refreshStatus,
+            configurable: true,
+          },
           statusText: { value: 'Refresh response', configurable: true },
           responseText: {
             value: JSON.stringify({
@@ -344,19 +351,25 @@ it.each([200, 401])(
     }
     const notify = vi.spyOn(toast, 'error').mockReturnValue('error')
     const client = createAppQueryClient()
-    await client
-      .fetchQuery({
-        queryKey: ['refresh', refreshStatus],
-        queryFn: () => api.get('/protected'),
-        retry: false,
-      })
-      .catch(handleServerError)
+    const request =
+      refreshStatus === 'logout'
+        ? api.get('/protected')
+        : client.fetchQuery({
+            queryKey: ['refresh', refreshStatus],
+            queryFn: () => api.get('/protected'),
+            retry: false,
+          })
+    await request.catch(handleServerError)
     expect(open).toHaveBeenCalledTimes(1)
     expect(open.mock.calls[0][1]).toBe('/api/user/auth/refresh')
     if (refreshStatus === 200) {
       expect(requests).toBe(2)
       expect(notify).not.toHaveBeenCalled()
       expect(useAuthStore.getState().auth.accessToken).toBe('fresh-access')
+    } else if (refreshStatus === 'logout') {
+      expect(requests).toBe(1)
+      expect(notify).not.toHaveBeenCalled()
+      expect(useAuthStore.getState().auth.accessToken).toBeNull()
     } else {
       expect(requests).toBe(1)
       expect(notify.mock.calls.map(([message]) => message)).toEqual([
@@ -364,6 +377,60 @@ it.each([200, 401])(
       ])
       expect(useAuthStore.getState().auth.accessToken).toBeNull()
     }
+    client.clear()
+  }
+)
+
+it.each([false, true])(
+  'keeps a late 401 silent after signing out (new session: %s)',
+  async (signInAgain) => {
+    const bundle: AuthBundle = {
+      access_token: 'old-access',
+      token_type: 'Bearer',
+      access_expires_at: 2_000_000_000,
+      user: { id: 1, username: 'test-user', role: 1 },
+      session: {
+        sid: 'old-session',
+        current: true,
+        login_method: 'password',
+        ip: '',
+        user_agent: '',
+        created_at: 1,
+        last_active_at: 1,
+        expires_at: 2_000_000_000,
+      },
+    }
+    useAuthStore.getState().auth.setBundle(bundle)
+    const client = createAppQueryClient()
+    const notify = vi.spyOn(toast, 'error').mockReturnValue('error')
+    const send = vi.spyOn(XMLHttpRequest.prototype, 'send')
+    api.defaults.adapter = async (config) => {
+      clearAuthenticatedClientState(client, false)
+      if (signInAgain) {
+        useAuthStore.getState().auth.setBundle({
+          ...bundle,
+          access_token: 'new-access',
+          session: { ...bundle.session, sid: 'new-session' },
+        })
+      }
+      throw new AxiosError('HTTP 401', 'ERR_BAD_REQUEST', config, undefined, {
+        data: { message: 'Access token expired' },
+        status: 401,
+        statusText: 'Unauthorized',
+        headers: {},
+        config,
+      })
+    }
+    const failure = await api.get('/late-protected').catch((error: unknown) => {
+      handleServerError(error)
+      return error
+    })
+    expect(failure).toBeInstanceOf(CanceledError)
+    expect(send).not.toHaveBeenCalled()
+    expect(notify).not.toHaveBeenCalled()
+    expect(useAuthStore.getState().auth.accessToken).toBe(
+      signInAgain ? 'new-access' : null
+    )
     client.clear()
   }
 )
