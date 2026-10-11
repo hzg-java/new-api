@@ -91,8 +91,6 @@ function buildSearchSourceKey(values: {
   token?: unknown
   group?: unknown
   username?: unknown
-  requestId?: unknown
-  upstreamRequestId?: unknown
   type?: unknown
 }) {
   return [
@@ -103,8 +101,6 @@ function buildSearchSourceKey(values: {
     values.token,
     values.group,
     values.username,
-    values.requestId,
-    values.upstreamRequestId,
     Array.isArray(values.type) ? values.type.join(',') : values.type,
   ]
     .map((value) => String(value ?? ''))
@@ -155,8 +151,6 @@ export function CommonLogsFilterBar<TData>(
       token: searchParams.token,
       group: searchParams.group,
       username: searchParams.username,
-      requestId: searchParams.requestId,
-      upstreamRequestId: searchParams.upstreamRequestId,
       type: searchParams.type,
     }
     const filters: CommonLogFilters = {
@@ -169,8 +163,6 @@ export function CommonLogsFilterBar<TData>(
       token: searchParams.token || undefined,
       group: searchParams.group || undefined,
       username: searchParams.username || undefined,
-      requestId: searchParams.requestId || undefined,
-      upstreamRequestId: searchParams.upstreamRequestId || undefined,
     }
     return {
       sourceKey: buildSearchSourceKey(sourceValues),
@@ -185,8 +177,6 @@ export function CommonLogsFilterBar<TData>(
     searchParams.token,
     searchParams.group,
     searchParams.username,
-    searchParams.requestId,
-    searchParams.upstreamRequestId,
     searchParams.type,
   ])
   const [draft, setDraft] = useState<CommonLogDraft>(() => searchState)
@@ -262,11 +252,7 @@ export function CommonLogsFilterBar<TData>(
   )
 
   const hasExpandedFilters =
-    !!filters.token ||
-    !!filters.username ||
-    !!filters.channel ||
-    !!filters.requestId ||
-    !!filters.upstreamRequestId
+    !!filters.token || !!filters.username || !!filters.channel
 
   const hasTypeFilter = logType !== LOG_TYPE_ALL_VALUE
   const hasAdditionalFilters =
@@ -276,8 +262,6 @@ export function CommonLogsFilterBar<TData>(
     filters.token,
     isAdmin ? filters.username : undefined,
     isAdmin ? filters.channel : undefined,
-    filters.requestId,
-    filters.upstreamRequestId,
   ].filter(Boolean).length
   const sensitiveInputClass = sensitiveVisible
     ? undefined
@@ -464,22 +448,6 @@ export function CommonLogsFilterBar<TData>(
           />
         </LogsFilterField>
       )}
-      <LogsFilterField>
-        <LogsFilterInput
-          placeholder={t('Request ID')}
-          value={filters.requestId || ''}
-          onChange={(e) => handleChange('requestId', e.target.value)}
-          onKeyDown={handleKeyDown}
-        />
-      </LogsFilterField>
-      <LogsFilterField>
-        <LogsFilterInput
-          placeholder={t('Upstream Request ID')}
-          value={filters.upstreamRequestId || ''}
-          onChange={(e) => handleChange('upstreamRequestId', e.target.value)}
-          onKeyDown={handleKeyDown}
-        />
-      </LogsFilterField>
     </>
   )
 

@@ -75,7 +75,13 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 		}
 	}
 	billingModelName := info.GetBillingModelName()
+	multiplier := info.ModelPricingMultiplier(info.GetOriginModelName(), func() float64 {
+		return ratio_setting.GetModelPricingMultiplier(info.GetOriginModelName(), billingModelName) * ratio_setting.GetUserModelPricingMultiplier(info.UserId, info.GetOriginModelName())
+	})
 	modelPrice, usePrice := ratio_setting.GetModelPrice(billingModelName, false)
+	if usePrice {
+		modelPrice *= multiplier
+	}
 
 	groupRatioInfo := HandleGroupRatio(c, info)
 
@@ -86,6 +92,7 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 
 	var preConsumedQuota int
 	var modelRatio float64
+	var rawModelRatio float64
 	var completionRatio float64
 	var cacheRatio float64
 	var imageRatio float64
@@ -104,6 +111,8 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 		var success bool
 		var matchName string
 		modelRatio, success, matchName = ratio_setting.GetModelRatio(billingModelName)
+		rawModelRatio = modelRatio
+		modelRatio *= multiplier
 		if !success {
 			acceptUnsetRatio := false
 			if info.UserSetting.AcceptUnsetRatioModel {
@@ -160,20 +169,23 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 	}
 
 	priceData := hosttypes.PriceData{
-		FreeModel:            freeModel,
-		ModelPrice:           modelPrice,
-		ModelRatio:           modelRatio,
-		CompletionRatio:      completionRatio,
-		GroupRatioInfo:       groupRatioInfo,
-		UsePrice:             usePrice,
-		CacheRatio:           cacheRatio,
-		ImageRatio:           imageRatio,
-		AudioRatio:           audioRatio,
-		AudioCompletionRatio: audioCompletionRatio,
-		CacheCreationRatio:   cacheCreationRatio,
-		CacheCreation5mRatio: cacheCreationRatio5m,
-		CacheCreation1hRatio: cacheCreationRatio1h,
-		QuotaToPreConsume:    preConsumedQuota,
+		RawModelRatio:         rawModelRatio,
+		LegacyPriceResolved:   true,
+		GeminiAudioInputPrice: operation_setting.GetGeminiInputAudioPricePerMillionTokens(info.GetOriginModelName()) * multiplier,
+		FreeModel:             freeModel,
+		ModelPrice:            modelPrice,
+		ModelRatio:            modelRatio,
+		CompletionRatio:       completionRatio,
+		GroupRatioInfo:        groupRatioInfo,
+		UsePrice:              usePrice,
+		CacheRatio:            cacheRatio,
+		ImageRatio:            imageRatio,
+		AudioRatio:            audioRatio,
+		AudioCompletionRatio:  audioCompletionRatio,
+		CacheCreationRatio:    cacheCreationRatio,
+		CacheCreation5mRatio:  cacheCreationRatio5m,
+		CacheCreation1hRatio:  cacheCreationRatio1h,
+		QuotaToPreConsume:     preConsumedQuota,
 	}
 	if usePrice {
 		for name, ratio := range meta.BillingRatios {
@@ -239,6 +251,14 @@ func ModelPriceHelperPerCall(c *gin.Context, info *relaycommon.RelayInfo) (hostt
 		}
 	}
 
+	multiplier := info.ModelPricingMultiplier(info.OriginModelName, func() float64 {
+		return ratio_setting.GetModelPricingMultiplier(info.OriginModelName) * ratio_setting.GetUserModelPricingMultiplier(info.UserId, info.OriginModelName)
+	})
+	if usePrice {
+		modelPrice *= multiplier
+	} else {
+		modelRatio *= multiplier
+	}
 	var quota int
 	freeModel := false
 
@@ -340,9 +360,22 @@ func resolveBillingModelName(origin string) string {
 }
 
 func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billingModelName string, promptTokens int, groupRatioInfo hosttypes.GroupRatioInfo) (hosttypes.PriceData, error) {
-	exprStr, ok := billing_setting.GetBillingExpr(billingModelName)
-	if !ok {
-		return hosttypes.PriceData{}, fmt.Errorf("model %s is configured as tiered_expr but has no billing expression", billingModelName)
+	var exprStr string
+	if snapshot := info.TieredBillingSnapshot; snapshot != nil && snapshot.ModelName == billingModelName {
+		exprStr = snapshot.ExprString
+	} else {
+		var ok bool
+		exprStr, ok = billing_setting.GetBillingExpr(billingModelName)
+		if !ok {
+			return hosttypes.PriceData{}, fmt.Errorf("model %s is configured as tiered_expr but has no billing expression", billingModelName)
+		}
+		var scaleErr error
+		exprStr, scaleErr = billingexpr.ScalePricingExpression(exprStr, info.ModelPricingMultiplier(info.GetOriginModelName(), func() float64 {
+			return ratio_setting.GetModelPricingMultiplier(info.GetOriginModelName(), billingModelName) * ratio_setting.GetUserModelPricingMultiplier(info.UserId, info.GetOriginModelName())
+		}))
+		if scaleErr != nil {
+			return hosttypes.PriceData{}, scaleErr
+		}
 	}
 	exprHash := billingexpr.ExprHashString(exprStr)
 	if info.RelayFormat == types.RelayFormatOpenAIRealtime && billingexpr.UsesFixedPricingByHash(exprStr, exprHash) {

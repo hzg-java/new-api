@@ -149,6 +149,8 @@ func InitOptionMap() {
 	common.OptionMap["ModelRequestRateLimitDurationMinutes"] = strconv.Itoa(setting.ModelRequestRateLimitDurationMinutes)
 	common.OptionMap["ModelRequestRateLimitSuccessCount"] = strconv.Itoa(setting.ModelRequestRateLimitSuccessCount)
 	common.OptionMap["ModelRequestRateLimitGroup"] = setting.ModelRequestRateLimitGroup2JSONString()
+	common.OptionMap[UserModelPricingMultiplierOption] = ratio_setting.UserModelPricingMultiplier2JSONString()
+	common.OptionMap["ModelPricingMultiplier"] = ratio_setting.ModelPricingMultiplier2JSONString()
 	common.OptionMap["ModelRatio"] = ratio_setting.ModelRatio2JSONString()
 	common.OptionMap["ModelPrice"] = ratio_setting.ModelPrice2JSONString()
 	common.OptionMap["CacheRatio"] = ratio_setting.CacheRatio2JSONString()
@@ -195,6 +197,8 @@ func InitOptionMap() {
 }
 
 func loadOptionsFromDatabase() {
+	userModelPricingMutex.Lock()
+	defer userModelPricingMutex.Unlock()
 	requestPolicyOptionMutex.Lock()
 	defer requestPolicyOptionMutex.Unlock()
 	defer func() {
@@ -228,6 +232,10 @@ func SyncOptions(frequency int) {
 }
 
 func validateOptionValue(key string, value string) error {
+	if key == UserModelPricingMultiplierOption {
+		_, err := ratio_setting.ParseUserModelPricingMultipliers(value)
+		return err
+	}
 	if err := operation_setting.ValidateQuotaOption(key, value); err != nil {
 		return err
 	}
@@ -244,6 +252,9 @@ func validateOptionValue(key string, value string) error {
 }
 
 func UpdateOption(key string, value string) error {
+	if key == UserModelPricingMultiplierOption {
+		return UpdateOptionsBulk(map[string]string{key: value})
+	}
 	if IsRequestPolicyOption(key) {
 		return UpdateRequestPolicyOptions(map[string]string{key: value})
 	}
@@ -280,6 +291,10 @@ func UpdateOption(key string, value string) error {
 func UpdateOptionsBulk(values map[string]string) error {
 	if len(values) == 0 {
 		return nil
+	}
+	if _, ok := values[UserModelPricingMultiplierOption]; ok {
+		userModelPricingMutex.Lock()
+		defer userModelPricingMutex.Unlock()
 	}
 	for key := range values {
 		if IsPasskeyDomainOption(key) {
@@ -626,6 +641,10 @@ func updateOptionMap(key string, value string) (err error) {
 		common.DataExportInterval, _ = strconv.Atoi(value)
 	case "DataExportDefaultTime":
 		common.DataExportDefaultTime = value
+	case UserModelPricingMultiplierOption:
+		err = ratio_setting.UpdateUserModelPricingMultiplierByJSONString(value)
+	case "ModelPricingMultiplier":
+		err = ratio_setting.UpdateModelPricingMultiplierByJSONString(value)
 	case "ModelRatio":
 		err = ratio_setting.UpdateModelRatioByJSONString(value)
 	case "GroupRatio":

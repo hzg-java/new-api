@@ -51,6 +51,7 @@ import {
 } from './model-ratio-visual-editor'
 
 type ModelFormValues = {
+  ModelPricingMultiplier: string
   ModelPrice: string
   ModelRatio: string
   CacheRatio: string
@@ -76,6 +77,7 @@ type ModelRatioFormProps = {
 }
 
 type ModelJsonFieldName =
+  | 'ModelPricingMultiplier'
   | 'ModelPrice'
   | 'ModelRatio'
   | 'CacheRatio'
@@ -90,6 +92,12 @@ const modelJsonFields: Array<{
   labelKey: string
   descriptionKey: string
 }> = [
+  {
+    name: 'ModelPricingMultiplier',
+    labelKey: 'Pricing multiplier',
+    descriptionKey:
+      'Applies to all prices for this model. Defaults to 1. Users only see final prices.',
+  },
   {
     name: 'ModelPrice',
     labelKey: 'Model fixed pricing',
@@ -307,6 +315,8 @@ export const ModelRatioForm = memo(function ModelRatioForm({
           <div className='flex min-h-0 flex-1 flex-col gap-6'>
             <ModelRatioVisualEditor
               ref={visualEditorRef}
+              savedModelPricingMultiplier={savedValues.ModelPricingMultiplier}
+              modelPricingMultiplier={form.watch('ModelPricingMultiplier')}
               savedModelPrice={savedValues.ModelPrice}
               savedModelRatio={savedValues.ModelRatio}
               savedCacheRatio={savedValues.CacheRatio}

@@ -80,7 +80,11 @@ import {
   type DynamicPriceEntry,
 } from '../lib/dynamic-price'
 import { parseTags } from '../lib/filters'
-import { getAvailableGroups, isTokenBasedModel } from '../lib/model-helpers'
+import {
+  getAvailableGroups,
+  isTokenBasedModel,
+  withFinalGroupPrice,
+} from '../lib/model-helpers'
 import { withPluginPricing } from '../lib/plugin-pricing'
 import { formatFixedPrice, formatGroupPrice } from '../lib/price'
 import {
@@ -722,7 +726,7 @@ function PriceSection(props: {
     if (dynamicSummary.isSpecialExpression) {
       return (
         <section>
-          <SectionTitle>{t('Base Price')}</SectionTitle>
+          <SectionTitle>{t('Price')}</SectionTitle>
           {dynamicSummary.isTaskUsage ? (
             <p className='text-muted-foreground text-sm'>
               {t('Pricing details cannot be displayed for this model.')}
@@ -756,7 +760,7 @@ function PriceSection(props: {
 
     return (
       <section>
-        <SectionTitle>{t('Base Price')}</SectionTitle>
+        <SectionTitle>{t('Price')}</SectionTitle>
         {dynamicSummary.providerCount && (
           <p className='text-muted-foreground mb-2 text-xs'>
             {t('{{count}} providers', { count: dynamicSummary.providerCount })}
@@ -842,10 +846,13 @@ function PriceSection(props: {
     )
   }
 
-  if (isUnconfiguredTaskUsageModel(props.model)) {
+  if (
+    isUnconfiguredTaskUsageModel(props.model) ||
+    (props.model.billing_mode === 'tiered_expr' && !props.model.billing_expr)
+  ) {
     return (
       <section>
-        <SectionTitle>{t('Base Price')}</SectionTitle>
+        <SectionTitle>{t('Price')}</SectionTitle>
         <UnconfiguredTaskPricingNotice model={props.model} />
       </section>
     )
@@ -854,7 +861,7 @@ function PriceSection(props: {
   if (!isTokenBased) {
     return (
       <section>
-        <SectionTitle>{t('Base Price')}</SectionTitle>
+        <SectionTitle>{t('Price')}</SectionTitle>
         <div className='flex items-baseline justify-between'>
           <span className='text-muted-foreground text-sm'>
             {t('Per request')}
@@ -895,7 +902,7 @@ function PriceSection(props: {
 
   return (
     <section>
-      <SectionTitle>{t('Base Price')}</SectionTitle>
+      <SectionTitle>{t('Price')}</SectionTitle>
       <div className='grid grid-cols-2 gap-2'>
         {primaryPriceTypes.map((item) => (
           <div key={item.type} className='bg-muted/20 rounded-lg border p-3'>
@@ -1011,6 +1018,32 @@ type GroupPricingSectionProps = {
 
 function GroupPricingSection(props: GroupPricingSectionProps) {
   const { t } = useTranslation()
+  if (props.model.group_prices) {
+    return (
+      <section>
+        <SectionTitle>{t('Pricing by Group')}</SectionTitle>
+        <div className='space-y-4'>
+          {props.model.enable_groups.map((group) => {
+            const finalModel = withFinalGroupPrice(props.model, group)
+            return (
+              <div key={group} className='space-y-3'>
+                <GroupBadge group={group} size='sm' />
+                <GroupPricingSection
+                  {...props}
+                  model={{
+                    ...finalModel,
+                    group_prices: undefined,
+                    enable_groups: [group],
+                  }}
+                  groupRatio={{ [group]: 1 }}
+                />
+              </div>
+            )
+          })}
+        </div>
+      </section>
+    )
+  }
   const variants = props.model.billing_plugin_variants
   if (!variants?.length) {
     return <ProviderGroupPricingSection {...props} />
@@ -1297,9 +1330,6 @@ function ProviderGroupPricingSection(
               <div key={group} className='overflow-hidden rounded-lg border'>
                 <div className='bg-muted/20 flex items-center justify-between gap-3 border-b px-3 py-2'>
                   <GroupBadge group={group} size='sm' />
-                  <span className='text-muted-foreground font-mono text-xs'>
-                    {ratio}x
-                  </span>
                 </div>
                 <StaticDataTable
                   className='rounded-none border-0'
@@ -1561,7 +1591,10 @@ function ProviderGroupPricingSection(
     )
   }
 
-  if (isUnconfiguredTaskUsageModel(props.model)) {
+  if (
+    isUnconfiguredTaskUsageModel(props.model) ||
+    (props.model.billing_mode === 'tiered_expr' && !props.model.billing_expr)
+  ) {
     return (
       <section>
         {!props.hideTitle && (
@@ -1611,13 +1644,6 @@ function ProviderGroupPricingSection(
             className: thClass,
             cellClassName: 'py-2.5',
             cell: (group) => <GroupBadge group={group} size='sm' />,
-          },
-          {
-            id: 'ratio',
-            header: t('Ratio'),
-            className: thClass,
-            cellClassName: 'text-muted-foreground py-2.5 font-mono',
-            cell: (group) => `${props.groupRatio[group] || 1}x`,
           },
           ...(isTokenBased
             ? [
@@ -1690,6 +1716,7 @@ export interface ModelDetailsContentProps {
 }
 
 export function ModelDetailsContent(props: ModelDetailsContentProps) {
+  props = { ...props, model: withFinalGroupPrice(props.model) }
   const { t } = useTranslation()
   const showRechargePrice = props.showRechargePrice ?? false
 

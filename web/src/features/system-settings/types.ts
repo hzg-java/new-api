@@ -245,6 +245,7 @@ export type ModelSettings = {
   'claude.thinking_adapter_budget_tokens_percentage': number
   'grok.violation_deduction_enabled': boolean
   'grok.violation_deduction_amount': number
+  ModelPricingMultiplier: string
   ModelPrice: string
   ModelRatio: string
   CacheRatio: string
@@ -285,6 +286,7 @@ export type BillingSettings = {
   'general_setting.custom_currency_exchange_rate': number
   DisplayInCurrencyEnabled: boolean
   DisplayTokenStatEnabled: boolean
+  ModelPricingMultiplier: string
   ModelPrice: string
   ModelRatio: string
   CacheRatio: string

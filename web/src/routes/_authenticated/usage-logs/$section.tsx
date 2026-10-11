@@ -20,6 +20,7 @@ import { createFileRoute, redirect } from '@tanstack/react-router'
 import z from 'zod'
 
 import { UsageLogs } from '@/features/usage-logs'
+import { TASK_STATUS } from '@/features/usage-logs/constants'
 import {
   isUsageLogsSectionId,
   USAGE_LOGS_DEFAULT_SECTION,
@@ -43,8 +44,7 @@ const usageLogsSearchSchema = z.object({
   channel: z.string().optional().catch(''),
   group: z.string().optional().catch(''),
   username: z.string().optional().catch(''),
-  requestId: z.string().optional().catch(''),
-  upstreamRequestId: z.string().optional().catch(''),
+  status: z.enum(TASK_STATUS).optional().catch(undefined),
   startTime: z.number().optional(),
   endTime: z.number().optional(),
 })

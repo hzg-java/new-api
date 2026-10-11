@@ -163,8 +163,14 @@ export function PricingConversionDialog(props: {
                     {t(row.label)}
                   </dt>
                   <dd className='font-mono text-sm tabular-nums'>
-                    {formatPricingAmount(row.value, props.currency)} /{' '}
-                    {unitLabel}
+                    {formatPricingAmount(
+                      Number(row.value) *
+                        Number(
+                          props.preview.effective.ModelPricingMultiplier ?? 1
+                        ),
+                      props.currency
+                    )}{' '}
+                    / {unitLabel}
                   </dd>
                 </div>
               )

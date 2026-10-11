@@ -3,7 +3,7 @@ package controller
 import (
 	"net/http"
 
-	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -26,22 +26,29 @@ func GetGroups(c *gin.Context) {
 func GetUserGroups(c *gin.Context) {
 	usableGroups := make(map[string]map[string]any)
 	userGroup := ""
-	userId := c.GetInt("id")
-	userGroup, _ = model.GetUserGroup(userId, false)
+	isAdmin := false
+	// UserAuth/TryUserAuth populate group and role from the validated user.
+	// The anonymous route has neither; do not query a nonexistent user ID.
+	if c.GetInt("id") > 0 {
+		userGroup = c.GetString("group")
+		isAdmin = c.GetInt("role") >= common.RoleAdminUser
+	}
 	userUsableGroups := service.GetUserUsableGroups(userGroup)
-	for groupName, _ := range ratio_setting.GetGroupRatioCopy() {
+	for groupName := range ratio_setting.GetGroupRatioCopy() {
 		// UserUsableGroups contains the groups that the user can use
 		if desc, ok := userUsableGroups[groupName]; ok {
-			usableGroups[groupName] = map[string]any{
-				"ratio": service.GetUserGroupRatio(userGroup, groupName),
-				"desc":  desc,
+			usableGroups[groupName] = map[string]any{"desc": desc}
+			if isAdmin {
+				usableGroups[groupName]["ratio"] = service.GetUserGroupRatio(userGroup, groupName)
 			}
 		}
 	}
 	if _, ok := userUsableGroups["auto"]; ok {
 		usableGroups["auto"] = map[string]any{
-			"ratio": "自动",
-			"desc":  setting.GetUsableGroupDescription("auto"),
+			"desc": setting.GetUsableGroupDescription("auto"),
+		}
+		if isAdmin {
+			usableGroups["auto"]["ratio"] = "自动"
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{

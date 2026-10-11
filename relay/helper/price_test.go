@@ -22,6 +22,99 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestUserModelPricingMultiplierIsolatedAndFrozen(t *testing.T) {
+	oldRatios := ratio_setting.ModelRatio2JSONString()
+	oldMultipliers := ratio_setting.ModelPricingMultiplier2JSONString()
+	oldUserMultipliers := ratio_setting.UserModelPricingMultiplier2JSONString()
+	oldConfig := config.GlobalConfig.ExportAllConfigs()
+	t.Cleanup(func() {
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(oldRatios))
+		require.NoError(t, ratio_setting.UpdateModelPricingMultiplierByJSONString(oldMultipliers))
+		require.NoError(t, ratio_setting.UpdateUserModelPricingMultiplierByJSONString(oldUserMultipliers))
+		require.NoError(t, config.GlobalConfig.LoadFromDB(oldConfig))
+	})
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"personal-model":1}`))
+	require.NoError(t, ratio_setting.UpdateModelPricingMultiplierByJSONString(`{"personal-model":1.5}`))
+	require.NoError(t, ratio_setting.UpdateUserModelPricingMultiplierByJSONString(`{"101::personal-model":0.8}`))
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{"group_ratio_setting.group_ratio": `{"default":2}`}))
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	for _, tc := range []struct{ user, want int }{{101, 2400}, {102, 3000}} {
+		info := &relaycommon.RelayInfo{UserId: tc.user, OriginModelName: "personal-model", UsingGroup: "default", UserGroup: "default"}
+		price, err := ModelPriceHelper(ctx, info, 1000, &types.TokenCountMeta{})
+		require.NoError(t, err)
+		assert.Equal(t, tc.want, price.QuotaToPreConsume)
+		assert.Empty(t, price.OtherRatios())
+	}
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		"billing_setting.billing_mode": `{"personal-model":"tiered_expr"}`,
+		"billing_setting.billing_expr": `{"personal-model":"tier(\"base\", p * 2 + c * 8)"}`,
+	}))
+	info := &relaycommon.RelayInfo{UserId: 101, OriginModelName: "personal-model", UsingGroup: "default", UserGroup: "default", BillingRequestInput: &billingexpr.RequestInput{}}
+	price, err := ModelPriceHelper(ctx, info, 1000, &types.TokenCountMeta{})
+	require.NoError(t, err)
+	assert.Equal(t, 2400, price.QuotaToPreConsume)
+	require.NoError(t, ratio_setting.UpdateUserModelPricingMultiplierByJSONString(`{"101::personal-model":5}`))
+	result, err := billingexpr.ComputeTieredQuotaWithRequest(info.TieredBillingSnapshot, billingexpr.TokenParams{P: 1000, C: 100, Len: 1000}, billingexpr.RequestInput{})
+	require.NoError(t, err)
+	assert.Equal(t, 3360, result.ActualQuotaAfterGroup)
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{"billing_setting.billing_expr": `{"personal-model":"tier(\"base\", p * 99)"}`}))
+	price, err = ModelPriceHelper(ctx, info, 1000, &types.TokenCountMeta{})
+	require.NoError(t, err)
+	assert.Equal(t, 2400, price.QuotaToPreConsume, "reusing the request must retain its starting price")
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{"billing_setting.billing_expr": `{}`}))
+	price, err = ModelPriceHelper(ctx, info, 1000, &types.TokenCountMeta{})
+	require.NoError(t, err)
+	assert.Equal(t, 2400, price.QuotaToPreConsume, "removing configuration must not invalidate an active request")
+}
+
+func TestModelPricingMultiplierFreezesEffectivePrices(t *testing.T) {
+	oldRatios, oldPrices := ratio_setting.ModelRatio2JSONString(), ratio_setting.ModelPrice2JSONString()
+	saved := map[string]string{}
+	require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error { saved[key] = value; return nil }))
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{"group_ratio_setting.group_ratio": `{"default":1}`}))
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-4o":1.25}`))
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"dall-e-3":0.04}`))
+	t.Cleanup(func() {
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(oldRatios))
+		require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(oldPrices))
+		require.NoError(t, config.GlobalConfig.LoadFromDB(saved))
+	})
+	previous := ratio_setting.ModelPricingMultiplier2JSONString()
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelPricingMultiplierByJSONString(previous)) })
+	require.NoError(t, ratio_setting.UpdateModelPricingMultiplierByJSONString(`{"gpt-4o":1.5,"dall-e-3":2}`))
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	info := &relaycommon.RelayInfo{OriginModelName: "gpt-4o", UsingGroup: "default", UserGroup: "default"}
+	price, err := ModelPriceHelper(ctx, info, 1000, &types.TokenCountMeta{})
+	require.NoError(t, err)
+	assert.Equal(t, 1.875, price.ModelRatio)
+	assert.Equal(t, 1875, price.QuotaToPreConsume)
+	assert.Empty(t, price.OtherRatios())
+	info.OriginModelName = "dall-e-3"
+	price, err = ModelPriceHelperPerCall(ctx, info)
+	require.NoError(t, err)
+	assert.Equal(t, 0.08, price.ModelPrice)
+	assert.Equal(t, 40000, price.Quota)
+	assert.Error(t, ratio_setting.UpdateModelPricingMultiplierByJSONString(`{"gpt-4o":0}`))
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		"billing_setting.billing_mode": `{"gpt-4o":"tiered_expr"}`,
+		"billing_setting.billing_expr": `{"gpt-4o":"tier(\"base\", p * 2 + c * 8)"}`,
+	}))
+	info.OriginModelName = "gpt-4o"
+	info.BillingRequestInput = &billingexpr.RequestInput{}
+	price, err = ModelPriceHelper(ctx, info, 1000, &types.TokenCountMeta{})
+	require.NoError(t, err)
+	assert.Equal(t, 1500, price.QuotaToPreConsume)
+	require.NotNil(t, info.TieredBillingSnapshot)
+	assert.Equal(t, `tier("base", p * 3 + c * 12)`, info.TieredBillingSnapshot.ExprString)
+	require.NoError(t, ratio_setting.UpdateModelPricingMultiplierByJSONString(`{"gpt-4o":9}`))
+	result, err := billingexpr.ComputeTieredQuotaWithRequest(info.TieredBillingSnapshot, billingexpr.TokenParams{P: 1000, C: 100, Len: 1000}, billingexpr.RequestInput{})
+	require.NoError(t, err)
+	assert.Equal(t, 2100, result.ActualQuotaAfterGroup)
+	assert.Equal(t, 1.0, ratio_setting.GetModelPricingMultiplier("unconfigured"))
+}
+
 func TestModelPriceHelperTieredUsesPreloadedRequestInput(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

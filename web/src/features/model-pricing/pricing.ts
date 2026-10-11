@@ -31,6 +31,7 @@ import type { ModelPricingEntry } from './api'
 
 export const PRICING_KEYS = [
   'ModelPrice',
+  'ModelPricingMultiplier',
   'ModelRatio',
   'CompletionRatio',
   'CacheRatio',
@@ -68,6 +69,12 @@ export function modelPricingDisplay(
     Partial<Pick<ModelPricingEntry, 'configured' | 'cache_write_mode'>>
 ): PricingModel {
   const values = entry.effective
+  const multiplier = Number(values.ModelPricingMultiplier ?? 1)
+  const expression = values['billing_setting.billing_expr']
+  let displayExpression: string | undefined
+  if (typeof expression === 'string') {
+    displayExpression = multiplier === 1 ? expression : `(${expression}) * ${multiplier}`
+  }
   return {
     id: 0,
     model_name: entry.model_name,
@@ -77,10 +84,12 @@ export function modelPricingDisplay(
       values['billing_setting.billing_mode'] !== 'tiered_expr'
         ? 1
         : 0,
-    model_ratio: Number(values.ModelRatio ?? Number.NaN),
+    model_ratio: Number(values.ModelRatio ?? Number.NaN) * multiplier,
     completion_ratio: Number(values.CompletionRatio ?? Number.NaN),
     model_price:
-      values.ModelPrice === undefined ? undefined : Number(values.ModelPrice),
+      values.ModelPrice === undefined
+        ? undefined
+        : Number(values.ModelPrice) * multiplier,
     cache_ratio:
       values.CacheRatio === undefined || Number(values.CacheRatio) === 1
         ? undefined
@@ -108,10 +117,7 @@ export function modelPricingDisplay(
       typeof values['billing_setting.billing_mode'] === 'string'
         ? values['billing_setting.billing_mode']
         : undefined,
-    billing_expr:
-      typeof values['billing_setting.billing_expr'] === 'string'
-        ? values['billing_setting.billing_expr']
-        : undefined,
+    billing_expr: displayExpression,
     billing_usage_schema: entry.usage_schema,
   }
 }
@@ -146,6 +152,7 @@ export function pricingOptions(
 export function pricingRows(options: PricingOptions): ModelPricingSnapshot[] {
   return buildModelSnapshots({
     modelPrice: options.ModelPrice,
+    modelPricingMultiplier: options.ModelPricingMultiplier,
     modelRatio: options.ModelRatio,
     completionRatio: options.CompletionRatio,
     cacheRatio: options.CacheRatio,
@@ -193,13 +200,19 @@ export function pricingRow(
   return {
     ...row,
     name,
+    pricingMultiplier: String(values.ModelPricingMultiplier ?? 1),
     billingMode,
     pluginBillingExpr: values['billing_setting.plugin_billing_expr'],
   }
 }
 
 export function pricingFromDraft(data: ModelRatioData): PricingValues {
+  const multiplier = Number(data.pricingMultiplier ?? 1)
+  if (!Number.isFinite(multiplier) || multiplier <= 0) {
+    throw new Error(t('Enter a finite, positive pricing multiplier'))
+  }
   const values: PricingValues = {
+    ...(multiplier === 1 ? {} : { ModelPricingMultiplier: multiplier }),
     ...(data.pluginBillingExpr === undefined
       ? {}
       : { 'billing_setting.plugin_billing_expr': data.pluginBillingExpr }),
@@ -330,7 +343,12 @@ export function applyPriceSyncSelections(
 ): PricingOptions {
   let result = options
   for (const [name, fields] of Object.entries(selections)) {
-    const next: PricingValues = {}
+    const multiplierMap = JSON.parse(
+      options.ModelPricingMultiplier ?? '{}'
+    ) as Record<string, number>
+    const next: PricingValues = {
+      ModelPricingMultiplier: multiplierMap[name] ?? 1,
+    }
     const expression =
       typeof fields.billing_expr === 'string' &&
       fields.billing_expr.trim() !== ''

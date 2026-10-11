@@ -43,6 +43,7 @@ const defaultModelSettings: ModelSettings = {
   'claude.thinking_adapter_budget_tokens_percentage': 0.8,
   'grok.violation_deduction_enabled': true,
   'grok.violation_deduction_amount': 0.05,
+  ModelPricingMultiplier: '{}',
   ModelPrice: '',
   ModelRatio: '',
   CacheRatio: '',

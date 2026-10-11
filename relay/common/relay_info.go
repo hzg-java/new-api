@@ -81,6 +81,18 @@ type TokenCountMeta struct {
 	estimatePromptTokens int
 }
 
+func (info *RelayInfo) ModelPricingMultiplier(modelName string, resolve func() float64) float64 {
+	if value, ok := info.PricingMultipliers[modelName]; ok {
+		return value
+	}
+	value := resolve()
+	if info.PricingMultipliers == nil {
+		info.PricingMultipliers = make(map[string]float64)
+	}
+	info.PricingMultipliers[modelName] = value
+	return value
+}
+
 type RelayInfo struct {
 	TokenId           int
 	TokenKey          string
@@ -177,6 +189,7 @@ type RelayInfo struct {
 	// and again before settlement. Non-nil only when billing mode is "tiered_expr".
 	TieredBillingSnapshot *billingexpr.BillingSnapshot
 	BillingRequestInput   *billingexpr.RequestInput
+	PricingMultipliers    map[string]float64 `json:"-"`
 	BillingImageCount     *int
 	// ImageRequestCount is the effective quantity sent on the current attempt;
 	// ImageQuotaBeforeGroup is the frozen legacy estimate before request ratios.

@@ -55,7 +55,17 @@ export type BillingPluginVariant = {
   billing_usage_examples?: BillingUsageExample[]
 }
 
+export type FinalGroupPrice = {
+  quota_type: number
+  billing_mode: string
+  billing_expr?: string
+  billing_usage_schema?: BillingUsageSchema
+  billing_usage_examples?: BillingUsageExample[]
+  billing_plugin_variants?: BillingPluginVariant[]
+}
+
 export type PricingModel = {
+  group_prices?: Record<string, FinalGroupPrice>
   billing_plugin_variants?: BillingPluginVariant[]
   id: number
   model_name: string
@@ -126,8 +136,7 @@ export type PricingData = {
   message?: string
   data: PricingModel[]
   vendors: PricingVendor[]
-  group_ratio: Record<string, number>
-  usable_group: Record<string, { desc: string; ratio: number }>
+  usable_group: Record<string, string>
   supported_endpoint: Record<string, string>
   auto_groups: string[]
 }

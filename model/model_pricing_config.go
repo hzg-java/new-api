@@ -65,7 +65,7 @@ var ErrModelPricingConflict = errors.New("model pricing changed; reload before s
 // the transaction also serializes the first write to an unconfigured database.
 var modelPricingOptionKeys = []string{
 	"AudioCompletionRatio", "AudioRatio", "CacheRatio", "CompletionRatio",
-	"CreateCacheRatio", "ImageRatio", "ModelPrice", "ModelRatio",
+	"CreateCacheRatio", "ImageRatio", "ModelPrice", "ModelPricingMultiplier", "ModelRatio",
 	"billing_setting.billing_expr", "billing_setting.billing_mode", billing_setting.PluginBillingExprOption,
 }
 
@@ -169,6 +169,9 @@ func replaceModelPricing(values map[string]map[string]any, name string, draft Pr
 
 func effectiveModelPricing(values map[string]map[string]any, name string) PricingValues {
 	result := modelPricingValues(values, name)
+	if _, exists := result["ModelPricingMultiplier"]; !exists {
+		result["ModelPricingMultiplier"] = float64(1)
+	}
 	// Legacy wildcard aliases are resolved by the same normalization as relay.
 	alias := ratio_setting.FormatMatchingModelName(name)
 	for _, key := range []string{"ModelPrice", "ModelRatio", "CompletionRatio", "AudioRatio", "AudioCompletionRatio"} {
@@ -444,6 +447,9 @@ func validateModelPricing(name string, values, previous PricingValues) error {
 			continue
 		}
 		number, ok := value.(float64)
+		if key == "ModelPricingMultiplier" && (!ok || number <= 0) {
+			return fmt.Errorf("%s must be a finite, positive number", key)
+		}
 		if !ok || math.IsNaN(number) || math.IsInf(number, 0) || number < 0 {
 			return fmt.Errorf("%s must be a finite, non-negative number", key)
 		}

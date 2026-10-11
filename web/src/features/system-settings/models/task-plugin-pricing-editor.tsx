@@ -51,6 +51,7 @@ type TaskPluginPricingEditorProps = {
   modelExpression: string
   modelBillingMode?: 'ratio' | 'tiered_expr'
   currency: PricingCurrency
+  previewCurrency?: PricingCurrency
   children: ReactNode
 }
 
@@ -245,6 +246,7 @@ export function TaskPluginPricingEditor(props: TaskPluginPricingEditorProps) {
             {separate ? (
               <TaskUsagePricingEditor
                 currency={props.currency}
+                previewCurrency={props.previewCurrency}
                 billingExpr={split.billingExpr}
                 requestRuleExpr={split.requestRuleExpr}
                 usageSchema={variant.usage_schema}

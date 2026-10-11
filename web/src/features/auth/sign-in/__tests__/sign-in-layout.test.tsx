@@ -143,8 +143,8 @@ it('renders the split brand and accessible password fields when password sign-in
   )
   expect(screen.getByRole('button', { name: 'Sign in' })).toBeEnabled()
   expect(
-    screen.getByRole('link', { name: 'Forgot password?' })
-  ).toHaveAttribute('href', '/forgot-password')
+    screen.queryByRole('link', { name: 'Forgot password?' })
+  ).not.toBeInTheDocument()
   expect(screen.getByRole('link', { name: 'Sign up' })).toHaveAttribute(
     'href',
     '/sign-up'

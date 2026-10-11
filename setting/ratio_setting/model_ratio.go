@@ -1,7 +1,10 @@
 package ratio_setting
 
 import (
+	"fmt"
 	"maps"
+	"math"
+	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -319,6 +322,88 @@ var defaultAudioCompletionRatio = map[string]float64{
 	"tts-1-hd":             0,
 	"tts-1-1106":           0,
 	"tts-1-hd-1106":        0,
+}
+
+var userModelPricingMultiplierMap = types.NewRWMap[string, float64]()
+
+func UserModelPricingMultiplier2JSONString() string {
+	return userModelPricingMultiplierMap.MarshalJSONString()
+}
+
+// ParseUserModelPricingMultipliers validates the persisted flat user/client-model map.
+func ParseUserModelPricingMultipliers(raw string) (map[string]float64, error) {
+	var values map[string]float64
+	if err := common.UnmarshalJsonStr(raw, &values); err != nil {
+		return nil, err
+	}
+	if values == nil {
+		return nil, fmt.Errorf("UserModelPricingMultiplier must be a JSON object")
+	}
+	for key, value := range values {
+		id, name, ok := strings.Cut(key, "::")
+		userID, err := strconv.Atoi(id)
+		if !ok || err != nil || userID <= 0 || strconv.Itoa(userID) != id || strings.TrimSpace(name) == "" {
+			return nil, fmt.Errorf("invalid user model pricing key: %q", key)
+		}
+		if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+			return nil, fmt.Errorf("UserModelPricingMultiplier must be finite and positive")
+		}
+	}
+	return values, nil
+}
+
+func UpdateUserModelPricingMultiplierByJSONString(raw string) error {
+	if _, err := ParseUserModelPricingMultipliers(raw); err != nil {
+		return err
+	}
+	return types.LoadFromJsonString(userModelPricingMultiplierMap, raw)
+}
+
+// GetUserModelPricingMultiplier matches only the exact client model, never channel aliases.
+func GetUserModelPricingMultiplier(userID int, modelName string) float64 {
+	if value, ok := userModelPricingMultiplierMap.Get(strconv.Itoa(userID) + "::" + modelName); ok {
+		return value
+	}
+	return 1
+}
+
+var modelPricingMultiplierMap = types.NewRWMap[string, float64]()
+
+func ModelPricingMultiplier2JSONString() string {
+	return modelPricingMultiplierMap.MarshalJSONString()
+}
+
+func UpdateModelPricingMultiplierByJSONString(raw string) error {
+	var values map[string]float64
+	if err := common.UnmarshalJsonStr(raw, &values); err != nil {
+		return err
+	}
+	if values == nil {
+		return fmt.Errorf("ModelPricingMultiplier must be a JSON object")
+	}
+	for _, value := range values {
+		if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+			return fmt.Errorf("ModelPricingMultiplier must be finite and positive")
+		}
+	}
+	return types.LoadFromJsonStringWithCallback(modelPricingMultiplierMap, raw, InvalidateExposedDataCache)
+}
+
+// GetModelPricingMultiplier never uses channel-mapped names. An exact client
+// override wins over the billing identity and legacy wildcard fallback.
+func GetModelPricingMultiplier(model string, aliases ...string) float64 {
+	candidates := append([]string{model}, aliases...)
+	candidates = append(candidates, hostreasoning.CanonicalBillingModelNames(model)...)
+	candidates = append(candidates, hostreasoning.BaseModelName(model))
+	for _, name := range candidates {
+		if value, ok := modelPricingMultiplierMap.Get(name); ok {
+			return value
+		}
+		if value, ok := modelPricingMultiplierMap.Get(FormatMatchingModelName(name)); ok {
+			return value
+		}
+	}
+	return 1
 }
 
 var modelPriceMap = types.NewRWMap[string, float64]()

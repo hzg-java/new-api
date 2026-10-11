@@ -33,6 +33,7 @@ import { IconBadge } from '@/components/ui/icon-badge'
 import { Switch } from '@/components/ui/switch'
 import { api } from '@/lib/api'
 import { handleServerError } from '@/lib/handle-server-error'
+import { ROLE } from '@/lib/roles'
 import { useAuthStore } from '@/stores/auth-store'
 
 type SidebarModuleConfig = {
@@ -126,11 +127,17 @@ export function SidebarModulesCard() {
           title: t('Personal Settings'),
           description: t('Personal info settings'),
         },
-        {
-          key: 'security',
-          title: t('Security & Access'),
-          description: t('Manage your security settings and account access'),
-        },
+        ...((currentUser?.role ?? 0) >= ROLE.ADMIN
+          ? [
+              {
+                key: 'security',
+                title: t('Security & Access'),
+                description: t(
+                  'Manage your security settings and account access'
+                ),
+              },
+            ]
+          : []),
       ],
     },
   ]

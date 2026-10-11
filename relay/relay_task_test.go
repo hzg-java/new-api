@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -403,6 +404,105 @@ func TestSharedTaskBillingExpressionSelectionAndFrozenSettlement(t *testing.T) {
 			assert.Equal(t, float64(2), info.TieredBillingSnapshot.UsageFacts[field])
 			assert.Equal(t, 2*info.TieredBillingSnapshot.EstimatedQuotaAfterGroup, result.ActualQuotaAfterGroup)
 			assert.Equal(t, tc.wantExpr, info.TieredBillingSnapshot.ExprString)
+		})
+	}
+}
+
+func TestRelayTaskSubmitStacksUserDefaultAndGroupPricing(t *testing.T) {
+	oldRedis, oldBatch := common.RedisEnabled, common.BatchUpdateEnabled
+	common.RedisEnabled, common.BatchUpdateEnabled = false, false
+	t.Cleanup(func() { common.RedisEnabled, common.BatchUpdateEnabled = oldRedis, oldBatch })
+	service.InitHttpClient()
+	for _, mode := range []string{"fixed", "token", "expression"} {
+		t.Run(mode, func(t *testing.T) {
+			saveBillingConfig(t)
+			oldDefault := ratio_setting.ModelPricingMultiplier2JSONString()
+			oldUser := ratio_setting.UserModelPricingMultiplier2JSONString()
+			oldGroups := ratio_setting.GroupRatio2JSONString()
+			oldPrices := ratio_setting.ModelPrice2JSONString()
+			oldRatios := ratio_setting.ModelRatio2JSONString()
+			t.Cleanup(func() {
+				require.NoError(t, ratio_setting.UpdateModelPricingMultiplierByJSONString(oldDefault))
+				require.NoError(t, ratio_setting.UpdateUserModelPricingMultiplierByJSONString(oldUser))
+				require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(oldGroups))
+				require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(oldPrices))
+				require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(oldRatios))
+			})
+			require.NoError(t, ratio_setting.UpdateModelPricingMultiplierByJSONString(`{"declared-model":2}`))
+			require.NoError(t, ratio_setting.UpdateUserModelPricingMultiplierByJSONString(`{"91::declared-model":0.75,"92::declared-model":7}`))
+			require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"billing-test":3}`))
+			require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{}`))
+			require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"declared-model":0.04}`))
+			modes, expressions := `{}`, `{}`
+			if mode == "fixed" {
+				require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"declared-model":0.02}`))
+			}
+			if mode == "expression" {
+				modes = `{"declared-model":"tiered_expr"}`
+				expressions = `{"declared-model":"tier(\"base\", u(\"seconds\") * 0.01)"}`
+			}
+			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+				"billing_setting.billing_mode": modes, "billing_setting.billing_expr": expressions,
+				billing_setting.PluginBillingExprOption: `{}`,
+			}))
+			database := setupRelayChannelDB(t)
+			require.NoError(t, database.AutoMigrate(&model.User{}, &model.Token{}))
+			const initialQuota = 1_000_000
+			require.NoError(t, database.Create(&model.User{Id: 91, Username: "billing-task", Quota: initialQuota}).Error)
+			require.NoError(t, database.Create(&model.Token{Id: 91, UserId: 91, Key: "billing-task", RemainQuota: initialQuota}).Error)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"job-frozen"}`))
+			}))
+			defer server.Close()
+			c, info := newTaskSubmitContext(t, "declared-model", "")
+			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, server.URL)
+			c.Set("group", "billing-test")
+			info.UserId, info.TokenId, info.TokenKey = 91, 91, "billing-task"
+			info.UserSetting.BillingPreference = "wallet_only"
+			info.UserGroup, info.UsingGroup = "billing-test", "billing-test"
+			info.OriginModelName = "declared-model"
+			source := strings.Replace(billingFallbackPlugin, `fetchMode:"per_task"`, `fetchMode:"per_task",usageSchema:{seconds:{type:"number",unit:"second"}}`, 1)
+			source += `export function extractUsage(){return {seconds:2};}`
+			pinMappingOrderPlugin(t, c, source)
+			result, taskErr := RelayTaskSubmit(c, info)
+			require.Nil(t, taskErr, "%+v", taskErr)
+			require.NotNil(t, result)
+			// Legacy hooks expose seconds as an additional ratio; expressions consume it themselves.
+			wantReserved := common.QuotaRound(0.09 * common.QuotaPerUnit)
+			if mode != "expression" {
+				wantReserved *= 2
+			}
+			assert.Equal(t, wantReserved, result.Quota)
+			require.NotNil(t, info.Billing)
+			assert.Equal(t, wantReserved, info.Billing.GetPreConsumedQuota())
+			var user model.User
+			var token model.Token
+			require.NoError(t, database.First(&user, 91).Error)
+			require.NoError(t, database.First(&token, 91).Error)
+			assert.Equal(t, initialQuota-wantReserved, user.Quota)
+			assert.Equal(t, initialQuota-wantReserved, token.RemainQuota)
+			require.NoError(t, ratio_setting.UpdateModelPricingMultiplierByJSONString(`{"declared-model":9}`))
+			require.NoError(t, ratio_setting.UpdateUserModelPricingMultiplierByJSONString(`{"91::declared-model":8}`))
+			require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"billing-test":7}`))
+			if mode == "expression" {
+				require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{"billing_setting.billing_expr": `{}`}))
+				settled, _, err := service.EvaluateTaskCompletionUsage(info.TieredBillingSnapshot, map[string]any{"seconds": float64(4)})
+				require.NoError(t, err)
+				assert.Equal(t, 2*wantReserved, settled.ActualQuotaAfterGroup)
+				require.NoError(t, info.Billing.Settle(settled.ActualQuotaAfterGroup))
+			} else {
+				assert.Equal(t, 1.5, info.PricingMultipliers["declared-model"])
+				require.NoError(t, info.Billing.Settle(result.Quota))
+			}
+			wantCharge := wantReserved
+			if mode == "expression" {
+				wantCharge *= 2
+			}
+			require.NoError(t, database.First(&user, 91).Error)
+			require.NoError(t, database.First(&token, 91).Error)
+			assert.Equal(t, initialQuota-wantCharge, user.Quota)
+			assert.Equal(t, initialQuota-wantCharge, token.RemainQuota)
 		})
 	}
 }

@@ -266,6 +266,7 @@ export const ModelPricingEditorPanel = forwardRef<
     resolver: zodResolver(createModelPricingSchema(t)),
     defaultValues: {
       name: '',
+      pricingMultiplier: '1',
       price: '',
       ratio: '',
       cacheRatio: '',
@@ -277,6 +278,11 @@ export const ModelPricingEditorPanel = forwardRef<
     },
   })
   const watchedValues = form.watch()
+  const previewCurrency = {
+    ...currency,
+    exchangeRate:
+      currency.exchangeRate * Number(watchedValues.pricingMultiplier ?? 1),
+  }
   let previewRequest = ''
   if (pricingMode === 'per-token' && watchedValues.name.trim()) {
     try {
@@ -358,6 +364,7 @@ export const ModelPricingEditorPanel = forwardRef<
     if (editData) {
       form.reset({
         name: editData.name,
+        pricingMultiplier: editData.pricingMultiplier ?? '1',
         price: editData.price || '',
         ratio: editData.ratio || '',
         cacheRatio: editData.cacheRatio || '',
@@ -373,6 +380,7 @@ export const ModelPricingEditorPanel = forwardRef<
     } else {
       form.reset({
         name: '',
+        pricingMultiplier: '1',
         price: '',
         ratio: '',
         cacheRatio: '',
@@ -679,6 +687,7 @@ export const ModelPricingEditorPanel = forwardRef<
     (values: ModelPricingFormValues) => {
       const data: ModelRatioData = {
         name: values.name.trim(),
+        pricingMultiplier: values.pricingMultiplier ?? '1',
         ...(editData?.pluginBillingExpr ||
         pluginVariants?.length ||
         Object.keys(pluginExpressions).length
@@ -809,6 +818,7 @@ export const ModelPricingEditorPanel = forwardRef<
   const expressionEditor = taskUsageSchema ? (
     <TaskUsagePricingEditor
       currency={currency}
+      previewCurrency={previewCurrency}
       key={`${editorReloadToken}:${watchedValues.name}`}
       billingExpr={resolvedBillingExpr}
       requestRuleExpr={requestRuleExpr}
@@ -820,6 +830,7 @@ export const ModelPricingEditorPanel = forwardRef<
   ) : (
     <TieredPricingEditor
       currency={currency}
+      previewCurrency={previewCurrency}
       key={editorReloadToken}
       modelName={watchedValues.name}
       billingExpr={billingExpr}
@@ -908,6 +919,29 @@ export const ModelPricingEditorPanel = forwardRef<
                 )}
 
                 <PricingCurrencySelector siteCurrency={siteCurrency} />
+                <FormField
+                  control={form.control}
+                  name='pricingMultiplier'
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t('Pricing multiplier')}</FormLabel>
+                      <FormControl>
+                        <Input
+                          {...field}
+                          value={field.value ?? '1'}
+                          inputMode='decimal'
+                          disabled={isSaving}
+                        />
+                      </FormControl>
+                      <FormDescription>
+                        {t(
+                          'Applies to all prices for this model. Defaults to 1. Users only see final prices.'
+                        )}
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
 
                 <TaskPluginPricingEditor
                   key={`${editorReloadToken}:${watchedValues.name}`}
@@ -922,6 +956,7 @@ export const ModelPricingEditorPanel = forwardRef<
                     pricingMode === 'tiered_expr' ? 'tiered_expr' : 'ratio'
                   }
                   currency={currency}
+                  previewCurrency={previewCurrency}
                 >
                   <Tabs
                     key={editorReloadToken}

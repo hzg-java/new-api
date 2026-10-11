@@ -71,6 +71,26 @@ export function withPluginPricing(
     billing_usage_schema: variant.billing_usage_schema,
     billing_usage_examples: variant.billing_usage_examples,
     billing_plugin_variants: undefined,
+    group_prices:
+      model.group_prices &&
+      Object.fromEntries(
+        Object.entries(model.group_prices).map(([group, price]) => {
+          const provider = price.billing_plugin_variants?.find(
+            (item) => item.plugin_key === variant.plugin_key
+          )
+          return [
+            group,
+            {
+              ...price,
+              billing_expr: provider?.billing_expr ?? '',
+              billing_mode: 'tiered_expr',
+              billing_usage_schema: provider?.billing_usage_schema,
+              billing_usage_examples: provider?.billing_usage_examples,
+              billing_plugin_variants: undefined,
+            },
+          ]
+        })
+      ),
   }
 }
 

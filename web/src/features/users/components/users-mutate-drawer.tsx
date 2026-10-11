@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Pencil } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useForm } from 'react-hook-form'
@@ -31,6 +31,7 @@ import {
   sideDrawerFormClassName,
   sideDrawerHeaderClassName,
 } from '@/components/drawer-layout'
+import { ErrorState } from '@/components/error-state'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Combobox } from '@/components/ui/combobox'
@@ -70,12 +71,16 @@ import {
   hasPermission,
   normalizeAdminPermissions,
 } from '@/lib/admin-permissions'
+import { api } from '@/lib/api'
 import { getCurrencyDisplay, getCurrencyLabel } from '@/lib/currency'
 import { formatQuota, parseQuotaFromDollars } from '@/lib/format'
 import { handleServerError } from '@/lib/handle-server-error'
 import { accountPasswordSchema } from '@/lib/password-policy'
 import { ROLE } from '@/lib/roles'
-import { requireServerSuccess } from '@/lib/server-error-message'
+import {
+  getServerErrorMessage,
+  requireServerSuccess,
+} from '@/lib/server-error-message'
 import { useAuthStore } from '@/stores/auth-store'
 
 import {
@@ -96,6 +101,177 @@ import {
 import type { User } from '../types'
 import { UserQuotaDialog } from './user-quota-dialog'
 import { useUsers } from './users-provider'
+
+function UserModelPricing(props: { userId: number }) {
+  const { t } = useTranslation()
+  const client = useQueryClient()
+  const [rows, setRows] = useState<
+    Array<{ id: string; model: string; multiplier: string }>
+  >([])
+  const [error, setError] = useState('')
+  const queryKey = ['user-model-pricing', props.userId]
+  const pricing = useQuery({
+    queryKey,
+    queryFn: async () => {
+      const response = await api.get(`/api/user/${props.userId}/model-pricing`)
+      return requireServerSuccess(response.data) as {
+        success: true
+        data: { multipliers: Record<string, number> }
+      }
+    },
+    refetchOnWindowFocus: false,
+    staleTime: 0,
+  })
+  useEffect(() => {
+    if (!pricing.data) return
+    setRows(
+      Object.entries(pricing.data.data.multipliers).map(
+        ([model, multiplier]) => ({
+          id: crypto.randomUUID(),
+          model,
+          multiplier: String(multiplier),
+        })
+      )
+    )
+    setError('')
+  }, [pricing.data])
+  const save = useMutation({
+    mutationFn: async (multipliers: Record<string, number>) => {
+      const response = await api.put(
+        `/api/user/${props.userId}/model-pricing`,
+        { multipliers }
+      )
+      requireServerSuccess(response.data)
+      return multipliers
+    },
+    onSuccess: (multipliers) => {
+      client.setQueryData(queryKey, { success: true, data: { multipliers } })
+      void client.invalidateQueries({ queryKey: ['pricing'] })
+      toast.success(t('Saved successfully'))
+      setError('')
+    },
+    onError: (cause) => {
+      setError(getServerErrorMessage(cause, t('Failed to save')))
+      handleServerError(cause, t('Failed to save'))
+    },
+  })
+  const onSave = () => {
+    const entries: Array<[string, number]> = []
+    const models = new Set<string>()
+    for (const row of rows) {
+      const model = row.model.trim()
+      const value = row.multiplier.trim()
+      if (!model && !value) continue
+      if (!model) {
+        setError(t('Model name is required'))
+        return
+      }
+      if (models.has(model)) {
+        setError(t('Duplicate model names are not allowed'))
+        return
+      }
+      models.add(model)
+      if (!value) continue
+      const multiplier = Number(value)
+      if (!Number.isFinite(multiplier) || multiplier <= 0) {
+        setError(t('Enter a finite, positive pricing multiplier'))
+        return
+      }
+      entries.push([model, multiplier])
+    }
+    setError('')
+    save.mutate(Object.fromEntries(entries))
+  }
+  return (
+    <SideDrawerSection>
+      <h3 className='text-sm font-medium'>
+        {t('User model pricing multipliers')}
+      </h3>
+      <p className='text-muted-foreground text-xs'>
+        {t(
+          'Applies only to this user. Leave blank or remove a row to use the default multiplier of 1. Save separately from user details.'
+        )}
+      </p>
+      {pricing.isError ? (
+        <ErrorState
+          title={t('Failed to load')}
+          description={getServerErrorMessage(pricing.error)}
+          onRetry={() => void pricing.refetch()}
+        />
+      ) : (
+        <fieldset
+          disabled={pricing.isFetching || !pricing.data || save.isPending}
+          className='space-y-3'
+        >
+          {pricing.isFetching && <p role='status'>{t('Loading...')}</p>}
+          {rows.map((row, index) => (
+            <div key={row.id} className='flex flex-wrap items-end gap-2'>
+              <label className='min-w-0 flex-1 space-y-1'>
+                <span className='text-xs'>{t('Model name')}</span>
+                <Input
+                  value={row.model}
+                  onChange={(event) =>
+                    setRows(
+                      rows.map((item, i) =>
+                        i === index
+                          ? { ...item, model: event.target.value }
+                          : item
+                      )
+                    )
+                  }
+                />
+              </label>
+              <label className='w-28 space-y-1'>
+                <span className='text-xs'>{t('Pricing multiplier')}</span>
+                <Input
+                  inputMode='decimal'
+                  placeholder='1'
+                  value={row.multiplier}
+                  onChange={(event) =>
+                    setRows(
+                      rows.map((item, i) =>
+                        i === index
+                          ? { ...item, multiplier: event.target.value }
+                          : item
+                      )
+                    )
+                  }
+                />
+              </label>
+              <Button
+                type='button'
+                variant='outline'
+                onClick={() => setRows(rows.filter((_, i) => i !== index))}
+              >
+                {t('Remove')}
+              </Button>
+            </div>
+          ))}
+          <Button
+            type='button'
+            variant='outline'
+            onClick={() =>
+              setRows([
+                ...rows,
+                { id: crypto.randomUUID(), model: '', multiplier: '' },
+              ])
+            }
+          >
+            {t('Add model')}
+          </Button>
+          <Button type='button' onClick={onSave}>
+            {save.isPending ? t('Saving...') : t('Save user model pricing')}
+          </Button>
+        </fieldset>
+      )}
+      {error && (
+        <p role='alert' className='text-destructive text-sm'>
+          {error}
+        </p>
+      )}
+    </SideDrawerSection>
+  )
+}
 
 type UsersMutateDrawerProps = {
   open: boolean
@@ -534,6 +710,10 @@ export function UsersMutateDrawer({
                     )}
                   </SideDrawerSection>
                 )}
+
+              {open && currentRow && canEditAdminPermissions && (
+                <UserModelPricing key={currentRow.id} userId={currentRow.id} />
+              )}
 
               {/* Binding Information (Read-only) */}
               {isUpdate && (

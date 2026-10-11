@@ -4,7 +4,9 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -53,9 +55,17 @@ func TestRatioConfigExportsEffectiveExpressions(t *testing.T) {
 	})
 	config.UpdateConfigFromMap(config.GlobalConfig.Get("billing_setting"), map[string]string{"billing_mode": `{"sync-export":"tiered_expr"}`, "billing_expr": `{"sync-export":"tier(\"base\", p * 2)"}`})
 	ratio_setting.SetExposeRatioEnabled(true)
+	db := setupTokenControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.AuditLog{}))
+	oldRedis := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.RedisEnabled = oldRedis })
+	key := "ratio-admin-export-test"
+	require.NoError(t, db.Create(&model.User{Username: "ratio-admin", Password: "unused", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, AccessToken: &key}).Error)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodGet, "/api/ratio_config", nil)
+	c.Request.Header.Set("Authorization", "Bearer "+key)
 	GetRatioConfig(c)
 	var response struct {
 		Success bool
@@ -65,6 +75,99 @@ func TestRatioConfigExportsEffectiveExpressions(t *testing.T) {
 	require.True(t, response.Success)
 	assert.Equal(t, billing_setting.BillingModeTieredExpr, valueMap(response.Data["billing_mode"])["sync-export"])
 	assert.Equal(t, `tier("base", p * 2)`, valueMap(response.Data["billing_expr"])["sync-export"])
+}
+
+func TestRatioConfigRejectsPublicAndForgedRoles(t *testing.T) {
+	old := ratio_setting.IsExposeRatioEnabled()
+	ratio_setting.SetExposeRatioEnabled(true)
+	t.Cleanup(func() { ratio_setting.SetExposeRatioEnabled(old) })
+	for _, role := range []int{0, common.RoleCommonUser, common.RoleAdminUser, common.RoleRootUser} {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodGet, "/api/ratio_config?role=100", nil)
+		c.Set("role", role)
+		c.Set("id", 123)
+		GetRatioConfig(c)
+		assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+		assert.NotContains(t, recorder.Body.String(), "model_ratio")
+		assert.NotContains(t, recorder.Body.String(), "billing_expr")
+	}
+}
+
+func TestRatioConfigAuthenticatedRoles(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.AuditLog{}))
+	oldRedis, oldExpose := common.RedisEnabled, ratio_setting.IsExposeRatioEnabled()
+	common.RedisEnabled = false
+	ratio_setting.SetExposeRatioEnabled(true)
+	t.Cleanup(func() {
+		common.RedisEnabled = oldRedis
+		ratio_setting.SetExposeRatioEnabled(oldExpose)
+	})
+	for _, tc := range []struct {
+		name               string
+		role, status, want int
+	}{
+		{"ordinary", common.RoleCommonUser, common.UserStatusEnabled, http.StatusForbidden},
+		{"admin", common.RoleAdminUser, common.UserStatusEnabled, http.StatusOK},
+		{"root", common.RoleRootUser, common.UserStatusEnabled, http.StatusOK},
+		{"disabled", common.RoleRootUser, common.UserStatusDisabled, http.StatusUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			key := "ratio-role-test-" + tc.name
+			require.NoError(t, db.Create(&model.User{Username: "ratio-" + tc.name, AffCode: "ratio-" + tc.name, Password: "unused", Role: tc.role, Status: tc.status, AccessToken: &key}).Error)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, "/api/ratio_config", nil)
+			c.Request.Header.Set("Authorization", "Bearer "+key)
+			// The role must come from the credential, not a preexisting context.
+			c.Set("role", common.RoleRootUser)
+			GetRatioConfig(c)
+			assert.Equal(t, tc.want, recorder.Code)
+			if tc.want != http.StatusOK {
+				assert.NotContains(t, recorder.Body.String(), "model_ratio")
+			}
+		})
+	}
+}
+
+func TestUserGroupProjectionHidesRatios(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.AuditLog{}))
+	require.NoError(t, db.Create(&model.User{Id: 123, Username: "group-user", Password: "unused", Group: "default"}).Error)
+	oldRedis := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.RedisEnabled = oldRedis })
+	oldGroups := setting.UserUsableGroups2JSONString()
+	oldRatios := ratio_setting.GroupRatio2JSONString()
+	require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"default":"Default","auto":"Auto"}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1.23}`))
+	t.Cleanup(func() {
+		require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(oldGroups))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(oldRatios))
+	})
+	for _, role := range []int{0, common.RoleCommonUser, common.RoleAdminUser, common.RoleRootUser} {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodGet, "/api/user/groups", nil)
+		// Dashboard middleware supplies these values for authenticated requests.
+		if role != 0 {
+			c.Set("id", 123)
+			c.Set("role", role)
+			c.Set("group", "default")
+		}
+		GetUserGroups(c)
+		var response struct{ Data map[string]map[string]any }
+		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+		require.Contains(t, response.Data, "default")
+		assert.Equal(t, "Default", response.Data["default"]["desc"])
+		if role >= common.RoleAdminUser {
+			assert.Equal(t, 1.23, response.Data["default"]["ratio"])
+		} else {
+			assert.NotContains(t, response.Data["default"], "ratio")
+			assert.NotContains(t, response.Data["auto"], "ratio")
+		}
+	}
 }
 
 func TestPricingSyncCompleteSourcesAndArrayFormats(t *testing.T) {

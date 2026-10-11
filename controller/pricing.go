@@ -36,15 +36,25 @@ func filterPricingByUsableGroups(pricing []model.Pricing, usableGroup map[string
 }
 
 func GetPricing(c *gin.Context) {
-	pricing := model.GetPricing()
-	userId, exists := c.Get("id")
+	c.Header("Cache-Control", "private, no-store")
+	pricing, err := model.PricingForUser(model.GetPricing(), c.GetInt("id"))
+	if err != nil {
+		c.JSON(500, gin.H{"success": false, "message": "Pricing is unavailable"})
+		return
+	}
+	userId := c.GetInt("id")
+	exists := userId > 0
 	usableGroup := map[string]string{}
 	groupRatio := map[string]float64{}
 	maps.Copy(groupRatio, ratio_setting.GetGroupRatioCopy())
 	var group string
 	if exists {
-		user, err := model.GetUserCache(userId.(int))
-		if err == nil {
+		user, err := model.GetUserCache(userId)
+		if err != nil {
+			c.JSON(500, gin.H{"success": false, "message": "Pricing is unavailable"})
+			return
+		}
+		if user != nil {
 			group = user.Group
 			for g := range groupRatio {
 				ratio, ok := ratio_setting.GetGroupGroupRatio(group, g)
@@ -66,9 +76,8 @@ func GetPricing(c *gin.Context) {
 
 	c.JSON(200, gin.H{
 		"success":            true,
-		"data":               pricing,
+		"data":               model.PublicPricingForGroups(pricing, groupRatio, userId),
 		"vendors":            model.GetVendors(),
-		"group_ratio":        groupRatio,
 		"usable_group":       usableGroup,
 		"supported_endpoint": model.GetSupportedEndpointMap(),
 		"auto_groups":        service.GetUserAutoGroup(group),

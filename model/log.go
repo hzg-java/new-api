@@ -115,8 +115,30 @@ func assignDisplayLogIds(logs []*Log, startIdx int) {
 
 func formatUserLogs(logs []*Log, startIdx int) {
 	for i := range logs {
-		logs[i].ChannelName = ""
-		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityUser)
+		log := logs[i]
+		log.ChannelName = ""
+		if log.Type == LogTypeConsume || log.Type == LogTypeRefund {
+			var metadata struct {
+				IsTask bool   `json:"is_task"`
+				TaskID string `json:"task_id"`
+			}
+			_ = common.UnmarshalJsonStr(log.Other, &metadata)
+			// Older task logs may have no structured task marker. Their free-form
+			// calculation text is not a safe source of user-visible usage facts.
+			if metadata.IsTask || metadata.TaskID != "" || strings.Contains(log.Content, "计算参数") || strings.Contains(log.Content, "token重算") {
+				switch log.Content {
+				case "", "adaptor调整", "token重算", "任务失败", "任务取消":
+					// Fixed non-pricing context is safe; arbitrary reasons are not.
+				default:
+					if log.Type == LogTypeRefund {
+						log.Content = "Task refund"
+					} else {
+						log.Content = "Task consumption"
+					}
+				}
+			}
+		}
+		log.Other = formatLogOtherJSON(log.Other, logOtherVisibilityUser)
 	}
 	assignDisplayLogIds(logs, startIdx)
 }

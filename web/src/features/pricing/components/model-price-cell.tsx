@@ -30,7 +30,7 @@ import {
   getDynamicPricingSummary,
   isUnconfiguredTaskUsageModel,
 } from '../lib/dynamic-price'
-import { isTokenBasedModel } from '../lib/model-helpers'
+import { isTokenBasedModel, withFinalGroupPrice } from '../lib/model-helpers'
 import { formatPrice, formatRequestPrice } from '../lib/price'
 import { taskUsageUnitLabel } from '../lib/task-price-display'
 import type { PricingModel, TokenUnit } from '../types'
@@ -48,6 +48,10 @@ export function ModelPriceCell(props: {
   options?: ModelPriceCellOptions
   showExpression?: boolean
 }) {
+  props = {
+    ...props,
+    model: withFinalGroupPrice(props.model, props.options?.selectedGroup),
+  }
   const { t, i18n } = useTranslation()
   const currency = useSystemConfigStore((state) => state.config.currency)
   const currencyLabel =

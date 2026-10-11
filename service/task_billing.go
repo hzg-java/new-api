@@ -387,6 +387,12 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 
 	// 获取模型价格和倍率
 	modelRatio, hasRatioSetting, _ := ratio_setting.GetModelRatio(modelName)
+	if bc := task.PrivateData.BillingContext; bc != nil {
+		if bc.PerCallBilling || bc.TieredSnapshot != nil {
+			return false
+		}
+		modelRatio, hasRatioSetting = bc.ModelRatio, true
+	}
 	// 只有配置了倍率(非固定价格)时才按 token 重新计费
 	if !hasRatioSetting || modelRatio <= 0 {
 		return false
@@ -412,6 +418,10 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 		finalGroupRatio = userGroupRatio
 	} else {
 		finalGroupRatio = groupRatio
+	}
+
+	if bc := task.PrivateData.BillingContext; bc != nil {
+		finalGroupRatio = bc.GroupRatio
 	}
 
 	// 计算 OtherRatios 乘积（视频折扣、时长等）

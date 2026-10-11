@@ -53,8 +53,6 @@ export interface CommonLogFilters extends CommonFilters {
   token?: string
   group?: string
   username?: string
-  requestId?: string
-  upstreamRequestId?: string
 }
 
 /**
@@ -69,6 +67,8 @@ export interface DrawingLogFilters extends CommonFilters {
  */
 export interface TaskLogFilters extends CommonFilters {
   taskId?: string
+  model?: string
+  status?: string
 }
 
 /**
@@ -319,6 +319,8 @@ export interface TaskEvent {
   kind: 'request' | 'accepted' | 'result'
   timestamp: number
   payload: string
+  detail_complete?: boolean
+  detail_unavailable?: string
 }
 
 export interface TaskEventsResponse {
@@ -451,8 +453,6 @@ export interface GetLogsParams {
   end_timestamp?: number
   channel?: number
   group?: string
-  request_id?: string
-  upstream_request_id?: string
 }
 
 export interface GetLogsResponse {
@@ -475,8 +475,6 @@ export interface GetLogStatsParams {
   end_timestamp?: number
   channel?: number
   group?: string
-  request_id?: string
-  upstream_request_id?: string
 }
 
 export interface GetLogStatsResponse {
@@ -507,6 +505,8 @@ export interface GetTaskLogsParams {
   page_size?: number
   channel_id?: string
   task_id?: string
+  model_name?: string
+  status?: string
   start_timestamp?: number
   end_timestamp?: number
 }

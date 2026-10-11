@@ -24,6 +24,7 @@ import { formatPricingNumber } from './pricing-format'
 
 export type ModelPricingSnapshotInput = {
   modelPrice: string
+  modelPricingMultiplier?: string
   modelRatio: string
   cacheRatio: string
   createCacheRatio: string
@@ -39,6 +40,7 @@ export type ModelPricingSnapshotInput = {
 export type ModelPricingSnapshot = {
   pluginBillingExpr?: Record<string, string>
   name: string
+  pricingMultiplier?: string
   price?: string
   ratio?: string
   cacheRatio?: string
@@ -157,6 +159,7 @@ export const getPriceDetail = (
 
 export const buildModelSnapshots = ({
   modelPrice,
+  modelPricingMultiplier = '{}',
   modelRatio,
   cacheRatio,
   createCacheRatio,
@@ -168,6 +171,13 @@ export const buildModelSnapshots = ({
   billingExpr,
   pluginBillingExpr = '{}',
 }: ModelPricingSnapshotInput): ModelPricingSnapshot[] => {
+  const multiplierMap = safeJsonParse<Record<string, number>>(
+    modelPricingMultiplier,
+    {
+      fallback: {},
+      context: 'model pricing multipliers',
+    }
+  )
   const priceMap = safeJsonParse<Record<string, number>>(modelPrice, {
     fallback: {},
     context: 'model prices',
@@ -225,6 +235,7 @@ export const buildModelSnapshots = ({
   }
   const modelNames = new Set([
     ...pluginExpressionsByModel.keys(),
+    ...Object.keys(multiplierMap),
     ...Object.keys(priceMap),
     ...Object.keys(ratioMap),
     ...Object.keys(cacheMap),
@@ -255,6 +266,7 @@ export const buildModelSnapshots = ({
       return {
         name,
         pluginBillingExpr: pluginExpressionsByModel.get(name),
+        pricingMultiplier: String(multiplierMap[name] ?? 1),
         billingMode: 'tiered_expr',
         billingExpr: pureExpr,
         requestRuleExpr,
@@ -273,6 +285,7 @@ export const buildModelSnapshots = ({
     return {
       name,
       pluginBillingExpr: pluginExpressionsByModel.get(name),
+      pricingMultiplier: String(multiplierMap[name] ?? 1),
       price,
       ratio,
       cacheRatio: cache,
@@ -298,6 +311,7 @@ export const buildModelSnapshots = ({
 export const getSnapshotSignature = (snapshot?: ModelPricingSnapshot) => {
   if (!snapshot) return ''
   return JSON.stringify({
+    pricingMultiplier: snapshot.pricingMultiplier ?? '1',
     price: snapshot.price || '',
     ratio: snapshot.ratio || '',
     cacheRatio: snapshot.cacheRatio || '',

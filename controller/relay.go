@@ -1,11 +1,15 @@
 package controller
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -383,6 +387,8 @@ func RelayNotFound(c *gin.Context) {
 // existing handler while claimed requests enter the generation-pinned
 // host-owned protocol bridge.
 func RelayTaskPluginEndpoint(c *gin.Context, fallback gin.HandlerFunc) {
+	capture := installTaskEventResponseCapture(c)
+	defer capture.record()
 	pinnedValue, exists := c.Get(pluginruntime.ContextKeyPinnedEndpoint)
 	if !exists {
 		fallback(c)
@@ -431,6 +437,8 @@ type taskSubmissionOutcome struct {
 }
 
 func RelayTask(c *gin.Context) {
+	capture := installTaskEventResponseCapture(c)
+	defer capture.record()
 	relayInfo, err := relaycommon.GenRelayInfo(c, types.RelayFormatTask, nil, nil)
 	if err != nil {
 		respondTaskSubmissionError(c, &taskdto.TaskError{
@@ -472,11 +480,156 @@ func executeTaskSubmission(c *gin.Context, relayInfo *relaycommon.RelayInfo) (*t
 
 type taskSubmitAttempt func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *taskdto.TaskError)
 
+// Embedding preserves Gin's flushing, hijacking and close-notification behavior.
+// The same pointer stays in context keys when a submission context is copied.
+type taskEventResponseCapture struct {
+	gin.ResponseWriter
+	body                            bytes.Buffer
+	task                            *model.Task
+	overflow, writeFailed, recorded bool
+}
+
+func installTaskEventResponseCapture(c *gin.Context) *taskEventResponseCapture {
+	if value, ok := c.Get("task_event_response_capture"); ok {
+		if capture, ok := value.(*taskEventResponseCapture); ok {
+			return capture
+		}
+	}
+	capture := &taskEventResponseCapture{ResponseWriter: c.Writer}
+	c.Writer = capture
+	c.Set("task_event_response_capture", capture)
+	return capture
+}
+
+func (w *taskEventResponseCapture) Write(data []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(data)
+	if err != nil {
+		w.writeFailed = true
+	}
+	if !w.overflow {
+		if w.body.Len()+n > model.TaskEventPayloadLimit {
+			w.overflow = true
+			w.body.Reset()
+		} else {
+			_, _ = w.body.Write(data[:n])
+		}
+	}
+	return n, err
+}
+
+func (w *taskEventResponseCapture) WriteString(text string) (int, error) {
+	return w.Write([]byte(text))
+}
+func (w *taskEventResponseCapture) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *taskEventResponseCapture) record() {
+	if w.recorded || w.task == nil {
+		return
+	}
+	w.recorded = true
+	detail := map[string]any{"status_code": w.Status(), "content_type": w.Header().Get("Content-Type")}
+	switch {
+	case w.task.PrivateData.ResultDiscarded:
+		detail["unavailable"] = "result_discarded"
+	case w.overflow:
+		detail["unavailable"] = "size_limit_exceeded"
+	case w.writeFailed:
+		detail["unavailable"] = "write_failed"
+	case w.body.Len() == 0:
+		detail["unavailable"] = "response_not_written"
+	case strings.Contains(w.Header().Get("Content-Type"), "text/event-stream"):
+		// Parse each SSE data value so recursive credential redaction applies to JSON events.
+		var events []any
+		for block := range strings.SplitSeq(strings.ReplaceAll(w.body.String(), "\r\n", "\n"), "\n\n") {
+			if strings.TrimSpace(block) == "" {
+				continue
+			}
+			var data []string
+			var eventName string
+			for line := range strings.SplitSeq(block, "\n") {
+				if value, ok := strings.CutPrefix(line, "data:"); ok {
+					data = append(data, strings.TrimPrefix(value, " "))
+				}
+				if value, ok := strings.CutPrefix(line, "event:"); ok {
+					eventName = strings.TrimSpace(value)
+				}
+			}
+			if len(data) == 0 {
+				continue
+			}
+			text := strings.Join(data, "\n")
+			var raw json.RawMessage
+			var value any = text
+			if common.Unmarshal([]byte(text), &raw) == nil {
+				value = raw
+			}
+			events = append(events, map[string]any{"event": eventName, "data": value})
+		}
+		detail["events"] = events
+	default:
+		var raw json.RawMessage
+		if common.Unmarshal(w.body.Bytes(), &raw) == nil {
+			detail["body"] = raw
+		} else {
+			detail["unavailable"] = "non_json_response"
+		}
+	}
+	if err := model.RecordTaskEventDetail(w.task.ID, "accepted", time.Now().Unix(), detail); err != nil {
+		common.SysError("record task response detail: " + err.Error())
+	}
+}
+
+func taskEventOriginalRequest(c *gin.Context) any {
+	storage, err := common.GetBodyStorage(c)
+	if err != nil {
+		return map[string]any{"unavailable": "request_read_failed"}
+	}
+	defer func() { _, _ = storage.Seek(0, io.SeekStart); c.Request.Body = io.NopCloser(storage) }()
+	mediaType, _, _ := mime.ParseMediaType(c.Request.Header.Get("Content-Type"))
+	if mediaType == "multipart/form-data" {
+		c.Request.Body = io.NopCloser(storage)
+		if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
+			return map[string]any{"unavailable": "invalid_multipart"}
+		}
+		var files []any
+		for field, headers := range c.Request.MultipartForm.File {
+			for _, file := range headers {
+				files = append(files, map[string]any{"field": field, "filename": file.Filename, "mime_type": file.Header.Get("Content-Type"), "size": file.Size})
+			}
+		}
+		detail := map[string]any{"kind": "multipart", "fields": c.Request.MultipartForm.Value, "files": files}
+		if len(files) > 0 {
+			detail["unavailable"] = "uploaded_file_bytes_omitted"
+		}
+		return detail
+	}
+	data, err := io.ReadAll(io.LimitReader(storage, model.TaskEventPayloadLimit+1))
+	if err != nil {
+		return map[string]any{"unavailable": "request_read_failed"}
+	}
+	if len(data) > model.TaskEventPayloadLimit {
+		return map[string]any{"unavailable": "size_limit_exceeded"}
+	}
+	if mediaType == "application/x-www-form-urlencoded" {
+		fields, err := url.ParseQuery(string(data))
+		if err != nil {
+			return map[string]any{"unavailable": "invalid_form"}
+		}
+		return map[string]any{"kind": "form", "fields": fields}
+	}
+	var raw json.RawMessage
+	if common.Unmarshal(data, &raw) != nil {
+		return map[string]any{"unavailable": "non_json_request"}
+	}
+	return raw
+}
+
 func executeTaskSubmissionWith(
 	c *gin.Context,
 	relayInfo *relaycommon.RelayInfo,
 	submit taskSubmitAttempt,
 ) (*taskSubmissionOutcome, *taskdto.TaskError) {
+	originalRequest := taskEventOriginalRequest(c)
 	policy := service.RequestPolicy(c)
 	diagnostics := newTaskPluginSubmitDiagnostics(c)
 	diagnostics.start(relayInfo)
@@ -691,6 +844,29 @@ func executeTaskSubmissionWith(
 		return nil, taskErr
 	}
 	durable = true
+	if value, ok := c.Get("task_event_response_capture"); ok {
+		if capture, ok := value.(*taskEventResponseCapture); ok {
+			capture.task = task
+		}
+	}
+	if err := model.RecordTaskEvent(task.ID, "request", task.SubmitTime, map[string]any{"model": relayInfo.OriginModelName}); err != nil {
+		common.SysError("record task request event: " + err.Error())
+	}
+	if err := model.RecordTaskEventDetail(task.ID, "request", task.SubmitTime, originalRequest); err != nil {
+		common.SysError("record task request detail: " + err.Error())
+	}
+	acceptedStatus := "queued"
+	if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
+		acceptedStatus = string(task.Status)
+	}
+	if err := model.RecordTaskEvent(task.ID, "accepted", time.Now().Unix(), map[string]any{"id": task.TaskID, "status": acceptedStatus, "model": relayInfo.OriginModelName}); err != nil {
+		common.SysError("record task accepted event: " + err.Error())
+	}
+	if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
+		if err := model.RecordTaskEvent(task.ID, "result", task.FinishTime, model.TaskResultEventPayload(task)); err != nil {
+			common.SysError("record task result event: " + err.Error())
+		}
+	}
 	stage = "settle"
 	diagnostics.durable(task)
 	diagnostics.settleStart(task, result.Quota)
@@ -708,21 +884,6 @@ func executeTaskSubmissionWith(
 	}
 	service.LogTaskConsumption(c, relayInfo, task)
 	diagnostics.complete(task, result.Quota)
-	if err := model.RecordTaskEvent(task.ID, "request", task.SubmitTime, map[string]any{"model": relayInfo.OriginModelName}); err != nil {
-		common.SysError("record task request event: " + err.Error())
-	}
-	acceptedStatus := "queued"
-	if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
-		acceptedStatus = string(task.Status)
-	}
-	if err := model.RecordTaskEvent(task.ID, "accepted", time.Now().Unix(), map[string]any{"id": task.TaskID, "status": acceptedStatus, "model": relayInfo.OriginModelName}); err != nil {
-		common.SysError("record task accepted event: " + err.Error())
-	}
-	if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
-		if err := model.RecordTaskEvent(task.ID, "result", task.FinishTime, model.TaskResultEventPayload(task)); err != nil {
-			common.SysError("record task result event: " + err.Error())
-		}
-	}
 
 	return &taskSubmissionOutcome{Result: result, Task: task, RelayInfo: relayInfo}, nil
 }

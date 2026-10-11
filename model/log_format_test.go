@@ -31,8 +31,8 @@ func TestFormatUserLogsStripsQuotaSaturation(t *testing.T) {
 	require.NoError(t, err)
 	_, hasAdminInfo := parsed["admin_info"]
 	require.False(t, hasAdminInfo, "admin_info (and nested quota_saturation) must be stripped for non-admin views")
-	// Non-admin billing fields remain visible.
-	require.Contains(t, parsed, "model_price")
+	// Internal base prices are also absent from ordinary-user views.
+	require.NotContains(t, parsed, "model_price")
 }
 
 func TestTaskPluginLogVisibilityIsRoleSeparated(t *testing.T) {
@@ -61,7 +61,7 @@ func TestTaskPluginLogVisibilityIsRoleSeparated(t *testing.T) {
 		require.NoError(t, err)
 		assert.NotContains(t, parsed, "admin_info")
 		assert.NotContains(t, parsed, "root_info")
-		assert.Equal(t, 1.25, parsed["model_price"])
+		assert.NotContains(t, parsed, "model_price")
 	})
 
 	t.Run("admin", func(t *testing.T) {
@@ -231,14 +231,14 @@ func TestModelMappingLogVisibilityIsRoleSeparated(t *testing.T) {
 }
 
 func TestLogFormattingPreservesLargeIntegerLexemes(t *testing.T) {
-	const other = `{"public_id":9007199254740993,"admin_info":{"admin_id":9007199254740995},"root_info":{"generation":18446744073709551615}}`
+	const other = `{"subscription_id":9007199254740993,"admin_info":{"admin_id":9007199254740995},"root_info":{"generation":18446744073709551615}}`
 
 	t.Run("user", func(t *testing.T) {
 		logs := []*Log{{Other: other}}
 
 		formatUserLogs(logs, 0)
 
-		assert.Contains(t, logs[0].Other, `"public_id":9007199254740993`)
+		assert.Contains(t, logs[0].Other, `"subscription_id":9007199254740993`)
 		assert.NotContains(t, logs[0].Other, "admin_id")
 		assert.NotContains(t, logs[0].Other, "generation")
 	})
@@ -248,7 +248,7 @@ func TestLogFormattingPreservesLargeIntegerLexemes(t *testing.T) {
 
 		FormatAdminLogs(logs)
 
-		assert.Contains(t, logs[0].Other, `"public_id":9007199254740993`)
+		assert.Contains(t, logs[0].Other, `"subscription_id":9007199254740993`)
 		assert.Contains(t, logs[0].Other, `"admin_id":9007199254740995`)
 		assert.NotContains(t, logs[0].Other, "generation")
 	})
@@ -262,11 +262,11 @@ func TestLogFormattingPreservesLargeIntegerLexemes(t *testing.T) {
 	})
 
 	t.Run("unprivileged", func(t *testing.T) {
-		const unprivileged = `{"public_id":9007199254740993,"model_price":0.004}`
+		const unprivileged = `{"subscription_id":9007199254740993,"model_price":0.004}`
 
 		userLogs := []*Log{{Other: unprivileged}}
 		formatUserLogs(userLogs, 0)
-		assert.Equal(t, unprivileged, userLogs[0].Other)
+		assert.Equal(t, `{"subscription_id":9007199254740993}`, userLogs[0].Other)
 
 		adminLogs := []*Log{{Other: unprivileged}}
 		FormatAdminLogs(adminLogs)

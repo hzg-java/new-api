@@ -177,6 +177,14 @@ func GetPricingSyncData(base map[string]any) map[string]any {
 		extra[BillingModeField] = modes
 	}
 	if exprs := GetBillingExprCopy(); len(exprs) > 0 {
+		for name, expression := range exprs {
+			scaled, err := billingexpr.ScalePricingExpression(expression, ratio_setting.GetModelPricingMultiplier(name))
+			if err != nil {
+				delete(exprs, name)
+				continue
+			}
+			exprs[name] = scaled
+		}
 		extra[BillingExprField] = exprs
 	}
 	return lo.Assign(base, extra)

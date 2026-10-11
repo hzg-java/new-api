@@ -6,10 +6,133 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestPersonalPricingDoesNotMutateSharedPrices(t *testing.T) {
+	previous := ratio_setting.UserModelPricingMultiplier2JSONString()
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateUserModelPricingMultiplierByJSONString(previous)) })
+	require.NoError(t, ratio_setting.UpdateUserModelPricingMultiplierByJSONString(`{"101::personal-model":0.8}`))
+	shared := []Pricing{{ModelName: "personal-model", ModelPrice: 1.5, BillingExpr: `tier("base", p * 3)`, BillingPluginVariants: []PricingPluginVariant{{BillingExpr: `tier("video", u("seconds") * 0.3)`}}}}
+	personal, err := PricingForUser(shared, 101)
+	require.NoError(t, err)
+	assert.InDelta(t, 1.2, personal[0].ModelPrice, 1e-12)
+	assert.Equal(t, `tier("base", p * 2.4)`, personal[0].BillingExpr)
+	assert.Equal(t, `tier("video", u("seconds") * 0.24)`, personal[0].BillingPluginVariants[0].BillingExpr)
+	other, err := PricingForUser(shared, 102)
+	require.NoError(t, err)
+	assert.Equal(t, shared, other)
+	assert.Equal(t, 1.5, shared[0].ModelPrice)
+	assert.Equal(t, `tier("video", u("seconds") * 0.3)`, shared[0].BillingPluginVariants[0].BillingExpr)
+}
+
+func TestPublicPricingFinalPricesAndPrivacy(t *testing.T) {
+	cache, audio, audioOut := 0.25, 4.0, 2.0
+	shared := []Pricing{{ModelName: "public-model", EnableGroup: []string{"all"}, ModelRatio: 1.5, CompletionRatio: 3, CacheRatio: &cache, AudioRatio: &audio, AudioCompletionRatio: &audioOut}}
+	public := PublicPricingForGroups(shared, map[string]float64{"default": 2, "free": 0})
+	require.Len(t, public, 1)
+	encoded, err := common.Marshal(public)
+	require.NoError(t, err)
+	for _, forbidden := range []string{"model_ratio", "completion_ratio", "cache_ratio", "audio_ratio", "group_ratio", "model_price"} {
+		assert.NotContains(t, string(encoded), forbidden)
+	}
+	assert.Contains(t, public[0].GroupPrices["default"].BillingExpr, "p * 6")
+	assert.Contains(t, public[0].GroupPrices["default"].BillingExpr, "c * 18")
+	assert.Contains(t, public[0].GroupPrices["default"].BillingExpr, "ai * 24")
+	assert.Contains(t, public[0].GroupPrices["default"].BillingExpr, "ao * 48")
+	assert.Contains(t, public[0].GroupPrices["free"].BillingExpr, "p * 0")
+	assert.Equal(t, 1.5, shared[0].ModelRatio)
+	private := PublicPricingForGroups([]Pricing{{ModelName: "restricted", EnableGroup: []string{"hidden"}}}, map[string]float64{"default": 1})
+	assert.Empty(t, private)
+	fixed := PublicPricingForGroups([]Pricing{{ModelName: "task", QuotaType: 1, ModelPrice: 0.3, EnableGroup: []string{"default"}, BillingPluginVariants: []PricingPluginVariant{{PluginKey: "fallback", BillingMode: "ratio"}}}}, map[string]float64{"default": 2})
+	assert.Equal(t, `tier("request", fixed(0.6))`, fixed[0].GroupPrices["default"].BillingPluginVariants[0].BillingExpr)
+}
+
+func TestPublicPricingCanonicalExpressions(t *testing.T) {
+	for _, tc := range []struct{ name, expression, expected string }{
+		{"token tiers", `len <= 200000 ? tier("short", p * 3 + c * 15) : tier("long", p * 6 + c * 22.5)`, `len <= 200000 ? tier("short", p * 6 + c * 30) : tier("long", p * 12 + c * 45)`},
+		{"fixed", `tier("request", fixed(0.1))`, `tier("request", fixed(0.2))`},
+		{"image quantity", `tier("image", fixed(0.1)) * image_count`, `(tier("image", fixed(0.2))) * image_count`},
+		{"task tokens", `tier("video", u("tokens") * 9.8 / 1000000)`, `tier("video", u("tokens") * 19.6 / 1000000)`},
+		{"nested task prices", `tier("video", u("seconds") * (u("resolution") == "4K" ? 0.12 : 0.09))`, `u("resolution") == "4K" ? tier("video", u("seconds") * 0.24) : tier("video", u("seconds") * 0.18)`},
+		{"time prices", `hour("UTC") >= 18 ? tier("peak", p * 3) : tier("base", p * 2)`, `hour("UTC") >= 18 ? tier("peak", p * 6) : tier("base", p * 4)`},
+		{"unsafe program", `tier("secret", max(p, 12345) * 0.2)`, ""},
+		{"unsafe request threshold", `param("private") > 12345 ? tier("a", p * 2) : tier("b", p * 3)`, ""},
+		{"unsafe bare request probe", `param("private") ? tier("a", p * 2) : tier("b", p * 3)`, ""},
+		{"unsafe dynamic usage key", `u(param("private")) ? tier("a", p * 2) : tier("b", p * 3)`, ""},
+		{"unsafe usage probe arity", `u("has_video_input", "private") ? tier("a", p * 2) : tier("b", p * 3)`, ""},
+		{"unsafe boolean branch body", `u("has_video_input") ? tier("secret", max(p, 12345) * 0.2) : tier("b", p * 3)`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			public := PublicPricingForGroups([]Pricing{{ModelName: "test", EnableGroup: []string{"default"}, BillingMode: "tiered_expr", BillingExpr: tc.expression}}, map[string]float64{"default": 2})
+			require.Len(t, public, 1)
+			assert.Equal(t, tc.expected, public[0].GroupPrices["default"].BillingExpr)
+		})
+	}
+	expression := `tier("base", p * 3) * (param("service_tier") == "fast" ? 6 : 1)`
+	public := PublicPricingForGroups([]Pricing{{ModelName: "test", EnableGroup: []string{"default"}, BillingMode: "tiered_expr", BillingExpr: expression, BillingPluginVariants: []PricingPluginVariant{{PluginKey: "video", BillingMode: "tiered_expr", BillingExpr: `tier("base", u("seconds") * 0.4)`}}}}, map[string]float64{"default": 2})
+	price := public[0].GroupPrices["default"]
+	assert.Contains(t, price.BillingExpr, "p * 36")
+	assert.Contains(t, price.BillingExpr, "p * 6")
+	assert.NotContains(t, price.BillingExpr, "? 6 : 1")
+	assert.Equal(t, `tier("base", u("seconds") * 0.8)`, price.BillingPluginVariants[0].BillingExpr)
+}
+
+func TestPublicPricingSeedanceBooleanUsage(t *testing.T) {
+	previous := ratio_setting.UserModelPricingMultiplier2JSONString()
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateUserModelPricingMultiplierByJSONString(previous)) })
+	require.NoError(t, ratio_setting.UpdateUserModelPricingMultiplierByJSONString(`{"101::seedance":0.8}`))
+
+	for _, tc := range []struct{ name, expression, grouped, personal string }{
+		{
+			"video input",
+			`u("has_video_input") ? tier("sd_video_in", u("tokens") * 22 / 1000000) : tier("sd", u("tokens") * 37 / 1000000)`,
+			`u("has_video_input") ? tier("sd_video_in", u("tokens") * 44 / 1000000) : tier("sd", u("tokens") * 74 / 1000000)`,
+			`u("has_video_input") ? tier("sd_video_in", u("tokens") * 52.8 / 1000000) : tier("sd", u("tokens") * 88.8 / 1000000)`,
+		},
+		{
+			"nested resolution",
+			`u("resolution") == "1080p" ? (u("has_video_input") ? tier("hd_video_in", u("tokens") * 44 / 1000000) : tier("hd", u("tokens") * 74 / 1000000)) : (u("has_video_input") ? tier("sd_video_in", u("tokens") * 22 / 1000000) : tier("sd", u("tokens") * 37 / 1000000))`,
+			`u("resolution") == "1080p" ? u("has_video_input") ? tier("hd_video_in", u("tokens") * 88 / 1000000) : tier("hd", u("tokens") * 148 / 1000000) : u("has_video_input") ? tier("sd_video_in", u("tokens") * 44 / 1000000) : tier("sd", u("tokens") * 74 / 1000000)`,
+			`u("resolution") == "1080p" ? u("has_video_input") ? tier("hd_video_in", u("tokens") * 105.6 / 1000000) : tier("hd", u("tokens") * 177.6 / 1000000) : u("has_video_input") ? tier("sd_video_in", u("tokens") * 52.8 / 1000000) : tier("sd", u("tokens") * 88.8 / 1000000)`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shared := []Pricing{{ModelName: "seedance", EnableGroup: []string{"default"}, BillingMode: "tiered_expr", BillingExpr: tc.expression, BillingPluginVariants: []PricingPluginVariant{{PluginKey: "doubao", BillingMode: "tiered_expr", BillingExpr: tc.expression}}}}
+			public := PublicPricingForGroups(shared, map[string]float64{"default": 2})
+			require.Len(t, public, 1)
+			price := public[0].GroupPrices["default"]
+			assert.Equal(t, tc.grouped, price.BillingExpr)
+			require.Len(t, price.BillingPluginVariants, 1)
+			assert.Equal(t, tc.grouped, price.BillingPluginVariants[0].BillingExpr)
+
+			// Shared pricing already carries the default model multiplier before personalization.
+			defaultExpression, err := billingexpr.ScalePricingExpression(tc.expression, 1.5)
+			require.NoError(t, err)
+			shared[0].BillingExpr = defaultExpression
+			shared[0].BillingPluginVariants[0].BillingExpr = defaultExpression
+			personal, err := PricingForUser(shared, 101)
+			require.NoError(t, err)
+			public = PublicPricingForGroups(personal, map[string]float64{"default": 2}, 101)
+			require.Len(t, public, 1)
+			price = public[0].GroupPrices["default"]
+			assert.Equal(t, tc.personal, price.BillingExpr)
+			require.Len(t, price.BillingPluginVariants, 1)
+			assert.Equal(t, tc.personal, price.BillingPluginVariants[0].BillingExpr)
+			encoded, err := common.Marshal(public)
+			require.NoError(t, err)
+			for _, forbidden := range []string{"model_ratio", "group_ratio", "model_price", "multiplier"} {
+				assert.NotContains(t, string(encoded), forbidden)
+			}
+			assert.Equal(t, defaultExpression, shared[0].BillingExpr)
+			assert.Equal(t, defaultExpression, shared[0].BillingPluginVariants[0].BillingExpr)
+		})
+	}
+}
 
 func resetPricingEndpointTestTables(t *testing.T) {
 	t.Helper()

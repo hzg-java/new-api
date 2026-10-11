@@ -23,6 +23,29 @@ import type { PricingModel } from '../types'
 // Model Helper Utilities
 // ----------------------------------------------------------------------------
 
+/** Select a complete final-price object; never reconstruct private ratios. */
+export function withFinalGroupPrice(
+  model: PricingModel,
+  group?: string
+): PricingModel {
+  if (!model.group_prices) return model
+  const key = group && group !== FILTER_ALL ? group : model.enable_groups[0]
+  const price = model.group_prices[key]
+  return {
+    ...model,
+    quota_type: price?.quota_type ?? 0,
+    billing_mode: 'tiered_expr',
+    billing_expr: price?.billing_expr ?? '',
+    billing_usage_schema: price?.billing_usage_schema,
+    billing_usage_examples: price?.billing_usage_examples,
+    billing_plugin_variants: price?.billing_plugin_variants,
+    model_ratio: Number.NaN,
+    completion_ratio: Number.NaN,
+    model_price: undefined,
+    group_ratio: undefined,
+  }
+}
+
 /**
  * Get available groups for a model
  */
@@ -61,6 +84,7 @@ export function getDisplayGroupRatio(
   model: PricingModel,
   selectedGroup?: string
 ): number {
+  if (model.group_prices) return 1
   const modelEnableGroups = Array.isArray(model.enable_groups)
     ? model.enable_groups
     : []

@@ -88,6 +88,35 @@ afterEach(() => {
 })
 
 describe('model cards', () => {
+  it('uses server final prices when selecting a group without requiring ratios', () => {
+    const finalModel = pricingModel({
+      group_ratio: undefined,
+      group_prices: {
+        default: {
+          quota_type: 0,
+          billing_mode: 'tiered_expr',
+          billing_expr: 'tier("base", p * 4 + c * 12)',
+        },
+        premium: {
+          quota_type: 0,
+          billing_mode: 'tiered_expr',
+          billing_expr: 'tier("base", p * 9 + c * 27)',
+        },
+      },
+    })
+    const view = render(
+      <ModelCard model={finalModel} selectedGroup='default' onClick={vi.fn()} />
+    )
+    expect(screen.getByText('$4')).toBeVisible()
+    expect(screen.getByText('$12')).toBeVisible()
+    view.rerender(
+      <ModelCard model={finalModel} selectedGroup='premium' onClick={vi.fn()} />
+    )
+    expect(screen.getByText('$9')).toBeVisible()
+    expect(screen.getByText('$27')).toBeVisible()
+    expect(screen.queryByText('$4')).not.toBeInTheDocument()
+  })
+
   it('shows separate generic and image cache prices including a free image cache', () => {
     render(
       <CachedPriceCell

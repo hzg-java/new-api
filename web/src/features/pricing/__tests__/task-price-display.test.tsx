@@ -101,6 +101,81 @@ const model: PricingModel = {
 }
 const clients: QueryClient[] = []
 
+it('renders the public per-group contract with final prices and no internal base price', () => {
+  vi.spyOn(api, 'get').mockResolvedValue({ data: { data: { groups: [] } } })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  render(
+    <QueryClientProvider client={client}>
+      <ModelDetailsContent
+        model={{
+          ...model,
+          enable_groups: ['default', 'premium'],
+          group_prices: {
+            default: {
+              quota_type: 0,
+              billing_mode: 'tiered_expr',
+              billing_expr: 'tier("base", p * 4 + c * 12)',
+            },
+            premium: {
+              quota_type: 0,
+              billing_mode: 'tiered_expr',
+              billing_expr: 'tier("base", p * 9 + c * 27)',
+            },
+          },
+        }}
+        tokenUnit='M'
+        groupRatio={{}}
+        usableGroup={{
+          default: { desc: '', ratio: 1 },
+          premium: { desc: '', ratio: 1 },
+        }}
+        endpointMap={{}}
+        autoGroups={[]}
+        priceRate={1}
+        usdExchangeRate={1}
+      />
+    </QueryClientProvider>
+  )
+  expect(screen.getAllByText('$4').length).toBeGreaterThan(0)
+  expect(screen.getAllByText('$9').length).toBeGreaterThan(0)
+  expect(screen.getAllByText('$27').length).toBeGreaterThan(0)
+  expect(screen.queryByText('Base Price')).not.toBeInTheDocument()
+  expect(screen.queryByText('1x')).not.toBeInTheDocument()
+})
+
+it('shows final group prices without exposing numeric group multipliers', () => {
+  vi.spyOn(api, 'get').mockResolvedValue({ data: { data: { groups: [] } } })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  clients.push(client)
+  render(
+    <QueryClientProvider client={client}>
+      <ModelDetailsContent
+        model={{
+          ...model,
+          billing_mode: 'ratio',
+          quota_type: 1,
+          model_price: 1.5,
+        }}
+        tokenUnit='M'
+        groupRatio={{ default: 2 }}
+        usableGroup={{ default: { desc: '', ratio: 2 } }}
+        endpointMap={{}}
+        autoGroups={[]}
+        priceRate={1}
+        usdExchangeRate={1}
+      />
+    </QueryClientProvider>
+  )
+  expect(screen.getAllByText('$3').length).toBeGreaterThan(0)
+  expect(screen.queryByText('2x')).not.toBeInTheDocument()
+  expect(screen.queryByText('Ratio')).not.toBeInTheDocument()
+})
+
 it('shows nested task conditions and prices in detail and group tables without ambiguous log matches', () => {
   vi.spyOn(api, 'get').mockResolvedValue({ data: { data: { groups: [] } } })
   const client = new QueryClient({
@@ -151,6 +226,112 @@ it('shows nested task conditions and prices in detail and group tables without a
   expect(screen.getByText('$0.072 – $0.15')).toBeVisible()
   expect(screen.getAllByText('$0.24').length).toBeGreaterThan(0)
   expect(screen.queryByText('Matched')).not.toBeInTheDocument()
+})
+
+it.each([
+  [
+    'fast',
+    'u("has_video_input") ? tier("sd_video_in", u("tokens") * 22 / 1000000) : tier("sd", u("tokens") * 37 / 1000000)',
+    '22 – 37',
+  ],
+  [
+    'mini',
+    'u("has_video_input") ? tier("sd_video_in", u("tokens") * 14 / 1000000) : tier("sd", u("tokens") * 23 / 1000000)',
+    '14 – 23',
+  ],
+  [
+    '2.0',
+    'u("resolution_tier") == "4k" ? u("has_video_input") ? tier("4k_video_in", u("tokens") * 16 / 1000000) : tier("4k", u("tokens") * 26 / 1000000) : u("resolution_tier") == "1080p" ? u("has_video_input") ? tier("1080p_video_in", u("tokens") * 31 / 1000000) : tier("1080p", u("tokens") * 51 / 1000000) : u("has_video_input") ? tier("sd_video_in", u("tokens") * 28 / 1000000) : tier("sd", u("tokens") * 46 / 1000000)',
+    '16 – 51',
+  ],
+  [
+    '2.5',
+    'u("resolution_tier") == "1080p" ? u("has_video_input") ? tier("1080p_video_in", u("tokens") * 46 / 1000000) : tier("1080p", u("tokens") * 77 / 1000000) : u("has_video_input") ? tier("sd_video_in", u("tokens") * 42 / 1000000) : tier("sd", u("tokens") * 70 / 1000000)',
+    '42 – 77',
+  ],
+])(
+  'shows numeric public Seedance %s prices in cards and cells',
+  (name, expression, range) => {
+    const publicModel: PricingModel = {
+      ...model,
+      model_name: `seedance-${name}`,
+      billing_expr: expression,
+      billing_usage_schema: {
+        has_video_input: { type: 'boolean' },
+        resolution_tier: { enum: ['480p', '720p', '1080p', '4k'] },
+        tokens: { type: 'number', unit: 'token' },
+      },
+    }
+    const responseModel = {
+      ...model,
+      billing_expr: undefined,
+      billing_usage_schema: undefined,
+      group_prices: {
+        default: {
+          quota_type: 0,
+          billing_mode: 'tiered_expr' as const,
+          billing_expr: publicModel.billing_expr,
+          billing_usage_schema: publicModel.billing_usage_schema,
+        },
+      },
+    }
+    render(
+      <>
+        <ModelCard model={responseModel} onClick={vi.fn()} />
+        <ModelPriceCell model={responseModel} />
+      </>
+    )
+    expect(
+      screen.queryByText('Special billing expression')
+    ).not.toBeInTheDocument()
+    expect(screen.getByText(`${range}/1M token`)).toBeVisible()
+    expect(screen.queryByText(expression)).not.toBeInTheDocument()
+  }
+)
+
+it('uses personalized final task prices once when switching public groups', () => {
+  const schema: BillingUsageSchema = {
+    has_video_input: { type: 'boolean' },
+    tokens: { type: 'number', unit: 'token' },
+  }
+  const publicModel: PricingModel = {
+    ...model,
+    enable_groups: ['default', 'premium'],
+    group_ratio: { default: 2, premium: 3 },
+    group_prices: {
+      default: {
+        quota_type: 0,
+        billing_mode: 'tiered_expr',
+        billing_expr:
+          'u("has_video_input") ? tier("sd_video_in", u("tokens") * 11 / 1000000) : tier("sd", u("tokens") * 18.5 / 1000000)',
+        billing_usage_schema: schema,
+      },
+      premium: {
+        quota_type: 0,
+        billing_mode: 'tiered_expr',
+        billing_expr:
+          'u("has_video_input") ? tier("sd_video_in", u("tokens") * 33 / 1000000) : tier("sd", u("tokens") * 55.5 / 1000000)',
+        billing_usage_schema: schema,
+      },
+    },
+  }
+  const view = render(
+    <ModelPriceCell
+      model={publicModel}
+      options={{ selectedGroup: 'default' }}
+    />
+  )
+  expect(screen.getByText('11 – 18.5/1M token')).toBeVisible()
+  view.rerender(
+    <ModelPriceCell
+      model={publicModel}
+      options={{ selectedGroup: 'premium' }}
+    />
+  )
+  expect(screen.getByText('33 – 55.5/1M token')).toBeVisible()
+  expect(
+    screen.queryByText('Special billing expression')
+  ).not.toBeInTheDocument()
 })
 
 it('explains missing task metadata while retaining the original expression', () => {

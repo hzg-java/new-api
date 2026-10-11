@@ -21,7 +21,10 @@ import {
   CardStaggerContainer,
   CardStaggerItem,
 } from '@/components/page-transition'
+import { LoginAuthenticationSection } from '@/features/security/components/login-authentication-section'
 import { useStatus } from '@/hooks/use-status'
+import { ROLE } from '@/lib/roles'
+import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { CheckinCalendarCard } from './components/checkin-calendar-card'
@@ -42,6 +45,7 @@ export function Profile() {
   )
   const turnstileSiteKey = status?.turnstile_site_key || ''
   const canConfigureSidebar = permissions?.sidebar_settings !== false
+  const showPreferences = (profile?.role ?? 0) >= ROLE.ADMIN
 
   return (
     <Main>
@@ -52,18 +56,32 @@ export function Profile() {
           </CardStaggerItem>
 
           <CardStaggerItem>
-            <div className='grid gap-4 sm:gap-5 xl:grid-cols-[minmax(0,1fr)_minmax(360px,0.46fr)] xl:items-start'>
-              <div className='space-y-4 sm:space-y-6'>
-                <ProfileSettingsCard
+            <div
+              className={cn(
+                'grid gap-4 sm:gap-5 xl:items-start',
+                (showPreferences || profile) &&
+                  'xl:grid-cols-[minmax(0,1fr)_minmax(360px,0.46fr)]'
+              )}
+            >
+              {showPreferences ? (
+                <div className='space-y-4 sm:space-y-6'>
+                  <ProfileSettingsCard
+                    profile={profile}
+                    loading={loading}
+                    onProfileUpdate={refreshProfile}
+                  />
+                  <LanguagePreferencesCard
+                    profile={profile}
+                    onProfileUpdate={refreshProfile}
+                  />
+                </div>
+              ) : null}
+              {!showPreferences && profile ? (
+                <LoginAuthenticationSection
                   profile={profile}
-                  loading={loading}
-                  onProfileUpdate={refreshProfile}
+                  onUpdate={refreshProfile}
                 />
-                <LanguagePreferencesCard
-                  profile={profile}
-                  onProfileUpdate={refreshProfile}
-                />
-              </div>
+              ) : null}
 
               <div className='space-y-4 sm:space-y-6 xl:sticky xl:top-6'>
                 {checkinEnabled && (
@@ -73,7 +91,9 @@ export function Profile() {
                     turnstileSiteKey={turnstileSiteKey}
                   />
                 )}
-                {canConfigureSidebar && <SidebarModulesCard />}
+                {showPreferences && canConfigureSidebar && (
+                  <SidebarModulesCard />
+                )}
               </div>
             </div>
           </CardStaggerItem>

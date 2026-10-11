@@ -28,6 +28,56 @@ import {
 } from '../pricing'
 
 describe('shared model pricing', () => {
+  it('round-trips independent multipliers without changing base prices in every mode', () => {
+    for (const values of [
+      { ModelPrice: 2 },
+      { ModelRatio: 2, CompletionRatio: 3 },
+      {
+        'billing_setting.billing_mode': 'tiered_expr',
+        'billing_setting.billing_expr': 'tier("base", p * 2)',
+      },
+    ]) {
+      const draft = pricingRow('source', {
+        ...values,
+        ModelPricingMultiplier: 1.5,
+      })
+      expect(draft.pricingMultiplier).toBe('1.5')
+      const saved = pricingFromDraft(draft)
+      expect(saved).toMatchObject({ ...values, ModelPricingMultiplier: 1.5 })
+      const after = applyPricingDraft(pricingOptions({}), draft, [
+        'source',
+        'target',
+      ])
+      expect(JSON.parse(after.ModelPricingMultiplier)).toEqual({
+        source: 1.5,
+        target: 1.5,
+      })
+    }
+    expect(pricingRow('default', {}).pricingMultiplier).toBe('1')
+  })
+
+  it.each(['0', '-1', 'NaN', 'Infinity', '', ' '])(
+    'rejects invalid pricing multiplier %s',
+    (pricingMultiplier) => {
+      expect(() =>
+        pricingFromDraft({ name: 'example', pricingMultiplier })
+      ).toThrow()
+    }
+  )
+
+  it('keeps local multipliers when upstream prices are synchronized', () => {
+    const options = pricingOptions({
+      ModelPricingMultiplier: '{"example":1.5,"other":2}',
+    })
+    const after = applyPriceSyncSelections(options, {
+      example: { model_price: 3 },
+    })
+    expect(JSON.parse(after.ModelPricingMultiplier)).toEqual(
+      JSON.parse(options.ModelPricingMultiplier)
+    )
+    expect(JSON.parse(after.ModelPrice)).toEqual({ example: 3 })
+  })
+
   it('preserves explicit zero prices and cache-write configuration', () => {
     expect(
       pricingFromDraft({

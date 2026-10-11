@@ -37,6 +37,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Profile } from '@/features/profile'
 import type { UserProfile } from '@/features/profile/types'
 import { api } from '@/lib/api'
+import { Route as SecurityRoute } from '@/routes/_authenticated/security'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { Security } from '../index'
@@ -45,7 +46,7 @@ const profile: UserProfile = {
   id: 1,
   username: 'alice',
   display_name: 'Alice',
-  role: 1,
+  role: 10,
   group: 'default',
   quota: 1000000,
   used_quota: 0,
@@ -138,6 +139,8 @@ async function renderPage(path = '/security') {
   const security = createRoute({
     getParentRoute: () => root,
     path: '/security',
+    beforeLoad: (context) =>
+      SecurityRoute.options.beforeLoad?.(context as never),
     component: Security,
   })
   const personal = createRoute({
@@ -159,6 +162,34 @@ async function renderPage(path = '/security') {
 }
 
 describe('security page migration', () => {
+  it('ordinary users manage password from Profile without account bindings', async () => {
+    const userProfile = { ...profile, role: 1 }
+    useAuthStore.getState().auth.setUser({
+      ...userProfile,
+      permissions: { sidebar_settings: false },
+    })
+    const originalGet = vi.mocked(api.get).getMockImplementation()
+    if (!originalGet) throw new Error('API fixture is not initialized')
+    vi.mocked(api.get).mockImplementation(async (url, config) =>
+      url === '/api/user/self'
+        ? { data: { success: true, data: userProfile } }
+        : originalGet(url, config)
+    )
+    const user = userEvent.setup()
+    const { router } = await renderPage('/security')
+    await waitFor(() => expect(router.state.location.pathname).toBe('/profile'))
+    expect(
+      await screen.findByRole('region', { name: 'Login & Authentication' })
+    ).toBeVisible()
+    expect(screen.queryByText('Account Bindings')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Change Password' }))
+    expect(
+      await screen.findByRole('dialog', { name: 'Change Password' })
+    ).toBeVisible()
+    expect(screen.queryByText('Language Preferences')).not.toBeInTheDocument()
+    expect(api.get).not.toHaveBeenCalledWith('/api/user/sessions')
+  })
+
   it('places account management on the left and verification and privacy on the right', async () => {
     await renderPage()
     const login = await screen.findByRole('region', {

@@ -26,6 +26,8 @@ import { IconBadge } from '@/components/ui/icon-badge'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { formatQuota } from '@/lib/format'
+import { ROLE } from '@/lib/roles'
+import { useAuthStore } from '@/stores/auth-store'
 
 import type { UserWalletData } from '../types'
 
@@ -45,6 +47,9 @@ export function AffiliateRewardsCard({
   loading,
 }: AffiliateRewardsCardProps) {
   const { t } = useTranslation()
+  const role = useAuthStore((state) => state.auth.user?.role ?? 0)
+  if (role < ROLE.ADMIN) return null
+
   if (loading) {
     return (
       <Card data-card-hover='false' className='bg-muted/20 py-0'>

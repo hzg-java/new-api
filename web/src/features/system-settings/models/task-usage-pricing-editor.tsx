@@ -80,6 +80,7 @@ import { TaskPricingMatrix } from './task-pricing-matrix'
 
 type TaskUsagePricingEditorProps = {
   currency?: PricingCurrency
+  previewCurrency?: PricingCurrency
   billingExpr: string
   requestRuleExpr: string
   usageSchema: BillingUsageSchema
@@ -611,7 +612,7 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
             )}
 
             <TaskBillingPreview
-              currency={props.currency}
+              currency={props.previewCurrency ?? props.currency}
               config={previewConfig}
               requestRuleExpr={previewRequestRuleExpr}
               sample={previewSample}
@@ -674,7 +675,7 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
               spellCheck={false}
             />
             <TaskBillingPreview
-              currency={props.currency}
+              currency={props.previewCurrency ?? props.currency}
               config={previewConfig}
               requestRuleExpr={previewRequestRuleExpr}
               sample={previewSample}
@@ -700,7 +701,7 @@ export const TaskUsagePricingEditor = memo(function TaskUsagePricingEditor(
         }
         usage={previewSample}
         usageSchema={props.usageSchema}
-        currency={props.currency}
+        currency={props.previewCurrency ?? props.currency}
         mode='task'
       />
     </div>

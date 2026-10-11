@@ -107,7 +107,7 @@ beforeEach(async () => {
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   client.setQueryData(['status'], {}, { updatedAt: Date.now() + 60_000 })
   client.setQueryData(
-    ['pricing'],
+    ['pricing', 0],
     { data: [], vendors: [] },
     { updatedAt: Date.now() + 60_000 }
   )
@@ -272,7 +272,7 @@ test.each([
 ])(
   'task expression $tier shows its recorded unit price',
   ({ expression, tier, expected }) => {
-    client.setQueryData(['pricing'], {
+    client.setQueryData(['pricing', 0], {
       data: [
         {
           model_name: 'wan2.5-i2v-preview',
@@ -301,7 +301,7 @@ test.each([
 )
 
 test('task log prices use localized unit labels from pricing metadata', async () => {
-  client.setQueryData(['pricing'], {
+  client.setQueryData(['pricing', 0], {
     data: [
       {
         model_name: 'wan2.5-i2v-preview',
@@ -330,7 +330,7 @@ test('task log prices use localized unit labels from pricing metadata', async ()
 })
 
 test('task log prices select the executing provider’s schema', () => {
-  client.setQueryData(['pricing'], {
+  client.setQueryData(['pricing', 0], {
     data: [
       {
         model_name: 'wan2.5-i2v-preview',
@@ -365,11 +365,102 @@ test('task log prices select the executing provider’s schema', () => {
   expect(preview).toHaveTextContent('images · images $0.25/image')
 })
 
+test('task log previews use public group schema but retain the recorded expression', () => {
+  client.setQueryData(['pricing', 0], {
+    data: [
+      {
+        model_name: 'wan2.5-i2v-preview',
+        enable_groups: ['default'],
+        group_prices: {
+          default: {
+            quota_type: 0,
+            billing_mode: 'tiered_expr',
+            billing_expr: 'tier("current", u("seconds") * 99)',
+            billing_usage_schema: {
+              seconds: { type: 'number', unit: 'second' },
+            },
+            billing_plugin_variants: [
+              {
+                plugin_key: 'beta',
+                plugin_name: 'Beta',
+                billing_expr: 'tier("current", u("images") * 99)',
+                billing_usage_schema: {
+                  images: {
+                    type: 'number',
+                    unit: 'count',
+                    unitLabel: { en: 'image' },
+                  },
+                },
+              },
+            ],
+          },
+        },
+      },
+    ],
+    vendors: [],
+  })
+  const preview = renderPreview({
+    is_task: true,
+    billing_mode: 'tiered_expr',
+    expr_b64: btoa('tier("images", u("images") * 0.25)'),
+    matched_tier: 'images',
+    admin_info: {
+      task_plugin: { key: 'beta', name: 'Beta', version: '1.0.0' },
+    },
+  })
+  expect(preview).toHaveTextContent('images · images $0.25/image')
+})
+
+test('redacted task usage facts without an expression do not reconstruct prices or ratios', async () => {
+  client.setQueryData(['pricing', 0], {
+    data: [
+      {
+        model_name: 'wan2.5-i2v-preview',
+        billing_mode: 'tiered_expr',
+        billing_expr: 'tier("music", u("clips") * 99)',
+        billing_usage_schema: { clips: { type: 'number', unit: 'count' } },
+      },
+    ],
+    vendors: [],
+  })
+  const preview = renderPreview({
+    is_task: true,
+    billing_mode: 'tiered_expr',
+    usage_facts: { clips: 2 },
+  })
+  expect(preview.textContent).toBe('Dynamic Pricing · No matching results')
+  fireEvent.click(preview)
+  const dialog = within(await screen.findByRole('dialog'))
+  expect(
+    dialog.queryByText(/Group Ratio|User Exclusive Ratio|Model Ratio/)
+  ).not.toBeInTheDocument()
+  expect(dialog.queryByText(/\$99/)).not.toBeInTheDocument()
+})
+
+test('ordinary users see no detail preview for redacted task usage facts', () => {
+  render(
+    <I18nextProvider i18n={i18n}>
+      <QueryClientProvider client={client}>
+        <DetailPreview
+          other={{
+            is_task: true,
+            billing_mode: 'tiered_expr',
+            usage_facts: { clips: 2 },
+          }}
+          isAdmin={false}
+        />
+      </QueryClientProvider>
+    </I18nextProvider>
+  )
+  expect(screen.queryByRole('button')).not.toBeInTheDocument()
+  expect(screen.queryByText(/Ratio|\$|\dx/)).not.toBeInTheDocument()
+})
+
 test.each(['missing schema', 'unsupported expression', 'unknown tier'])(
   'task pricing with %s shows an explicit unavailable summary',
   (scenario) => {
     if (scenario !== 'missing schema') {
-      client.setQueryData(['pricing'], {
+      client.setQueryData(['pricing', 0], {
         data: [
           {
             model_name: 'wan2.5-i2v-preview',

@@ -116,6 +116,7 @@ function createJsonStringField(
 
 const createModelSchema = (t: Translate) =>
   z.object({
+    ModelPricingMultiplier: createJsonStringField(t),
     ModelPrice: createJsonStringField(t),
     ModelRatio: createJsonStringField(t),
     CacheRatio: createJsonStringField(t),
@@ -222,6 +223,9 @@ export function RatioSettingsCard({
   })
 
   const modelNormalizedDefaults = useRef({
+    ModelPricingMultiplier: normalizeJsonString(
+      modelDefaults.ModelPricingMultiplier
+    ),
     ModelPrice: normalizeJsonString(modelDefaults.ModelPrice),
     ModelRatio: normalizeJsonString(modelDefaults.ModelRatio),
     CacheRatio: normalizeJsonString(modelDefaults.CacheRatio),
@@ -261,6 +265,9 @@ export function RatioSettingsCard({
     mode: 'onChange',
     defaultValues: {
       ...modelDefaults,
+      ModelPricingMultiplier: formatJsonForTextarea(
+        modelDefaults.ModelPricingMultiplier
+      ),
       ModelPrice: formatJsonForTextarea(modelDefaults.ModelPrice),
       ModelRatio: formatJsonForTextarea(modelDefaults.ModelRatio),
       CacheRatio: formatJsonForTextarea(modelDefaults.CacheRatio),
@@ -295,6 +302,9 @@ export function RatioSettingsCard({
 
   useEffect(() => {
     modelNormalizedDefaults.current = {
+      ModelPricingMultiplier: normalizeJsonString(
+        modelDefaults.ModelPricingMultiplier
+      ),
       ModelPrice: normalizeJsonString(modelDefaults.ModelPrice),
       ModelRatio: normalizeJsonString(modelDefaults.ModelRatio),
       CacheRatio: normalizeJsonString(modelDefaults.CacheRatio),
@@ -314,6 +324,9 @@ export function RatioSettingsCard({
 
     modelForm.reset({
       ...modelDefaults,
+      ModelPricingMultiplier: formatJsonForTextarea(
+        modelDefaults.ModelPricingMultiplier
+      ),
       ModelPrice: formatJsonForTextarea(modelDefaults.ModelPrice),
       ModelRatio: formatJsonForTextarea(modelDefaults.ModelRatio),
       CacheRatio: formatJsonForTextarea(modelDefaults.CacheRatio),
@@ -360,6 +373,9 @@ export function RatioSettingsCard({
   const saveModelRatios = useCallback(
     async (values: ModelFormValues) => {
       const normalized = {
+        ModelPricingMultiplier: normalizeJsonString(
+          values.ModelPricingMultiplier
+        ),
         ModelPrice: normalizeJsonString(values.ModelPrice),
         ModelRatio: normalizeJsonString(values.ModelRatio),
         CacheRatio: normalizeJsonString(values.CacheRatio),

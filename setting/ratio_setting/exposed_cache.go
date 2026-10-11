@@ -47,6 +47,11 @@ func GetExposedData() gin.H {
 		"create_cache_ratio": GetCreateCacheRatioCopy(),
 		"model_price":        GetModelPriceCopy(),
 	}
+	for _, key := range []string{"model_ratio", "model_price"} {
+		for name, value := range newData[key].(map[string]float64) {
+			newData[key].(map[string]float64)[name] = value * GetModelPricingMultiplier(name)
+		}
+	}
 	exposedData.Store(&exposedCache{
 		data:      newData,
 		expiresAt: time.Now().Add(exposedDataTTL),

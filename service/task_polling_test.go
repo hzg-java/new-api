@@ -842,6 +842,20 @@ func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
 		wantUnchanged bool
 	}{
 		{
+			name:       "unchanged terminal snapshot remains complete",
+			statusCode: http.StatusOK,
+			parse:      &relaycommon.TaskInfo{Status: model.TaskStatusFailure, Reason: "provider failure"},
+			wantStatus: model.TaskStatusFailure,
+			wantRefund: true,
+		},
+		{
+			name:       "sanitized terminal snapshot remains visible but incomplete",
+			statusCode: http.StatusOK,
+			parse:      &relaycommon.TaskInfo{Status: model.TaskStatusFailure, Reason: "provider failure"},
+			wantStatus: model.TaskStatusFailure,
+			wantRefund: true,
+		},
+		{
 			name:          "404 fails immediately and refunds",
 			statusCode:    http.StatusNotFound,
 			wantStatus:    model.TaskStatusFailure,
@@ -914,6 +928,8 @@ func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			truncate(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.TaskEvent{}))
+			require.NoError(t, model.DB.Where("1 = 1").Delete(&model.TaskEvent{}).Error)
 			const userID, tokenID, channelID = 510, 510, 510
 			const initialQuota, preConsumed, tokenRemain = 10_000, 4_000, 7_000
 			seedUser(t, userID, initialQuota)
@@ -936,6 +952,9 @@ func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
 			require.NoError(t, model.DB.Create(task).Error)
 
 			adaptor := &scriptedPollingAdaptor{statusCode: testCase.statusCode, fetchErr: testCase.fetchErr, parse: testCase.parse, parseErr: testCase.parseErr}
+			if testCase.name == "sanitized terminal snapshot remains visible but incomplete" {
+				adaptor.body = []byte(`{"number":9007199254740993,"response":{"bytesBase64Encoded":"video-canary","label":"retained"}}`)
+			}
 			require.NoError(t, updateVideoSingleTask(context.Background(), adaptor, ch, task.GetUpstreamTaskID(), map[string]*model.Task{
 				task.GetUpstreamTaskID(): task,
 			}))
@@ -944,6 +963,28 @@ func TestUpdateVideoSingleTaskPollClassification(t *testing.T) {
 			require.NoError(t, model.DB.First(&persisted, task.ID).Error)
 			assert.EqualValues(t, testCase.wantStatus, persisted.Status)
 			assert.Equal(t, testCase.wantFailures, persisted.PrivateData.PollFailures)
+			if testCase.name == "sanitized terminal snapshot remains visible but incomplete" {
+				events, err := model.GetTaskEvents(task.ID)
+				require.NoError(t, err)
+				require.Len(t, events, 1)
+				require.NoError(t, events[0].ProjectDetail(true))
+				require.NotNil(t, events[0].DetailComplete)
+				assert.False(t, *events[0].DetailComplete)
+				assert.Equal(t, "video_snapshot_sanitized", events[0].DetailUnavailable)
+				assert.Contains(t, events[0].Payload, `"data":`)
+				assert.Contains(t, events[0].Payload, "retained")
+				assert.NotContains(t, events[0].Payload, "video-canary")
+				assert.Equal(t, string(persisted.Data), string(task.Data))
+			}
+			if testCase.name == "unchanged terminal snapshot remains complete" {
+				events, err := model.GetTaskEvents(task.ID)
+				require.NoError(t, err)
+				require.Len(t, events, 1)
+				require.NoError(t, events[0].ProjectDetail(true))
+				require.NotNil(t, events[0].DetailComplete)
+				assert.True(t, *events[0].DetailComplete)
+				assert.Empty(t, events[0].DetailUnavailable)
+			}
 			if testCase.wantUnchanged {
 				assert.Empty(t, persisted.FailReason)
 			}

@@ -21,14 +21,17 @@ import { useMemo } from 'react'
 
 import { useStatus } from '@/hooks/use-status'
 import { requireServerSuccess } from '@/lib/server-error-message'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { getPricing } from '../api'
+import { withFinalGroupPrice } from '../lib/model-helpers'
 
 export function usePricingData(enabled = true) {
   const { status } = useStatus()
+  const userId = useAuthStore((state) => state.auth.user?.id)
 
   const { data, isLoading, error, refetch } = useQuery({
-    queryKey: ['pricing'],
+    queryKey: ['pricing', userId ?? 0],
     queryFn: async () => requireServerSuccess(await getPricing()),
     staleTime: 5 * 60 * 1000,
     enabled,
@@ -54,12 +57,11 @@ export function usePricingData(enabled = true) {
         ? vendorMap.get(model.vendor_id)
         : undefined
       return {
-        ...model,
+        ...withFinalGroupPrice(model),
         key: model.model_name,
         vendor_name: vendor?.name,
         vendor_icon: vendor?.icon,
         vendor_description: vendor?.description,
-        group_ratio: data.group_ratio,
       }
     })
   }, [data])
@@ -67,8 +69,13 @@ export function usePricingData(enabled = true) {
   return {
     models,
     vendors: data?.vendors ?? [],
-    groupRatio: data?.group_ratio ?? {},
-    usableGroup: data?.usable_group ?? {},
+    groupRatio: {},
+    usableGroup: Object.fromEntries(
+      Object.entries(data?.usable_group ?? {}).map(([key, desc]) => [
+        key,
+        { desc, ratio: 1 },
+      ])
+    ),
     endpointMap: data?.supported_endpoint ?? {},
     autoGroups: data?.auto_groups ?? [],
     isLoading,

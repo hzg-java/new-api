@@ -8,6 +8,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
@@ -88,6 +89,35 @@ func GetPricing() []Pricing {
 		}
 	}
 	return pricingMap
+}
+
+func PricingForUser(pricing []Pricing, userID int) ([]Pricing, error) {
+	result := make([]Pricing, len(pricing))
+	copy(result, pricing)
+	for i := range result {
+		item := &result[i]
+		multiplier := ratio_setting.GetUserModelPricingMultiplier(userID, item.ModelName)
+		item.ModelPrice *= multiplier
+		item.ModelRatio *= multiplier
+		var err error
+		if item.BillingExpr != "" {
+			item.BillingExpr, err = billingexpr.ScalePricingExpression(item.BillingExpr, multiplier)
+			if err != nil {
+				return nil, err
+			}
+		}
+		item.BillingPluginVariants = append([]PricingPluginVariant(nil), item.BillingPluginVariants...)
+		for j := range item.BillingPluginVariants {
+			variant := &item.BillingPluginVariants[j]
+			if variant.BillingExpr != "" {
+				variant.BillingExpr, err = billingexpr.ScalePricingExpression(variant.BillingExpr, multiplier)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	return result, nil
 }
 
 func InvalidatePricingCache() {
@@ -424,6 +454,29 @@ func updatePricing() {
 					BillingExpr: expression, BillingMode: mode,
 					BillingUsageSchema: jsplugin.CloneUsageSchema(schema), BillingUsageExamples: jsplugin.CloneUsageExamples(examples),
 				})
+			}
+		}
+		multiplier := ratio_setting.GetModelPricingMultiplier(model)
+		pricing.ModelPrice *= multiplier
+		pricing.ModelRatio *= multiplier
+		if pricing.BillingExpr != "" {
+			scaled, err := billingexpr.ScalePricingExpression(pricing.BillingExpr, multiplier)
+			if err != nil {
+				pricing.BillingExpr = ""
+			} else {
+				pricing.BillingExpr = scaled
+			}
+		}
+		for index := range pricing.BillingPluginVariants {
+			variant := &pricing.BillingPluginVariants[index]
+			if variant.BillingExpr == "" {
+				continue
+			}
+			scaled, err := billingexpr.ScalePricingExpression(variant.BillingExpr, multiplier)
+			if err != nil {
+				variant.BillingExpr = ""
+			} else {
+				variant.BillingExpr = scaled
 			}
 		}
 		pricingMap = append(pricingMap, pricing)

@@ -17,7 +17,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
-import { Link } from '@tanstack/react-router'
 import { Loader2, LogIn, KeyRound, UserRound, LockKeyhole } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
@@ -412,12 +411,6 @@ export function UserAuthForm({
                     </FormControl>
                   </div>
                   <FormMessage />
-                  <Link
-                    to='/forgot-password'
-                    className='absolute end-0 -top-0.5 z-10 text-xs font-medium text-[#5275da] hover:underline dark:text-[#9ab7ff]'
-                  >
-                    {t('Forgot password?')}
-                  </Link>
                 </FormItem>
               )}
             />

@@ -209,6 +209,32 @@ func normalizeLegacyRejectReason(values map[string]json.RawMessage) bool {
 	return true
 }
 
+// userLogOtherKey is deliberately an allowlist: task OtherRatios historically
+// wrote arbitrary keys (including strings and nested diagnostics) at the top level.
+// New metadata must be reviewed before exposing it to log owners.
+func userLogOtherKey(key string) bool {
+	switch key {
+	case "request_path", "frt", "reasoning_effort", "is_system_prompt_overwritten",
+		"stream_status", "request_conversion", "error_type", "error_code", "status_code",
+		"billing_source", "billing_preference", "billing_mode", "billing_unit", "matched_tier",
+		"subscription_id", "subscription_plan_id", "subscription_plan_title",
+		"subscription_pre_consumed", "subscription_post_delta", "subscription_total",
+		"subscription_used", "subscription_remain", "subscription_consumed", "wallet_quota_deducted",
+		"is_task", "task_sync", "task_id", "task_status", "task_billing_pending", "result_discarded",
+		"pre_consumed_quota", "actual_quota", "image_count", "usage_facts", "billing_tokens",
+		"claude", "ws", "audio", "image", "usage_semantic", "audio_input_seperate_price",
+		"audio_input", "audio_output", "text_input", "text_output", "image_output",
+		"audio_input_token_count", "input_tokens_total", "cache_tokens", "image_cache_tokens",
+		"cache_creation_tokens", "cache_creation_tokens_5m", "cache_creation_tokens_1h", "cache_write_tokens",
+		"web_search", "web_search_call_count", "file_search", "file_search_call_count",
+		"image_generation_call", "image_generation_call_count", "tool_surcharges",
+		"violation_fee", "violation_fee_code", "violation_fee_marker", "fee_quota":
+		return true
+	default:
+		return false
+	}
+}
+
 // formatLogOtherJSON applies the role projection while keeping untouched JSON
 // values as RawMessage. This preserves integers larger than JavaScript's safe
 // range instead of round-tripping them through float64.
@@ -227,17 +253,29 @@ func formatLogOtherJSON(value string, visibility logOtherVisibility) string {
 
 	changed := false
 	if visibility == logOtherVisibilityUser {
-		for _, key := range []string{logOtherAdminInfoKey, logOtherRootInfoKey, logOtherAuditInfoKey, "is_model_mapped", "upstream_model_name", "response_model"} {
-			if _, exists := values[key]; exists {
+		for key := range values {
+			if !userLogOtherKey(key) {
 				delete(values, key)
 				changed = true
 			}
 		}
-		for _, key := range legacySensitiveLogOtherKeys {
-			if _, exists := values[key]; exists {
-				delete(values, key)
-				changed = true
+		if raw, exists := values["tool_surcharges"]; exists {
+			// Retain tool usage, never the internal unit price or arbitrary fields.
+			var items []map[string]json.RawMessage
+			delete(values, "tool_surcharges")
+			if common.Unmarshal(raw, &items) == nil {
+				for _, item := range items {
+					for key := range item {
+						if key != "name" && key != "count" {
+							delete(item, key)
+						}
+					}
+				}
+				if encoded, err := common.Marshal(items); err == nil {
+					values["tool_surcharges"] = encoded
+				}
 			}
+			changed = true
 		}
 	} else {
 		changed = normalizeLegacyRejectReason(values)

@@ -3,9 +3,90 @@ package billingexpr
 import (
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/expr-lang/expr/ast"
+	"github.com/expr-lang/expr/parser"
+	"github.com/shopspring/decimal"
 )
+
+// ScalePricingExpression materializes effective prices without changing usage,
+// tier conditions, or request-rule factors. Canonical price leaves stay canonical.
+func ScalePricingExpression(expression string, multiplier float64) (string, error) {
+	if multiplier <= 0 || math.IsNaN(multiplier) || math.IsInf(multiplier, 0) {
+		return "", fmt.Errorf("pricing multiplier must be finite and positive")
+	}
+	if _, err := CompileFromCache(expression); err != nil {
+		return "", err
+	}
+	if multiplier == 1 {
+		return expression, nil
+	}
+	_, body := ParseExprVersion(expression)
+	tree, err := parser.Parse(body)
+	if err != nil {
+		return "", err
+	}
+	scaled, err := scalePriceTree(tree.Node, multiplier)
+	if err != nil {
+		return "", err
+	}
+	result := scaled.String()
+	if strings.HasPrefix(expression, "v1:") {
+		result = "v1:" + result
+	}
+	_, err = CompileFromCache(result)
+	return result, err
+}
+
+func scalePriceTree(node ast.Node, multiplier float64) (ast.Node, error) {
+	if conditional, ok := node.(*ast.ConditionalNode); ok {
+		var err error
+		conditional.Exp1, err = scalePriceTree(conditional.Exp1, multiplier)
+		if err != nil {
+			return nil, err
+		}
+		conditional.Exp2, err = scalePriceTree(conditional.Exp2, multiplier)
+		return conditional, err
+	}
+	if call, ok := node.(*ast.CallNode); ok {
+		if callee, ok := call.Callee.(*ast.IdentifierNode); ok && (callee.Value == "tier" || callee.Value == "fixed") {
+			index := len(call.Arguments) - 1
+			value, err := scalePriceTree(call.Arguments[index], multiplier)
+			call.Arguments[index] = value
+			return call, err
+		}
+	}
+	if number, ok := requestRuleNumber(node); ok {
+		value, _ := decimal.NewFromFloat(number).Mul(decimal.NewFromFloat(multiplier)).Float64()
+		if math.IsInf(value, 0) || math.IsNaN(value) {
+			return nil, fmt.Errorf("effective price is not finite")
+		}
+		return &ast.FloatNode{Value: value}, nil
+	}
+	if binary, ok := node.(*ast.BinaryNode); ok {
+		var err error
+		switch binary.Operator {
+		case "+", "-":
+			binary.Left, err = scalePriceTree(binary.Left, multiplier)
+			if err != nil {
+				return nil, err
+			}
+			binary.Right, err = scalePriceTree(binary.Right, multiplier)
+			return binary, err
+		case "*", "/":
+			if containsPricingMarker(binary.Left) || binary.Operator == "/" {
+				binary.Left, err = scalePriceTree(binary.Left, multiplier)
+			} else {
+				binary.Right, err = scalePriceTree(binary.Right, multiplier)
+			}
+			return binary, err
+		}
+	}
+	// Arbitrary raw numeric programs need a value-level transformation: never
+	// scale their internal thresholds, rounding arguments, or usage probes.
+	return &ast.BinaryNode{Operator: "*", Left: node, Right: &ast.FloatNode{Value: multiplier}}, nil
+}
 
 // UsesFixedPricing includes unselected branches, even when compilation later
 // optimizes them away. Hosts use it to reject unsupported billing entrances.

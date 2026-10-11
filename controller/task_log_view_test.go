@@ -1,7 +1,11 @@
 package controller
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -282,6 +286,10 @@ func TestTaskEventTimelinePreservesSafeSnapshotsAndOwnership(t *testing.T) {
 			assert.Equal(t, []string{"request", "accepted", "result"}, []string{response.Data[0].Kind, response.Data[1].Kind, response.Data[2].Kind})
 			assert.Contains(t, response.Data[2].Payload, "SUCCESS")
 			assert.NotContains(t, recorder.Body.String(), "FAILURE")
+			if tc.name == "admin" {
+				assert.Contains(t, recorder.Body.String(), `"detail_complete":false`)
+				assert.Contains(t, recorder.Body.String(), `"detail_unavailable":"not_recorded"`)
+			}
 		})
 	}
 }
@@ -321,6 +329,7 @@ func TestTaskEventStoreRejectsOversizedPayloadAndUnknownFields(t *testing.T) {
 func TestTaskEventResultSnapshotOmitsUntrustedResponseData(t *testing.T) {
 	task := &model.Task{TaskID: "public-id", Status: model.TaskStatusSuccess, Data: []byte(`{"usage":{"total_tokens":12,"completion_tokens":9,"key":"secret-canary"},"url":"https://secret.invalid/video?key=secret-canary"}`)}
 	payload := model.TaskResultEventPayload(task)
+	delete(payload, "admin_info")
 	encoded, err := common.Marshal(payload)
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"task_id":"public-id","status":"SUCCESS","usage":{"total_tokens":12,"completion_tokens":9}}`, string(encoded))
@@ -375,12 +384,243 @@ func TestTaskSubmissionRecordsTimelineWithoutRawPayloads(t *testing.T) {
 	require.Len(t, events, 2)
 	assert.Equal(t, "request", events[0].Kind)
 	assert.Equal(t, "accepted", events[1].Kind)
+	require.NoError(t, events[0].ProjectDetail(false))
 	assert.JSONEq(t, `{"model":"plugin-model"}`, events[0].Payload)
 	assert.JSONEq(t, `{"id":"task_public","status":"queued","model":"plugin-model"}`, events[1].Payload)
 	for _, event := range events {
 		assert.NotContains(t, event.Payload, "secret-canary")
 		assert.NotContains(t, event.Payload, "private-id")
 	}
+}
+
+func TestTaskEventAdminDetailProjection(t *testing.T) {
+	db, _ := openTaskDialectDatabase(t, &model.Task{}, &model.TaskEvent{})
+	previousDB := model.DB
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	task := &model.Task{TaskID: "detail-task", UserId: 7, Status: model.TaskStatusFailure, FailReason: "provider rejected", Data: []byte(`{"nested":[{"api_key":"credential-canary","number":9007199254740993,"url":"https://user:password@cdn.example/video?token=url-canary&width=720"}]}`)}
+	require.NoError(t, db.Create(task).Error)
+	require.NoError(t, model.RecordTaskEvent(task.ID, "result", 1700000000, model.TaskResultEventPayload(task)))
+	for _, tc := range []struct {
+		name        string
+		role, token int
+		full        bool
+	}{
+		{"admin browser", common.RoleAdminUser, 0, true},
+		{"ordinary browser", common.RoleCommonUser, 0, false},
+		{"root token", common.RoleRootUser, 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, "/api/task/events", nil)
+			c.Params = gin.Params{{Key: "task_id", Value: strconv.FormatInt(task.ID, 10)}}
+			c.Set("id", 7)
+			c.Set("role", tc.role)
+			c.Set("token_id", tc.token)
+			GetDashboardTaskEvents(c)
+			require.Equal(t, 200, recorder.Code)
+			body := recorder.Body.String()
+			assert.NotContains(t, body, "credential-canary")
+			assert.NotContains(t, body, "url-canary")
+			assert.NotContains(t, body, "user:password")
+			if tc.full {
+				assert.Contains(t, body, "9007199254740993")
+				assert.Contains(t, body, "provider rejected")
+				assert.Contains(t, body, `"detail_complete":true`)
+			} else {
+				assert.NotContains(t, body, "nested")
+				assert.NotContains(t, body, "admin_info")
+				assert.NotContains(t, body, "detail_complete")
+			}
+		})
+	}
+}
+
+func TestTaskEventOriginalRequestAndActualResponse(t *testing.T) {
+	db, _ := openTaskDialectDatabase(t, &model.Task{}, &model.TaskEvent{}, &model.User{}, &model.Channel{})
+	previousDB := model.DB
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	oldConsume := common.LogConsumeEnabled
+	common.LogConsumeEnabled = false
+	t.Cleanup(func() { common.LogConsumeEnabled = oldConsume })
+	c := taskSubmissionTestContext()
+	c.Request.Body = io.NopCloser(strings.NewReader(`{"model":"original-model","prompt":"original prompt","count":9007199254740993}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	capture := installTaskEventResponseCapture(c)
+	var billing []string
+	outcome, taskErr := executeTaskSubmissionWith(c, taskSubmissionRelayInfo(&taskSubmissionTestBilling{events: &billing}), func(c *gin.Context, _ *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+		c.Set("task_request", map[string]any{"prompt": "mutated prompt"})
+		return &relay.TaskSubmitResult{Platform: "video", UpstreamTaskID: "vendor-id"}, nil
+	})
+	require.Nil(t, taskErr)
+	require.NotNil(t, outcome)
+	c.JSON(502, gin.H{"error": gin.H{"message": "actual presenter failure", "api_key": "response-canary"}})
+	capture.record()
+	events, err := model.GetTaskEvents(outcome.Task.ID)
+	require.NoError(t, err)
+	require.Len(t, events, 2)
+	require.NoError(t, events[0].ProjectDetail(true))
+	assert.Contains(t, events[0].Payload, "original prompt")
+	assert.NotContains(t, events[0].Payload, "mutated prompt")
+	assert.Contains(t, events[0].Payload, "9007199254740993")
+	require.NoError(t, events[1].ProjectDetail(true))
+	assert.Contains(t, events[1].Payload, "actual presenter failure")
+	assert.NotContains(t, events[1].Payload, "response-canary")
+}
+
+func TestTaskEventCredentialTextAndEnvelopes(t *testing.T) {
+	for _, value := range []any{
+		map[string]any{"message": "Authorization: Bearer bearer-canary; Basic basic-canary api_key=key-canary x-api-key: header-canary sk-free-canary"},
+		map[string]any{"headers": []any{map[string]any{"name": "Authorization", "value": "Bearer envelope-canary"}, map[string]any{"name": "x-api-key", "value": "envelope-key-canary"}}},
+		map[string]any{"fields": []any{map[string]any{"name": "api_key", "value": []string{"form-canary", "second-canary"}}}},
+	} {
+		encoded, err := model.RedactTaskEventDetail(value)
+		require.NoError(t, err)
+		assert.NotContains(t, string(encoded), "canary")
+		assert.Contains(t, string(encoded), "[REDACTED]")
+	}
+}
+
+func TestTaskEventURLEncodedRequest(t *testing.T) {
+	for _, tc := range []struct{ body, reason string }{
+		{"prompt=first&prompt=second&api_key=form-canary&Authorization=Bearer+auth-canary", ""},
+		{"prompt=%zz", "invalid_form"},
+	} {
+		c := taskSubmissionTestContext()
+		c.Request = httptest.NewRequest(http.MethodPost, "/submit", strings.NewReader(tc.body))
+		c.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+		t.Cleanup(func() { common.CleanupBodyStorage(c) })
+		snapshot := taskEventOriginalRequest(c)
+		encoded, err := model.RedactTaskEventDetail(snapshot)
+		require.NoError(t, err)
+		if tc.reason != "" {
+			assert.Contains(t, string(encoded), tc.reason)
+		} else {
+			assert.Contains(t, string(encoded), `"prompt":["first","second"]`)
+			assert.Contains(t, string(encoded), `"kind":"form"`)
+			assert.NotContains(t, string(encoded), "canary")
+		}
+		replayed, err := io.ReadAll(c.Request.Body)
+		require.NoError(t, err)
+		assert.Equal(t, tc.body, string(replayed))
+	}
+}
+
+func TestTaskEventResultURLRedaction(t *testing.T) {
+	for _, discarded := range []bool{false, true} {
+		task := &model.Task{TaskID: "result", Status: model.TaskStatusSuccess, PrivateData: model.TaskPrivateData{ResultURL: "https://user:pass@cdn.example/video?token=result-canary&width=720", ResultDiscarded: discarded}}
+		encoded, err := model.RedactTaskEventDetail(model.TaskResultEventPayload(task)["admin_info"])
+		require.NoError(t, err)
+		assert.NotContains(t, string(encoded), "result-canary")
+		assert.NotContains(t, string(encoded), "user:pass")
+		if discarded {
+			assert.NotContains(t, string(encoded), "result_url")
+		} else {
+			assert.Contains(t, string(encoded), "https://cdn.example/video?")
+			assert.Contains(t, string(encoded), "width=720")
+		}
+	}
+}
+
+func TestTaskEventRedactionAndMultipart(t *testing.T) {
+	redacted, err := model.RedactTaskEventDetail(map[string]any{"raw": json.RawMessage(`{"values":[0,false,9007199254740993,1.2300],"Authorization":"Bearer canary","url":"https://u:p@example.com/?X-Amz-Signature=canary&width=0"}`)})
+	require.NoError(t, err)
+	assert.Contains(t, string(redacted), "9007199254740993")
+	assert.Contains(t, string(redacted), "1.2300")
+	assert.NotContains(t, string(redacted), "canary")
+	assert.NotContains(t, string(redacted), "u:p")
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	require.NoError(t, writer.WriteField("prompt", "original multipart"))
+	file, err := writer.CreateFormFile("image", "input.png")
+	require.NoError(t, err)
+	_, err = file.Write([]byte("file-bytes-canary"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+	c := taskSubmissionTestContext()
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/edits", bytes.NewReader(body.Bytes()))
+	c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+	defer common.CleanupBodyStorage(c)
+	defer func() {
+		if c.Request.MultipartForm != nil {
+			_ = c.Request.MultipartForm.RemoveAll()
+		}
+	}()
+	snapshot := taskEventOriginalRequest(c)
+	encoded, err := common.Marshal(snapshot)
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), "original multipart")
+	assert.Contains(t, string(encoded), "input.png")
+	assert.NotContains(t, string(encoded), "file-bytes-canary")
+	assert.Contains(t, string(encoded), `"unavailable":"uploaded_file_bytes_omitted"`)
+	replayed, err := io.ReadAll(c.Request.Body)
+	require.NoError(t, err)
+	assert.Equal(t, body.Bytes(), replayed)
+}
+
+func TestTaskEventSSECapturePreservesFlushAndBounds(t *testing.T) {
+	db, _ := openTaskDialectDatabase(t, &model.TaskEvent{})
+	previousDB := model.DB
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	for _, tc := range []struct{ name, body, reason string }{
+		{"stream", "event: result\ndata: {\"text\":\"actual stream\",\"token\":\"stream-canary\",\"number\":9007199254740993}\n\n", ""},
+		{"oversize", strings.Repeat("x", 61*1024), "size_limit_exceeded"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			capture := installTaskEventResponseCapture(c)
+			capture.task = &model.Task{ID: 1}
+			c.Header("Content-Type", "text/event-stream")
+			_, err := c.Writer.WriteString(tc.body)
+			require.NoError(t, err)
+			c.Writer.Flush()
+			assert.True(t, recorder.Flushed)
+			assert.Equal(t, tc.body, recorder.Body.String())
+			capture.record()
+			events, err := model.GetTaskEvents(1)
+			require.NoError(t, err)
+			require.Len(t, events, 1)
+			require.NoError(t, events[0].ProjectDetail(true))
+			assert.NotContains(t, events[0].Payload, "stream-canary")
+			assert.Equal(t, tc.reason, events[0].DetailUnavailable)
+			if tc.reason == "" {
+				assert.Contains(t, events[0].Payload, "actual stream")
+				assert.Contains(t, events[0].Payload, "9007199254740993")
+			}
+		})
+	}
+}
+
+func TestTaskEventDetailSizeAndDiscardPolicy(t *testing.T) {
+	db, _ := openTaskDialectDatabase(t, &model.TaskEvent{})
+	previousDB := model.DB
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	require.NoError(t, model.RecordTaskEvent(1, "request", 1700000000, map[string]any{"model": "summary"}))
+	require.NoError(t, model.RecordTaskEventDetail(1, "request", 1700000001, map[string]any{"prompt": strings.Repeat("界", 30000)}))
+	events, err := model.GetTaskEvents(1)
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+	assert.LessOrEqual(t, len(events[0].Payload), 60*1024)
+	assert.Contains(t, events[0].Payload, "summary")
+	assert.Equal(t, int64(1700000000), events[0].Timestamp)
+	require.NoError(t, events[0].ProjectDetail(true))
+	require.NotNil(t, events[0].DetailComplete)
+	assert.False(t, *events[0].DetailComplete)
+	assert.Equal(t, "size_limit_exceeded", events[0].DetailUnavailable)
+	task := &model.Task{TaskID: "discarded", Status: model.TaskStatusSuccess, Data: []byte(`{"image":"discard-canary"}`), PrivateData: model.TaskPrivateData{ResultDiscarded: true}}
+	require.NoError(t, model.RecordTaskEvent(2, "result", 1700000000, model.TaskResultEventPayload(task)))
+	events, err = model.GetTaskEvents(2)
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+	assert.NotContains(t, events[0].Payload, "discard-canary")
+	require.NoError(t, events[0].ProjectDetail(true))
+	assert.False(t, *events[0].DetailComplete)
+	assert.Equal(t, "result_discarded", events[0].DetailUnavailable)
 }
 
 func TestBulkTaskFailureRecordsResultEvent(t *testing.T) {
@@ -390,12 +630,13 @@ func TestBulkTaskFailureRecordsResultEvent(t *testing.T) {
 	t.Cleanup(func() { model.DB = previousDB })
 	task := &model.Task{TaskID: "public-id", UserId: 7, Status: model.TaskStatusSubmitted}
 	require.NoError(t, db.Create(task).Error)
-	require.NoError(t, model.TaskBulkUpdateByID([]int64{task.ID}, map[string]any{"status": "FAILURE", "progress": "100%"}))
+	require.NoError(t, model.TaskBulkUpdateByID([]int64{task.ID}, map[string]any{"status": "FAILURE", "progress": "100%", "fail_reason": "final bulk reason"}))
 	events, err := model.GetTaskEvents(task.ID)
 	require.NoError(t, err)
 	require.Len(t, events, 1)
 	assert.Equal(t, "result", events[0].Kind)
 	assert.Contains(t, events[0].Payload, `"status":"FAILURE"`)
+	assert.Contains(t, events[0].Payload, "final bulk reason")
 }
 
 func TestTerminalTaskTransitionRecordsResultOnce(t *testing.T) {
@@ -739,6 +980,74 @@ func TestTaskLogVideoInfoUsesOnlyActualSuccessfulUsage(t *testing.T) {
 				assert.Equal(t, float64(0), *task.PrivateData.VideoInfo.DurationSeconds)
 				assert.False(t, *task.PrivateData.VideoInfo.HasReferenceVideo)
 				assert.Equal(t, 9999, *task.PrivateData.VideoInfo.ConsumedTokens)
+			}
+		})
+	}
+}
+
+func TestTaskLogModelAndStatusFilters(t *testing.T) {
+	db, dialect := openTaskDialectDatabase(t, &model.Task{}, &model.User{})
+	oldDB := model.DB
+	oldMain, oldLog := common.MainDatabaseType(), common.LogDatabaseType()
+	oldRedis, oldMemory := common.RedisEnabled, common.MemoryCacheEnabled
+	model.DB = db
+	common.SetDatabaseTypes(dialect, dialect)
+	common.RedisEnabled, common.MemoryCacheEnabled = false, false
+	t.Cleanup(func() {
+		model.DB = oldDB
+		common.SetDatabaseTypes(oldMain, oldLog)
+		common.RedisEnabled, common.MemoryCacheEnabled = oldRedis, oldMemory
+	})
+	for _, user := range []model.User{{Id: 7, Username: "filter-owner", AffCode: "filter7"}, {Id: 8, Username: "filter-other", AffCode: "filter8"}} {
+		require.NoError(t, db.Create(&user).Error)
+	}
+	for _, task := range []model.Task{
+		{TaskID: "match", UserId: 7, Status: model.TaskStatusSuccess, SubmitTime: 100, Properties: model.Properties{OriginModelName: "client-model", UpstreamModelName: "private-model"}},
+		{TaskID: "pending", UserId: 7, Status: model.TaskStatusQueued, SubmitTime: 100, Properties: model.Properties{OriginModelName: "client-model"}},
+		{TaskID: "prefix", UserId: 7, Status: model.TaskStatusSuccess, SubmitTime: 100, Properties: model.Properties{OriginModelName: "client-model-extra"}},
+		{TaskID: "mapped", UserId: 7, Status: model.TaskStatusSuccess, SubmitTime: 100, Properties: model.Properties{OriginModelName: "other", UpstreamModelName: "client-model"}},
+		{TaskID: "foreign", UserId: 8, Status: model.TaskStatusSuccess, SubmitTime: 100, Properties: model.Properties{OriginModelName: "client-model"}},
+		{TaskID: "legacy", UserId: 7, Status: model.TaskStatusSuccess, SubmitTime: 100},
+	} {
+		require.NoError(t, db.Create(&task).Error)
+	}
+	for _, tc := range []struct {
+		name, query string
+		handler     gin.HandlerFunc
+		want        int
+	}{
+		{"self combined", "model_name=client-model&status=SUCCESS", GetUserTask, 1},
+		{"admin combined", "model_name=client-model&status=SUCCESS", GetAllTask, 2},
+		{"self model", "model_name=client-model", GetUserTask, 2},
+		{"admin model", "model_name=client-model", GetAllTask, 3},
+		{"self upstream is not searchable", "model_name=private-model", GetUserTask, 0},
+		{"admin exact model", "model_name=client", GetAllTask, 0},
+		{"self task and model", "model_name=client-model&task_id=prefix", GetUserTask, 0},
+		{"self time and model", "model_name=client-model&start_timestamp=101", GetUserTask, 0},
+		{"self reset", "", GetUserTask, 5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, "/api/task/?page_size=1&"+tc.query, nil)
+			c.Set("id", 7)
+			c.Set("role", common.RoleAdminUser)
+			tc.handler(c)
+			var response struct {
+				Success bool
+				Data    struct {
+					Total int
+					Items []dto.TaskDto
+				}
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			require.True(t, response.Success)
+			assert.Equal(t, tc.want, response.Data.Total)
+			assert.Len(t, response.Data.Items, min(tc.want, 1))
+			if tc.name == "self combined" {
+				require.Len(t, response.Data.Items, 1)
+				assert.Equal(t, "match", response.Data.Items[0].TaskID)
+				assert.NotContains(t, recorder.Body.String(), "private-model")
 			}
 		})
 	}

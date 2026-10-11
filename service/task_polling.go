@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -543,6 +544,12 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	}
 
 	task.Data = redactVideoResponseBody(responseBody)
+	// The existing sanitizer re-encodes numbers and omits inline video bytes.
+	// Mark only observations it actually changed; keep polling/artifact data unchanged.
+	task.EventDetailUnavailable = ""
+	if !bytes.Equal(task.Data, responseBody) {
+		task.EventDetailUnavailable = "video_snapshot_sanitized"
+	}
 	if len(taskResult.PluginState) > 0 {
 		task.PrivateData.PluginState = taskResult.PluginState
 	}

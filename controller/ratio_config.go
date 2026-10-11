@@ -3,6 +3,7 @@ package controller
 import (
 	"net/http"
 
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 
@@ -10,6 +11,12 @@ import (
 )
 
 func GetRatioConfig(c *gin.Context) {
+	// This endpoint is mounted publicly. Authenticate credentials here rather
+	// than trusting a role context that its route never populates.
+	middleware.AdminAuth()(c)
+	if c.IsAborted() {
+		return
+	}
 	if !ratio_setting.IsExposeRatioEnabled() {
 		c.JSON(http.StatusForbidden, gin.H{
 			"success": false,

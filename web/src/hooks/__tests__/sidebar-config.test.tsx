@@ -45,7 +45,12 @@ afterEach(() => {
   useAuthStore.getState().auth.reset()
 })
 
-function sidebarFor(admin?: object, user?: object, canConfigure = true) {
+function sidebarFor(
+  admin?: object,
+  user?: object,
+  canConfigure = true,
+  role = 10
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
@@ -55,7 +60,7 @@ function sidebarFor(admin?: object, user?: object, canConfigure = true) {
   useAuthStore.getState().auth.setUser({
     id: 1,
     username: 'alice',
-    role: 1,
+    role,
     permissions: { sidebar_settings: canConfigure },
     sidebar_modules: user ? JSON.stringify(user) : '',
   })
@@ -74,6 +79,15 @@ function sidebarFor(admin?: object, user?: object, canConfigure = true) {
 }
 
 describe('security sidebar visibility', () => {
+  it('hides security navigation for ordinary users even when configuration enables it', () => {
+    const { result } = sidebarFor(undefined, undefined, true, 1)
+    expect(
+      result.current
+        .flatMap((group) => group.items)
+        .some((item) => 'url' in item && item.url === '/security')
+    ).toBe(false)
+  })
+
   it('old configurations show Security & Access immediately after Profile and keep API Keys', () => {
     const { result } = sidebarFor(
       { personal: { enabled: true, personal: true, topup: true } },

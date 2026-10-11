@@ -21,6 +21,7 @@ import { HugeiconsIcon } from '@hugeicons/react'
 import { useQuery } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 
+import { CodeBlock } from '@/components/ai-elements/code-block'
 import { CopyButton } from '@/components/copy-button'
 import { Dialog } from '@/components/dialog'
 import { StatusBadge } from '@/components/status-badge'
@@ -82,8 +83,45 @@ function formatTaskTimestamp(value?: number): string {
   return value ? formatTimestampToDate(value, 'seconds') : '-'
 }
 
-function TaskTimeline(props: { events: TaskEvent[] }) {
+function formatTaskEventPayload(payload: string): string {
+  try {
+    JSON.parse(payload)
+  } catch {
+    return payload
+  }
+
+  const tokens =
+    payload.match(/"(?:\\.|[^"\\])*"|[^\s{}[\],:]+|[{}[\],:]/g) ?? []
+  let formatted = ''
+  let depth = 0
+  for (const [index, token] of tokens.entries()) {
+    const previous = tokens[index - 1]
+    if (token === '{' || token === '[') {
+      formatted += token
+      depth += 1
+      if (tokens[index + 1] !== '}' && tokens[index + 1] !== ']') {
+        formatted += `\n${'  '.repeat(depth)}`
+      }
+    } else if (token === '}' || token === ']') {
+      depth -= 1
+      if (previous !== '{' && previous !== '[') {
+        formatted += `\n${'  '.repeat(depth)}`
+      }
+      formatted += token
+    } else if (token === ',') {
+      formatted += `,\n${'  '.repeat(depth)}`
+    } else if (token === ':') {
+      formatted += ': '
+    } else {
+      formatted += token
+    }
+  }
+  return formatted
+}
+
+export function TaskTimeline(props: { events: TaskEvent[] }) {
   const { t } = useTranslation()
+  const visibleEvents = props.events.filter((event) => event.kind !== 'result')
   const labels = {
     request: t('User Request'),
     accepted: t('Submission Accepted'),
@@ -95,19 +133,13 @@ function TaskTimeline(props: { events: TaskEvent[] }) {
       aria-label={t('Full Chain Events')}
     >
       <h3 className='text-sm font-semibold'>{t('Full Chain Events')}</h3>
-      {props.events.length === 0 ? (
+      {visibleEvents.length === 0 ? (
         <p className='text-muted-foreground text-sm'>
           {t('No events recorded')}
         </p>
       ) : (
-        <ol className='space-y-0'>
-          {props.events.map((event) => {
-            let fields: Record<string, unknown> = {}
-            try {
-              fields = JSON.parse(event.payload) as Record<string, unknown>
-            } catch {
-              fields = {}
-            }
+        <ol className='space-y-0 pl-1'>
+          {visibleEvents.map((event) => {
             return (
               <li
                 key={event.kind}
@@ -126,25 +158,31 @@ function TaskTimeline(props: { events: TaskEvent[] }) {
                     {formatTaskTimestamp(event.timestamp)}
                   </time>
                 </div>
-                <div className='bg-muted/30 relative max-h-56 overflow-auto rounded-md border p-3'>
+                {event.detail_complete === false ? (
+                  <p className='text-muted-foreground mb-2 text-xs'>
+                    {t('Not recorded')}
+                    {event.detail_unavailable ? (
+                      <span className='ml-2 font-mono'>
+                        ({event.detail_unavailable})
+                      </span>
+                    ) : null}
+                  </p>
+                ) : null}
+                <CodeBlock
+                  code={formatTaskEventPayload(event.payload)}
+                  language='json'
+                  title={labels[event.kind]}
+                  enableCollapse={false}
+                  maxExpandedLines={14}
+                  showToolbar
+                  showLineNumbers
+                >
                   <CopyButton
                     value={event.payload}
-                    className='absolute top-1 right-1 size-7'
+                    className='size-8'
                     iconClassName='size-3.5'
                   />
-                  <div className='space-y-1 pr-7 font-mono text-xs break-all whitespace-pre-wrap'>
-                    {Object.entries(fields).map(([key, value]) => (
-                      <div key={key}>
-                        <span className='text-muted-foreground'>{key}: </span>
-                        <span>
-                          {typeof value === 'object'
-                            ? JSON.stringify(value, null, 2)
-                            : String(value)}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
+                </CodeBlock>
               </li>
             )
           })}
@@ -302,6 +340,33 @@ export function TaskDetailsDialog(props: TaskDetailsDialogProps) {
           <p role='alert' className='text-destructive text-xs'>
             {t('Failed to load logs')}
           </p>
+        ) : null}
+        {props.log.data != null ? (
+          <DetailSection label={t('Task Result')}>
+            <CodeBlock
+              code={formatTaskEventPayload(
+                typeof props.log.data === 'string'
+                  ? props.log.data
+                  : JSON.stringify(props.log.data)
+              )}
+              language='json'
+              title={t('Task Result')}
+              enableCollapse={false}
+              maxExpandedLines={14}
+              showToolbar
+              showLineNumbers
+            >
+              <CopyButton
+                value={
+                  typeof props.log.data === 'string'
+                    ? props.log.data
+                    : JSON.stringify(props.log.data)
+                }
+                className='size-8'
+                iconClassName='size-3.5'
+              />
+            </CodeBlock>
+          </DetailSection>
         ) : null}
         <DetailSection label={t('Additional Information')}>
           {props.isAdmin ? (

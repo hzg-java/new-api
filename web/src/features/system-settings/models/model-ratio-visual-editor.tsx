@@ -76,6 +76,8 @@ import {
 } from './model-ratio-table-columns'
 
 type ModelRatioVisualEditorProps = {
+  savedModelPricingMultiplier?: string
+  modelPricingMultiplier?: string
   savedModelPrice: string
   savedModelRatio: string
   savedCacheRatio: string
@@ -117,6 +119,8 @@ const ModelRatioVisualEditorComponent = forwardRef<
   ModelRatioVisualEditorProps
 >(function ModelRatioVisualEditor(
   {
+    savedModelPricingMultiplier = '{}',
+    modelPricingMultiplier = '{}',
     savedModelPrice,
     savedModelRatio,
     savedCacheRatio,
@@ -222,6 +226,7 @@ const ModelRatioVisualEditorComponent = forwardRef<
 
   const models = useMemo(() => {
     const savedRows = buildModelSnapshots({
+      modelPricingMultiplier: savedModelPricingMultiplier,
       modelPrice: savedModelPrice,
       modelRatio: savedModelRatio,
       cacheRatio: savedCacheRatio,
@@ -235,6 +240,7 @@ const ModelRatioVisualEditorComponent = forwardRef<
       pluginBillingExpr: savedPluginBillingExpr,
     })
     const draftRows = buildModelSnapshots({
+      modelPricingMultiplier,
       modelPrice,
       modelRatio,
       cacheRatio,
@@ -279,6 +285,8 @@ const ModelRatioVisualEditorComponent = forwardRef<
   }, [
     candidateModelNames,
     filterMode,
+    savedModelPricingMultiplier,
+    modelPricingMultiplier,
     savedModelPrice,
     savedModelRatio,
     savedCacheRatio,
@@ -339,6 +347,7 @@ const ModelRatioVisualEditorComponent = forwardRef<
       }
       setEditData({
         name: editableModel.name,
+        pricingMultiplier: editableModel.pricingMultiplier,
         price: editableModel.price,
         ratio: editableModel.ratio,
         cacheRatio: editableModel.cacheRatio,
@@ -381,6 +390,12 @@ const ModelRatioVisualEditorComponent = forwardRef<
 
   const handleDelete = useCallback(
     (name: string) => {
+      const multiplierMap = safeJsonParse<Record<string, number>>(
+        modelPricingMultiplier,
+        { fallback: {}, silent: true }
+      )
+      delete multiplierMap[name]
+      onChange('ModelPricingMultiplier', JSON.stringify(multiplierMap))
       const priceMap = safeJsonParse<Record<string, number>>(modelPrice, {
         fallback: {},
         silent: true,
@@ -473,6 +488,7 @@ const ModelRatioVisualEditorComponent = forwardRef<
       }
     },
     [
+      modelPricingMultiplier,
       modelPrice,
       modelRatio,
       cacheRatio,
@@ -537,6 +553,7 @@ const ModelRatioVisualEditorComponent = forwardRef<
   const persistPricingData = useCallback(
     (data: ModelRatioData, targetNames: string[] = [data.name]) => {
       const options = pricingOptions({
+        ModelPricingMultiplier: modelPricingMultiplier,
         ModelPrice: modelPrice,
         ModelRatio: modelRatio,
         CompletionRatio: completionRatio,
@@ -553,6 +570,7 @@ const ModelRatioVisualEditorComponent = forwardRef<
       for (const [key, value] of Object.entries(updated)) onChange(key, value)
     },
     [
+      modelPricingMultiplier,
       modelPrice,
       modelRatio,
       completionRatio,

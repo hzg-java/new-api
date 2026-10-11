@@ -1041,6 +1041,7 @@ function LlmPromptHelper({ modelName }: LlmPromptHelperProps) {
 
 export type TieredPricingEditorProps = {
   currency?: PricingCurrency
+  previewCurrency?: PricingCurrency
   modelName?: string
   billingExpr: string
   requestRuleExpr: string
@@ -1058,6 +1059,7 @@ function parseTierEditorDocument(source: string): VisualBillingDocument | null {
 
 export const TieredPricingEditor = memo(function TieredPricingEditor({
   currency = USD_PRICING_CURRENCY,
+  previewCurrency,
   modelName,
   billingExpr: currentExpr,
   requestRuleExpr: currentRequestRuleExpr,
@@ -1310,7 +1312,7 @@ export const TieredPricingEditor = memo(function TieredPricingEditor({
             ? rawExpr
             : combineBillingExpr(effectiveExpr, ruleExpr)
         }
-        currency={currency}
+        currency={previewCurrency ?? currency}
       />
     </div>
   )

@@ -35,6 +35,16 @@ import { formatPricingNumber } from './pricing-format'
 export const createModelPricingSchema = (t: (key: string) => string) =>
   z.object({
     name: z.string().min(1, t('Model name is required')),
+    pricingMultiplier: z
+      .string()
+      .refine(
+        (value) =>
+          value.trim() !== '' &&
+          Number.isFinite(Number(value)) &&
+          Number(value) > 0,
+        t('Enter a finite, positive pricing multiplier')
+      )
+      .optional(),
     price: z.string().optional(),
     ratio: z.string().optional(),
     cacheRatio: z.string().optional(),
@@ -62,6 +72,7 @@ export type LaneKey =
 export type ModelRatioData = {
   pluginBillingExpr?: Record<string, string>
   name: string
+  pricingMultiplier?: string
   price?: string
   ratio?: string
   cacheRatio?: string
@@ -230,8 +241,15 @@ export function buildPreviewRows(
   cacheWriteMode?: CacheWriteMode,
   billingDetails?: LegacyBillingDetails
 ): PreviewRow[] {
+  const multiplier = Number(values.pricingMultiplier ?? 1)
+  const previewCurrency = {
+    ...currency,
+    exchangeRate: currency.exchangeRate * multiplier,
+  }
   if (mode === 'tiered_expr') {
-    const effectiveExpr = combineBillingExpr(billingExpr, requestRuleExpr)
+    const baseExpr = combineBillingExpr(billingExpr, requestRuleExpr)
+    const effectiveExpr =
+      multiplier === 1 ? baseExpr : `(${baseExpr}) * ${multiplier}`
     return [
       { key: 'mode', label: t('Pricing'), value: t('Expression') },
       {
@@ -252,7 +270,7 @@ export function buildPreviewRows(
           : t('Fixed price'),
         ...(billingDetails?.image_count ? { unit: 'image' as const } : {}),
         value: values.price
-          ? formatPricingAmount(values.price, currency)
+          ? formatPricingAmount(values.price, previewCurrency)
           : t('Empty'),
       },
       ...pricingAdjustmentRows(billingDetails, t),
@@ -261,22 +279,22 @@ export function buildPreviewRows(
 
   let audioInputValue =
     laneEnabled.audioInput && lanePrices.audioInput
-      ? formatPricingAmount(lanePrices.audioInput, currency)
+      ? formatPricingAmount(lanePrices.audioInput, previewCurrency)
       : t('Empty')
   let audioOutputValue =
     laneEnabled.audioOutput && lanePrices.audioOutput
-      ? formatPricingAmount(lanePrices.audioOutput, currency)
+      ? formatPricingAmount(lanePrices.audioOutput, previewCurrency)
       : t('Empty')
   if (billingDetails?.audio_input_price !== undefined) {
     audioInputValue = formatPricingAmount(
       billingDetails.audio_input_price,
-      currency
+      previewCurrency
     )
   }
   if (billingDetails?.audio_output_price !== undefined) {
     audioOutputValue = formatPricingAmount(
       billingDetails.audio_output_price,
-      currency
+      previewCurrency
     )
   }
   const rows: PreviewRow[] = [
@@ -284,7 +302,7 @@ export function buildPreviewRows(
       key: 'inputPrice',
       label: t('Input price'),
       value: promptPrice
-        ? formatPricingAmount(promptPrice, currency)
+        ? formatPricingAmount(promptPrice, previewCurrency)
         : t('Empty'),
     },
     {
@@ -292,7 +310,7 @@ export function buildPreviewRows(
       label: t('Completion price'),
       value:
         laneEnabled.completion && lanePrices.completion
-          ? formatPricingAmount(lanePrices.completion, currency)
+          ? formatPricingAmount(lanePrices.completion, previewCurrency)
           : t('Empty'),
     },
     {
@@ -300,7 +318,7 @@ export function buildPreviewRows(
       label: t('Cache read price'),
       value:
         laneEnabled.cache && lanePrices.cache
-          ? formatPricingAmount(lanePrices.cache, currency)
+          ? formatPricingAmount(lanePrices.cache, previewCurrency)
           : t('Empty'),
     },
     {
@@ -311,7 +329,7 @@ export function buildPreviewRows(
           : t('Cache write price'),
       value:
         laneEnabled.createCache && lanePrices.createCache
-          ? formatPricingAmount(lanePrices.createCache, currency)
+          ? formatPricingAmount(lanePrices.createCache, previewCurrency)
           : t('Empty'),
     },
     {
@@ -319,7 +337,7 @@ export function buildPreviewRows(
       label: t('Image input price'),
       value:
         laneEnabled.image && lanePrices.image
-          ? formatPricingAmount(lanePrices.image, currency)
+          ? formatPricingAmount(lanePrices.image, previewCurrency)
           : t('Empty'),
     },
     {
@@ -343,7 +361,7 @@ export function buildPreviewRows(
       label: t('Cache create (1h) price'),
       value: formatPricingAmount(
         Number(lanePrices.createCache) * (6 / 3.75),
-        currency
+        previewCurrency
       ),
     })
   }

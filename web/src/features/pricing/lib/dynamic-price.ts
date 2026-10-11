@@ -159,6 +159,13 @@ export function isTaskUsagePricingModel(model: PricingModel): boolean {
 }
 
 export function isUnconfiguredTaskUsageModel(model: PricingModel): boolean {
+  if (
+    model.group_prices &&
+    !model.billing_expr &&
+    !model.billing_plugin_variants?.length
+  ) {
+    return true
+  }
   if (model.billing_plugin_variants?.length) {
     return model.billing_plugin_variants.every((variant) =>
       variant.billing_mode === 'ratio'

@@ -276,6 +276,7 @@ function PricingFormFixture(props: {
   onSave: () => Promise<void>
 }) {
   const values = {
+    ModelPricingMultiplier: '{"example-model":2}',
     ModelPrice: props.variant === 'default' ? '{"example-model":0.1}' : '{}',
     ModelRatio: '{}',
     CacheRatio: '{}',
@@ -376,6 +377,12 @@ it.each(['default', 'unset'] as const)(
       ).not.toBeInTheDocument()
     }
     await user.click(await screen.findByRole('button', { name: 'Edit' }))
+    const multiplier = screen.getByRole('textbox', {
+      name: 'Pricing multiplier',
+    })
+    expect(multiplier).toHaveValue('2')
+    await user.clear(multiplier)
+    await user.type(multiplier, '3')
     await user.click(
       screen.getByRole('tab', { name: 'Per-request (deprecated)' })
     )
@@ -389,7 +396,16 @@ it.each(['default', 'unset'] as const)(
     await user.click(button)
     await waitFor(() => expect(save).toHaveBeenCalledOnce())
     expect(save).toHaveBeenCalledWith(
-      expect.objectContaining({ ExposeRatioEnabled: variant === 'default' }),
+      expect.objectContaining({
+        ExposeRatioEnabled: variant === 'default',
+        ModelPricingMultiplier: expect.any(String),
+      }),
+      undefined
+    )
+    expect(save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ModelPricingMultiplier: '{"example-model":3}',
+      }),
       undefined
     )
   }

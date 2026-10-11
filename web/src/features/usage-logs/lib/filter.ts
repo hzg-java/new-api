@@ -54,10 +54,6 @@ export function buildSearchParams(
         ...(commonFilters.token && { token: commonFilters.token }),
         ...(commonFilters.group && { group: commonFilters.group }),
         ...(commonFilters.username && { username: commonFilters.username }),
-        ...(commonFilters.requestId && { requestId: commonFilters.requestId }),
-        ...(commonFilters.upstreamRequestId && {
-          upstreamRequestId: commonFilters.upstreamRequestId,
-        }),
       }
     }
     case 'drawing': {
@@ -72,6 +68,8 @@ export function buildSearchParams(
       return {
         ...baseParams,
         ...(taskFilters.taskId && { filter: taskFilters.taskId }),
+        ...(taskFilters.model && { model: taskFilters.model }),
+        ...(taskFilters.status && { status: taskFilters.status }),
       }
     }
     default:

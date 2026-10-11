@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -30,9 +31,104 @@ import (
 	"gorm.io/gorm"
 )
 
+func TestUserModelPricingDatabaseMatrix(t *testing.T) {
+	for _, dialect := range []struct{ kind, env string }{{"sqlite", ""}, {"mysql", "TEST_MYSQL_DSN"}, {"postgres", "TEST_POSTGRES_DSN"}} {
+		t.Run(dialect.kind, func(t *testing.T) {
+			if dialect.env != "" && os.Getenv(dialect.env) == "" {
+				t.Skip("set " + dialect.env)
+			}
+			db := modelManagementDB(t, dialect.kind, os.Getenv(dialect.env))
+			previous := ratio_setting.UserModelPricingMultiplier2JSONString()
+			t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateUserModelPricingMultiplierByJSONString(previous)) })
+			require.NoError(t, ratio_setting.UpdateUserModelPricingMultiplierByJSONString("{}"))
+			users := []model.User{{Username: "pricing-one", AffCode: "priceone", Setting: `{"language":"en"}`}, {Username: "pricing-two", AffCode: "pricetwo"}}
+			require.NoError(t, db.Create(&users).Error)
+			request := func(role int, id string, method, body string) *httptest.ResponseRecorder {
+				r := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(r)
+				c.Set("role", role)
+				c.Params = gin.Params{{Key: "id", Value: id}}
+				c.Request = httptest.NewRequest(method, "/api/user/"+id+"/model-pricing", strings.NewReader(body))
+				if method == http.MethodGet {
+					GetUserModelPricing(c)
+				} else {
+					PutUserModelPricing(c)
+				}
+				return r
+			}
+			id := strconv.Itoa(users[0].Id)
+			for _, role := range []int{0, common.RoleCommonUser, common.RoleAdminUser} {
+				for _, method := range []string{http.MethodGet, http.MethodPut} {
+					assert.Equal(t, http.StatusForbidden, request(role, id, method, `{"multipliers":{"client":2}}`).Code)
+				}
+			}
+			for _, invalidID := range []string{"0", "-1", "abc", "999999"} {
+				for _, method := range []string{http.MethodGet, http.MethodPut} {
+					assert.NotEqual(t, http.StatusOK, request(common.RoleRootUser, invalidID, method, `{"multipliers":{}}`).Code)
+				}
+			}
+			assert.JSONEq(t, `{"success":true,"message":"","data":{"multipliers":{}}}`, request(common.RoleRootUser, id, http.MethodGet, "").Body.String())
+			assert.Equal(t, http.StatusOK, request(common.RoleRootUser, id, http.MethodPut, `{"multipliers":{"client":0.5,"client::variant":2}}`).Code)
+			require.NoError(t, model.ReplaceUserModelPricing(users[1].Id, map[string]float64{"client": 3}))
+			assert.Equal(t, 0.5, ratio_setting.GetUserModelPricingMultiplier(users[0].Id, "client"))
+			assert.Equal(t, 2.0, ratio_setting.GetUserModelPricingMultiplier(users[0].Id, "client::variant"))
+			assert.Equal(t, 1.0, ratio_setting.GetUserModelPricingMultiplier(users[0].Id, "CLIENT"))
+			for _, body := range []string{`{}`, `{"multipliers":null}`, `{"multipliers":{"":2}}`, `{"multipliers":{"client":0}}`, `{"multipliers":{"client":-1}}`, `{"multipliers":{"client":1e999}}`, `{"multipliers":{"client":null}}`} {
+				assert.Equal(t, http.StatusBadRequest, request(common.RoleRootUser, id, http.MethodPut, body).Code, body)
+			}
+			require.NoError(t, db.Callback().Update().Before("gorm:update").Register("fail_user_pricing", func(tx *gorm.DB) {
+				if tx.Statement.Table == "options" {
+					tx.AddError(errors.New("injected write failure"))
+				}
+			}))
+			require.Error(t, model.ReplaceUserModelPricing(users[0].Id, map[string]float64{"client": 9}))
+			require.NoError(t, db.Callback().Update().Remove("fail_user_pricing"))
+			assert.Equal(t, 0.5, ratio_setting.GetUserModelPricingMultiplier(users[0].Id, "client"))
+			retained, err := model.GetUserModelPricing(users[0].Id)
+			require.NoError(t, err)
+			assert.Equal(t, map[string]float64{"client": 0.5, "client::variant": 2}, retained)
+			for _, invalid := range []float64{0, -1, math.NaN(), math.Inf(1), math.Inf(-1)} {
+				assert.Error(t, model.ReplaceUserModelPricing(users[0].Id, map[string]float64{"client": invalid}))
+			}
+			for _, invalid := range []string{`null`, `{"1::client":0}`, `{"01::client":2}`, `{"0::client":2}`, `{"1::":2}`, `{"1::client":null}`} {
+				assert.Error(t, ratio_setting.UpdateUserModelPricingMultiplierByJSONString(invalid))
+				assert.Equal(t, 0.5, ratio_setting.GetUserModelPricingMultiplier(users[0].Id, "client"))
+			}
+			var wg sync.WaitGroup
+			results := make(chan error, 2)
+			for i := range users {
+				wg.Go(func() {
+					results <- model.ReplaceUserModelPricing(users[i].Id, map[string]float64{"client": float64(i + 4)})
+				})
+			}
+			wg.Wait()
+			close(results)
+			for err := range results {
+				require.NoError(t, err)
+			}
+			require.NoError(t, ratio_setting.UpdateUserModelPricingMultiplierByJSONString("{}"))
+			model.InitOptionMap()
+			assert.Equal(t, 4.0, ratio_setting.GetUserModelPricingMultiplier(users[0].Id, "client"))
+			assert.Equal(t, 5.0, ratio_setting.GetUserModelPricingMultiplier(users[1].Id, "client"))
+			assert.Equal(t, http.StatusOK, request(common.RoleRootUser, id, http.MethodPut, `{"multipliers":{}}`).Code)
+			assert.Equal(t, 1.0, ratio_setting.GetUserModelPricingMultiplier(users[0].Id, "client"))
+			var stored model.Option
+			require.NoError(t, db.Where("key = ?", "UserModelPricingMultiplier").First(&stored).Error)
+			assert.JSONEq(t, fmt.Sprintf(`{"%d::client":5}`, users[1].Id), stored.Value)
+			var user model.User
+			require.NoError(t, db.First(&user, users[0].Id).Error)
+			assert.Equal(t, users[0].Setting, user.Setting)
+		})
+	}
+}
+
 func modelManagementDB(t *testing.T, kind, dsn string) *gorm.DB {
 	t.Helper()
 	database, isolatedDSN := newAuditTestDatabase(t, kind, dsn)
+	// InitDB opens its own pool; close the setup pool before replacing it.
+	setupConnection, err := database.DB()
+	require.NoError(t, err)
+	require.NoError(t, setupConnection.Close())
 	previousDB, previousLogDB := model.DB, model.LOG_DB
 	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
 	previousMaster, previousSQLite := common.IsMasterNode, common.SQLitePath
@@ -766,6 +862,45 @@ export function parseTaskResult() { return {}; }
 				require.NoError(t, db.Callback().Query().Remove("fail_listing_channels"))
 				assert.False(t, failed.Success, "a channel lookup failure must not look like an empty configuration")
 
+			})
+
+			t.Run("hidden_multiplier_keeps_admin_prices_raw_and_public_prices_effective", func(t *testing.T) {
+				const name = "matrix-hidden-price"
+				before, err := model.GetModelPricingSnapshot([]string{name})
+				require.NoError(t, err)
+				assert.Equal(t, float64(1), before.Entries[0].Effective["ModelPricingMultiplier"])
+				draft := model.PricingValues{"ModelPrice": float64(0.04), "ModelPricingMultiplier": float64(1.5)}
+				require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{{ModelName: name, ExpectedVersion: before.EmptyVersion, Pricing: draft}}))
+				loaded, err := model.GetModelPricingSnapshot([]string{name})
+				require.NoError(t, err)
+				assert.Equal(t, draft, loaded.Entries[0].Configured)
+				assert.Equal(t, 0.04, loaded.Entries[0].Effective["ModelPrice"])
+				assert.Equal(t, 1.5, ratio_setting.GetModelPricingMultiplier(name))
+				public := billing_setting.GetPricingSyncData(map[string]any(ratio_setting.GetExposedData()))
+				assert.Equal(t, 0.06, public["model_price"].(map[string]float64)[name])
+				assert.NotContains(t, public, "ModelPricingMultiplier")
+				assert.Equal(t, 0.04, getLocalPricingSyncData()["model_price"].(map[string]float64)[name])
+				channel := model.Channel{Name: name, Type: 1, Key: "fixture", Models: name, Group: "default", Status: common.ChannelStatusEnabled}
+				require.NoError(t, channel.Insert())
+				t.Cleanup(func() {
+					require.NoError(t, db.Where("channel_id = ?", channel.Id).Delete(&model.Ability{}).Error)
+					require.NoError(t, db.Where("id = ?", channel.Id).Delete(&model.Channel{}).Error)
+					model.RefreshPricing()
+				})
+				model.RefreshPricing()
+				found := false
+				for _, price := range model.GetPricing() {
+					if price.ModelName == name {
+						assert.Equal(t, 0.06, price.ModelPrice)
+						found = true
+					}
+				}
+				assert.True(t, found)
+				for _, invalid := range []float64{0, -1, math.NaN(), math.Inf(1)} {
+					assert.Error(t, model.ValidateModelPricing(name, model.PricingValues{"ModelPricingMultiplier": invalid}))
+				}
+				require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{{ModelName: name, ExpectedVersion: loaded.Entries[0].Version, Reset: true}}))
+				assert.Equal(t, float64(1), ratio_setting.GetModelPricingMultiplier(name))
 			})
 
 			t.Run("pricing_saves_zero_switches_modes_and_rejects_stale_batches", func(t *testing.T) {

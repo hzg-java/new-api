@@ -20,6 +20,7 @@ import { useMemo } from 'react'
 
 import type { NavGroup, NavItem } from '@/components/layout/types'
 import { useStatus } from '@/hooks/use-status'
+import { ROLE } from '@/lib/roles'
 import { useAuthStore } from '@/stores/auth-store'
 
 type SidebarSectionConfig = {
@@ -280,13 +281,13 @@ export function useSidebarConfig(navGroups: NavGroup[]): NavGroup[] {
   const { status } = useStatus()
   const { auth } = useAuthStore()
 
-  const adminConfig = useMemo(
-    () =>
-      parseSidebarConfig(
-        status?.SidebarModulesAdmin as string | null | undefined
-      ),
-    [status?.SidebarModulesAdmin]
-  )
+  const adminConfig = useMemo(() => {
+    const config = parseSidebarConfig(
+      status?.SidebarModulesAdmin as string | null | undefined
+    )
+    if ((auth.user?.role ?? 0) >= ROLE.ADMIN) return config
+    return { ...config, personal: { ...config.personal, security: false } }
+  }, [status?.SidebarModulesAdmin, auth.user?.role])
 
   const userConfig = useMemo(() => {
     // If the backend marks the user as unable to configure the sidebar
@@ -331,5 +332,6 @@ export function useIsSidebarModuleVisible(url: string): boolean {
       ? null
       : parseUserSidebarConfig(auth?.user?.sidebar_modules)
 
+  if (url === '/security' && (auth.user?.role ?? 0) < ROLE.ADMIN) return false
   return isModuleEnabled(url, adminConfig, userConfig)
 }

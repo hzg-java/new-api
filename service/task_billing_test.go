@@ -12,10 +12,13 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
@@ -1740,6 +1743,79 @@ func TestSettle_TieredSnapshotWriteBackUsesSettledFactsAndMatchedTier(t *testing
 	assert.NotContains(t, other, "seconds")
 }
 
+func TestLegacyTextSettlementUsesEffectivePricesAndUnscaledUsage(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	for _, tc := range []struct {
+		name      string
+		model     string
+		price     types.PriceData
+		usage     dto.Usage
+		wantQuota int
+		wantCache int
+	}{
+		{
+			name: "fixed price", model: "test-model",
+			price: types.PriceData{UsePrice: true, ModelPrice: 0.03, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 2}},
+			usage: dto.Usage{PromptTokens: 100}, wantQuota: 30000,
+		},
+		{
+			name: "token price", model: "test-model",
+			price: types.PriceData{ModelRatio: 1.5, CompletionRatio: 2, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 2}},
+			usage: dto.Usage{PromptTokens: 100, CompletionTokens: 20}, wantQuota: 420,
+		},
+		{
+			name: "Gemini hardcoded audio price is frozen and scaled independently", model: "gemini-2.5-flash",
+			price: types.PriceData{LegacyPriceResolved: true, GeminiAudioInputPrice: 1.5, ModelRatio: 0.225, CompletionRatio: 1, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 2}},
+			usage: dto.Usage{PromptTokens: 1100, PromptTokensDetails: dto.InputTokenDetails{AudioTokens: 1000}}, wantQuota: 1545,
+		},
+		{
+			name: "OpenRouter inference uses raw price not user price", model: "claude-3-7-sonnet-20250219",
+			price: types.PriceData{LegacyPriceResolved: true, RawModelRatio: 1.5, ModelRatio: 2.25, CompletionRatio: 5, CacheRatio: 0.1, CacheCreationRatio: 1.25, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 2}},
+			// 1000 input (100 cached + 200 created), 100 output at the upstream $3/$15 price.
+			usage: dto.Usage{PromptTokens: 1000, CompletionTokens: 100, Cost: 0.00438, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 100}}, wantQuota: 6570, wantCache: 200,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := &relaycommon.RelayInfo{OriginModelName: tc.model, PriceData: tc.price, StartTime: time.Now()}
+			if tc.wantCache > 0 {
+				info.ChannelMeta = &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeOpenRouter}
+				info.FinalRequestRelayFormat = relaytypes.RelayFormatClaude
+			}
+			summary := calculateTextQuotaSummary(ctx, info, &tc.usage)
+			assert.Equal(t, tc.wantQuota, summary.Quota)
+			assert.Equal(t, tc.wantCache, summary.CacheCreationTokens)
+			assert.Equal(t, tc.usage.CompletionTokens, summary.CompletionTokens)
+			assert.Equal(t, tc.usage.PromptTokensDetails.AudioTokens, summary.AudioTokens)
+		})
+	}
+}
+
+func TestTaskTokenSettlementUsesFrozenEffectivePrice(t *testing.T) {
+	truncate(t)
+	previous := ratio_setting.ModelRatio2JSONString()
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(previous)) })
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"test-model":99}`))
+	seedUser(t, 36, 10000)
+	seedChannel(t, 36)
+	task := makeTask(36, 36, 50, 0, BillingSourceWallet, 0)
+	task.Group = "default"
+	task.PrivateData.BillingContext.ModelRatio = 1.5
+	task.PrivateData.BillingContext.GroupRatio = 2
+	task.PrivateData.BillingContext.OtherRatios = map[string]float64{"duration": 2}
+	require.NoError(t, task.Insert())
+	// Completion reloads the persisted context, not the live user/model/group settings.
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	require.True(t, RecalculateTaskQuotaByTokens(context.Background(), &persisted, 100))
+	assert.Equal(t, 600, persisted.Quota)
+	assert.Equal(t, 9450, getUserQuota(t, 36))
+	assert.Equal(t, 600, getTaskQuota(t, task.ID))
+	log := getLastLog(t)
+	require.NotNil(t, log)
+	assert.NotContains(t, log.Other, "ModelPricingMultiplier")
+	assert.Contains(t, log.Other, `"model_ratio":1.5`)
+}
+
 func TestSettle_TokenRecalcFallsBackToCompletionTokens(t *testing.T) {
 	previousRatios := ratio_setting.ModelRatio2JSONString()
 	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"test-model":1}`))
@@ -1785,6 +1861,7 @@ func TestSettle_TokenRecalcFallsBackToCompletionTokens(t *testing.T) {
 			seedChannel(t, channelID)
 
 			task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
+			task.PrivateData.BillingContext.ModelRatio = 1
 			settled := settleTaskBillingOnComplete(
 				context.Background(),
 				&mockAdaptor{},

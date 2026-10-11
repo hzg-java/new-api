@@ -75,6 +75,65 @@ afterEach(() => {
   localStorage.clear()
 })
 
+it('edits a non-currency multiplier, keeps base prices through mode changes and validates before save', async () => {
+  const editor = renderEditor({ billingMode: 'per-request', price: '2' })
+  const multiplier = screen.getByRole('textbox', { name: 'Pricing multiplier' })
+  expect(multiplier).toHaveValue('1')
+  fireEvent.change(multiplier, { target: { value: '1.5' } })
+  await selectCurrency('Site currency (CNY)')
+  expect(multiplier).toHaveValue('1.5')
+  expect(await commit(editor.ref)).toMatchObject({
+    price: '2',
+    pricingMultiplier: '1.5',
+  })
+  expect(
+    within(screen.getByRole('complementary', { name: 'Preview' })).getByText(
+      '¥21'
+    )
+  ).toBeVisible()
+  await userEvent.click(screen.getByRole('tab', { name: 'Expression' }))
+  expect(await commit(editor.ref)).toMatchObject({ pricingMultiplier: '1.5' })
+  fireEvent.change(multiplier, { target: { value: '0' } })
+  expect(await commit(editor.ref)).toBeNull()
+  expect(multiplier).toHaveAttribute('aria-invalid', 'true')
+})
+
+it('uses base prices from the privileged preview and applies its independent multiplier only once', async () => {
+  vi.spyOn(api, 'post').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        effective: {
+          ModelRatio: 1,
+          CompletionRatio: 2,
+          ModelPricingMultiplier: 3,
+        },
+      },
+    },
+  })
+  renderEditor({ pricingMultiplier: '3' })
+  const preview = screen.getByRole('complementary', { name: 'Preview' })
+  expect(await within(preview).findByText('$6')).toBeVisible()
+  expect(within(preview).getByText('$12')).toBeVisible()
+  expect(screen.getByRole('textbox', { name: 'Input price' })).toHaveValue('2')
+})
+
+it('applies the multiplier to expression estimates without changing saved coefficients', async () => {
+  const editor = renderEditor({
+    billingMode: 'tiered_expr',
+    billingExpr: 'tier("base", p * 2 + c * 4)',
+    pricingMultiplier: '3',
+  })
+  fireEvent.change(screen.getByRole('spinbutton', { name: 'Input tokens' }), {
+    target: { value: '1000000' },
+  })
+  expect(screen.getByText('Estimated cost: $6')).toBeVisible()
+  expect(await commit(editor.ref)).toMatchObject({
+    billingExpr: 'tier("base", p * 2 + c * 4)',
+    pricingMultiplier: '3',
+  })
+})
+
 it('reads preview prices and billing metadata from the common data envelope', async () => {
   const effective = { ModelRatio: 0, CompletionRatio: 2 }
   const billingDetails = { audio_input_price: 1 }

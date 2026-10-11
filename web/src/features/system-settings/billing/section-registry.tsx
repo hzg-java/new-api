@@ -27,6 +27,7 @@ import type { BillingSettings } from '../types'
 import { createSectionRegistry } from '../utils/section-registry'
 
 const getModelDefaults = (settings: BillingSettings) => ({
+  ModelPricingMultiplier: settings.ModelPricingMultiplier,
   ModelPrice: settings.ModelPrice,
   ModelRatio: settings.ModelRatio,
   CacheRatio: settings.CacheRatio,

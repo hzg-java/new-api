@@ -193,12 +193,6 @@ export function buildApiParams(config: {
     ...(isAdmin && searchParams.username
       ? { username: String(searchParams.username) }
       : {}),
-    ...(searchParams.requestId
-      ? { request_id: String(searchParams.requestId) }
-      : {}),
-    ...(searchParams.upstreamRequestId
-      ? { upstream_request_id: String(searchParams.upstreamRequestId) }
-      : {}),
     ...buildTimeRangeParams(searchParams, false),
   }
 
@@ -271,7 +265,11 @@ export async function fetchLogsByCategory(
       ? { mj_id: searchParams.filter as string | undefined }
       : {}),
     ...(logCategory === 'task'
-      ? { task_id: searchParams.filter as string | undefined }
+      ? {
+          task_id: searchParams.filter as string | undefined,
+          model_name: searchParams.model as string | undefined,
+          status: searchParams.status as string | undefined,
+        }
       : {}),
   }
 

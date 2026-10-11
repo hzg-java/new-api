@@ -41,9 +41,12 @@ import zhTW from '@/i18n/locales/zh-TW.json'
 import zh from '@/i18n/locales/zh.json'
 import { api } from '@/lib/api'
 
+import { buildSearchParams } from '../../lib/filter'
+import { buildApiParams, fetchLogsByCategory } from '../../lib/utils'
 import { CommonLogsFilterBar } from '../common-logs-filter-bar'
 import { CompactDateTimeRangePicker } from '../compact-date-time-range-picker'
 import { LogsFilterToolbar } from '../logs-filter-toolbar'
+import { TaskLogsFilterBar } from '../task-logs-filter-bar'
 import { UsageLogsProvider } from '../usage-logs-provider'
 
 const captureDescriptor = Object.getOwnPropertyDescriptor(
@@ -58,7 +61,7 @@ beforeEach(() => {
   vi.spyOn(window, 'scrollTo').mockImplementation(() => {})
 })
 
-function Fixture() {
+function Fixture(props: { task?: boolean }) {
   const table = useReactTable({
     data: [],
     columns: [],
@@ -66,15 +69,19 @@ function Fixture() {
   })
   return (
     <UsageLogsProvider>
-      <CommonLogsFilterBar table={table} />
+      {props.task ? (
+        <TaskLogsFilterBar table={table} logCategory='task' />
+      ) : (
+        <CommonLogsFilterBar table={table} />
+      )}
     </UsageLogsProvider>
   )
 }
-async function renderMobileFilter() {
+async function renderMobileFilter(task = false, mobile = true) {
   const original = window.matchMedia
   vi.spyOn(window, 'matchMedia').mockImplementation((query) => ({
     ...original(query),
-    matches: query === '(max-width: 640px)',
+    matches: mobile && query === '(max-width: 640px)',
   }))
   vi.spyOn(api, 'get').mockImplementation(async (url) => ({
     data: {
@@ -87,14 +94,16 @@ async function renderMobileFilter() {
   const logs = createRoute({
     getParentRoute: () => auth,
     path: '/usage-logs/$section',
-    component: Fixture,
+    component: () => <Fixture task={task} />,
     validateSearch: (search: Record<string, unknown>) => search,
   })
   const router = createRouter({
     routeTree: root.addChildren([auth.addChildren([logs])]),
     history: createMemoryHistory({
       initialEntries: [
-        '/usage-logs/common?page=3&type=%5B%222%22%5D&group=default',
+        task
+          ? '/usage-logs/task?page=3&filter=task-1&model=client-model&status=QUEUED'
+          : '/usage-logs/common?page=3&type=%5B%222%22%5D&group=default&requestId=old&upstreamRequestId=old-upstream',
       ],
     }),
   })
@@ -107,7 +116,7 @@ async function renderMobileFilter() {
       <RouterProvider router={router} />
     </QueryClientProvider>
   )
-  await screen.findByRole('button', { name: 'Filter' })
+  await screen.findByRole('button', { name: mobile ? 'Filter' : 'Search' })
   return router
 }
 afterEach(async () => {
@@ -168,6 +177,102 @@ it('applies mobile drawer filters only when Search is pressed', async () => {
       screen.queryByRole('dialog', { name: 'Filter' })
     ).not.toBeInTheDocument()
   )
+})
+
+it.each([true, false])(
+  'combines task model/status/ID filters and resets them (mobile=%s)',
+  async (mobile) => {
+    const router = await renderMobileFilter(true, mobile)
+    const user = userEvent.setup()
+    if (mobile) await user.click(screen.getByRole('button', { name: 'Filter' }))
+    expect(screen.getByRole('textbox', { name: 'Model Name' })).toHaveValue(
+      'client-model'
+    )
+    expect(screen.getByRole('textbox', { name: 'Task ID' })).toHaveValue(
+      'task-1'
+    )
+    await user.click(screen.getByRole('combobox', { name: 'Status' }))
+    const options = await screen.findAllByRole('option')
+    expect(options.map((option) => option.textContent)).toEqual([
+      'All',
+      'Not Started',
+      'Submitted',
+      'Queued',
+      'In Progress',
+      'Success',
+      'Failed',
+      'Unknown',
+    ])
+    await user.click(screen.getByRole('option', { name: /^Success$/ }))
+    const scope = mobile
+      ? within(screen.getByRole('dialog', { name: 'Filter' }))
+      : screen
+    await user.click(scope.getByRole('button', { name: 'Search' }))
+    await waitFor(() =>
+      expect(router.state.location.search).toMatchObject({
+        page: 1,
+        filter: 'task-1',
+        model: 'client-model',
+        status: 'SUCCESS',
+      })
+    )
+    await fetchLogsByCategory({
+      logCategory: 'task',
+      isAdmin: false,
+      page: 1,
+      pageSize: 20,
+      searchParams: router.state.location.search,
+      columnFilters: [],
+    })
+    expect(vi.mocked(api.get).mock.calls.at(-1)?.[0]).toContain(
+      'model_name=client-model'
+    )
+    expect(vi.mocked(api.get).mock.calls.at(-1)?.[0]).toContain(
+      'status=SUCCESS'
+    )
+    if (mobile) await user.click(screen.getByRole('button', { name: 'Filter' }))
+    await user.click(screen.getByRole('button', { name: 'Reset' }))
+    await waitFor(() => {
+      expect(router.state.location.search).not.toHaveProperty('model')
+      expect(router.state.location.search).not.toHaveProperty('status')
+      expect(router.state.location.search).not.toHaveProperty('filter')
+    })
+  }
+)
+
+it('discards legacy request ID filters from common search and statistics', async () => {
+  const router = await renderMobileFilter()
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: 'Filter' }))
+  expect(screen.queryByPlaceholderText('Request ID')).not.toBeInTheDocument()
+  expect(
+    screen.queryByPlaceholderText('Upstream Request ID')
+  ).not.toBeInTheDocument()
+  const legacy = {
+    model: 'client-model',
+    requestId: 'old',
+    upstreamRequestId: 'old-upstream',
+  }
+  expect(buildSearchParams(legacy, 'common')).toEqual({ model: 'client-model' })
+  const params = buildApiParams({
+    page: 1,
+    pageSize: 20,
+    isAdmin: true,
+    searchParams: legacy,
+  })
+  expect(params).not.toHaveProperty('request_id')
+  expect(params).not.toHaveProperty('upstream_request_id')
+  await user.click(
+    within(screen.getByRole('dialog', { name: 'Filter' })).getByRole('button', {
+      name: 'Search',
+    })
+  )
+  await waitFor(() =>
+    expect(router.state.location.search).not.toHaveProperty('requestId')
+  )
+  for (const [url] of vi.mocked(api.get).mock.calls) {
+    expect(url).not.toContain('request_id=')
+  }
 })
 
 it('keeps all quick actions visible without opening a menu', async () => {
