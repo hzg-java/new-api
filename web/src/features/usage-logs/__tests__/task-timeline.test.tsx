@@ -3,42 +3,110 @@ import { cleanup, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, test } from 'vitest'
 
+import { ROLE } from '@/lib/roles'
+import { useAuthStore } from '@/stores/auth-store'
+
 import {
   TaskDetailsDialog,
   TaskTimeline,
 } from '../components/dialogs/task-details-dialog'
 import type { TaskEvent, TaskLog } from '../types'
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  useAuthStore.getState().auth.reset()
+})
 
 describe('task event content', () => {
-  test('omits the result node while retaining request and accepted nodes', () => {
+  test.each([ROLE.ADMIN, ROLE.SUPER_ADMIN])(
+    'shows all nodes for administrator role %s',
+    (role) => {
+      useAuthStore.getState().auth.setUser({ id: 7, username: 'admin', role })
+      render(
+        <TaskTimeline
+          events={[
+            { kind: 'request', timestamp: 1700000000, payload: '{}' },
+            { kind: 'accepted', timestamp: 1700000001, payload: '{}' },
+            {
+              kind: 'result',
+              timestamp: 1700000002,
+              payload: '{"output":"done"}',
+            },
+          ]}
+        />
+      )
+      expect(screen.getAllByRole('listitem')).toHaveLength(3)
+      expect(
+        screen.getByRole('textbox', { name: 'Task Result' })
+      ).toHaveTextContent('done')
+    }
+  )
+
+  test.each([ROLE.USER, null])(
+    'hides result but preserves business details for role %s',
+    (role) => {
+      useAuthStore
+        .getState()
+        .auth.setUser(role === null ? null : { id: 7, username: 'user', role })
+      render(
+        <TaskTimeline
+          events={[
+            {
+              kind: 'request',
+              timestamp: 1700000000,
+              payload: '{"prompt":"hello","duration":0}',
+            },
+            {
+              kind: 'accepted',
+              timestamp: 1700000001,
+              payload: '{"status":"queued"}',
+            },
+            {
+              kind: 'result',
+              timestamp: 1700000002,
+              payload: '{"output":"result-canary"}',
+            },
+          ]}
+        />
+      )
+      expect(screen.getAllByRole('listitem')).toHaveLength(2)
+      expect(
+        screen.getByRole('textbox', { name: 'User Request' })
+      ).toHaveTextContent('hello')
+      expect(
+        screen.getByRole('textbox', { name: 'Submission Accepted' })
+      ).toHaveTextContent('queued')
+      expect(
+        screen.queryByRole('textbox', { name: 'Task Result' })
+      ).not.toBeInTheDocument()
+      expect(screen.queryByText(/result-canary/)).not.toBeInTheDocument()
+      expect(
+        screen.getAllByRole('button', { name: 'Copy to clipboard' })
+      ).toHaveLength(2)
+    }
+  )
+
+  test('shows a historical result with its missing payload marker', () => {
+    useAuthStore
+      .getState()
+      .auth.setUser({ id: 7, username: 'admin', role: ROLE.ADMIN })
     render(
       <TaskTimeline
         events={[
-          { kind: 'request', timestamp: 1700000000, payload: '{}' },
-          { kind: 'accepted', timestamp: 1700000001, payload: '{}' },
           {
             kind: 'result',
-            timestamp: 1700000002,
-            payload: '{"output":"done"}',
+            timestamp: 1700000000,
+            payload: '{}',
+            detail_complete: false,
+            detail_unavailable: 'not_recorded',
           },
         ]}
       />
     )
-    expect(screen.getAllByRole('listitem')).toHaveLength(2)
     expect(
-      screen.queryByRole('textbox', { name: 'Task Result' })
-    ).not.toBeInTheDocument()
-  })
-
-  test('shows the empty state when only a result event exists', () => {
-    render(
-      <TaskTimeline
-        events={[{ kind: 'result', timestamp: 1700000000, payload: '{}' }]}
-      />
-    )
-    expect(screen.getByText('No events recorded')).toBeInTheDocument()
+      screen.getByRole('textbox', { name: 'Task Result' })
+    ).toBeInTheDocument()
+    expect(screen.getByText('Not recorded')).toBeInTheDocument()
   })
 
   test('reserves space for timeline markers inside horizontally clipped details', () => {

@@ -249,19 +249,25 @@ func TestTaskEventTimelinePreservesSafeSnapshotsAndOwnership(t *testing.T) {
 	require.NoError(t, model.RecordTaskEvent(other.ID, "request", 1700000000, map[string]any{"model": "foreign-model"}))
 	require.NoError(t, model.RecordTaskEvent(task.ID, "request", 1700000000, map[string]any{"model": "public-model", "prompt": "hello"}))
 	require.NoError(t, model.RecordTaskEvent(task.ID, "accepted", 1700000001, map[string]any{"id": task.TaskID, "status": "queued"}))
+	require.NoError(t, model.RecordTaskEventDetail(task.ID, "request", 1700000000, map[string]any{"model": "public-model", "prompt": "hello"}))
+	require.NoError(t, model.RecordTaskEventDetail(task.ID, "accepted", 1700000001, map[string]any{"id": task.TaskID, "status": "queued"}))
 	require.NoError(t, model.RecordTaskEvent(task.ID, "result", 1700000010, map[string]any{"status": "SUCCESS", "total_tokens": 12}))
 	require.NoError(t, model.RecordTaskEvent(task.ID, "result", 1700000011, map[string]any{"status": "FAILURE"}))
 
 	for _, tc := range []struct {
 		name                 string
 		userID, role, status int
+		tokenID              int
 		wantCount            int
 	}{
-		{"owner", 7, common.RoleCommonUser, 200, 3},
-		{"same public ID, different owner", 8, common.RoleCommonUser, 404, 0},
-		{"foreign user", 9, common.RoleCommonUser, 404, 0},
-		{"admin", 8, common.RoleAdminUser, 200, 3},
-		{"api token", 9, common.RoleRootUser, 404, 0},
+		{"owner", 7, common.RoleCommonUser, 200, 0, 2},
+		{"same public ID, different owner", 8, common.RoleCommonUser, 404, 0, 0},
+		{"foreign user", 9, common.RoleCommonUser, 404, 0, 0},
+		{"admin", 8, common.RoleAdminUser, 200, 0, 3},
+		{"root", 9, common.RoleRootUser, 200, 0, 3},
+		{"admin owner token", 7, common.RoleAdminUser, 200, 1, 2},
+		{"root owner token", 7, common.RoleRootUser, 200, 1, 2},
+		{"api token", 9, common.RoleRootUser, 404, 1, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
@@ -270,9 +276,7 @@ func TestTaskEventTimelinePreservesSafeSnapshotsAndOwnership(t *testing.T) {
 			c.Params = gin.Params{{Key: "task_id", Value: strconv.FormatInt(task.ID, 10)}}
 			c.Set("id", tc.userID)
 			c.Set("role", tc.role)
-			if tc.name == "api token" {
-				c.Set("token_id", 1)
-			}
+			c.Set("token_id", tc.tokenID)
 			GetDashboardTaskEvents(c)
 			assert.Equal(t, tc.status, recorder.Code)
 			if tc.wantCount == 0 {
@@ -283,8 +287,18 @@ func TestTaskEventTimelinePreservesSafeSnapshotsAndOwnership(t *testing.T) {
 			}
 			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
 			require.Len(t, response.Data, tc.wantCount)
-			assert.Equal(t, []string{"request", "accepted", "result"}, []string{response.Data[0].Kind, response.Data[1].Kind, response.Data[2].Kind})
-			assert.Contains(t, response.Data[2].Payload, "SUCCESS")
+			assert.Equal(t, "request", response.Data[0].Kind)
+			assert.Equal(t, "accepted", response.Data[1].Kind)
+			assert.JSONEq(t, `{"model":"public-model","prompt":"hello"}`, response.Data[0].Payload)
+			assert.JSONEq(t, `{"id":"public-id","status":"queued"}`, response.Data[1].Payload)
+			if tc.wantCount == 3 {
+				assert.Equal(t, "result", response.Data[2].Kind)
+				assert.Contains(t, response.Data[2].Payload, "SUCCESS")
+			} else {
+				assert.NotContains(t, recorder.Body.String(), `"kind":"result"`)
+				assert.NotContains(t, recorder.Body.String(), "SUCCESS")
+			}
+			assert.NotContains(t, recorder.Body.String(), "foreign-model")
 			assert.NotContains(t, recorder.Body.String(), "FAILURE")
 			if tc.name == "admin" {
 				assert.Contains(t, recorder.Body.String(), `"detail_complete":false`)
@@ -385,7 +399,8 @@ func TestTaskSubmissionRecordsTimelineWithoutRawPayloads(t *testing.T) {
 	assert.Equal(t, "request", events[0].Kind)
 	assert.Equal(t, "accepted", events[1].Kind)
 	require.NoError(t, events[0].ProjectDetail(false))
-	assert.JSONEq(t, `{"model":"plugin-model"}`, events[0].Payload)
+	// The original test request was {}, not the normalized plugin request.
+	assert.JSONEq(t, `{}`, events[0].Payload)
 	assert.JSONEq(t, `{"id":"task_public","status":"queued","model":"plugin-model"}`, events[1].Payload)
 	for _, event := range events {
 		assert.NotContains(t, event.Payload, "secret-canary")
@@ -407,6 +422,7 @@ func TestTaskEventAdminDetailProjection(t *testing.T) {
 		full        bool
 	}{
 		{"admin browser", common.RoleAdminUser, 0, true},
+		{"root browser", common.RoleRootUser, 0, true},
 		{"ordinary browser", common.RoleCommonUser, 0, false},
 		{"root token", common.RoleRootUser, 1, false},
 	} {
@@ -429,9 +445,15 @@ func TestTaskEventAdminDetailProjection(t *testing.T) {
 				assert.Contains(t, body, "provider rejected")
 				assert.Contains(t, body, `"detail_complete":true`)
 			} else {
+				var response struct {
+					Data []model.TaskEvent `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+				assert.Empty(t, response.Data)
+				assert.Contains(t, body, `"data":[]`)
+				assert.NotContains(t, body, "provider rejected")
 				assert.NotContains(t, body, "nested")
 				assert.NotContains(t, body, "admin_info")
-				assert.NotContains(t, body, "detail_complete")
 			}
 		})
 	}
@@ -468,6 +490,37 @@ func TestTaskEventOriginalRequestAndActualResponse(t *testing.T) {
 	require.NoError(t, events[1].ProjectDetail(true))
 	assert.Contains(t, events[1].Payload, "actual presenter failure")
 	assert.NotContains(t, events[1].Payload, "response-canary")
+}
+
+func TestTaskEventBusinessDetailProjection(t *testing.T) {
+	for _, tc := range []struct{ kind, detail, want string }{
+		{"request", `{"model":"client-model","prompt":"hello","duration":0,"generate_audio":false,"metadata":{"seed":9007199254740993,"channel":"ops-canary","model":"mapped-canary"},"price_data":{"ratio":"ops-canary"}}`, `{"model":"client-model","prompt":"hello","duration":0,"generate_audio":false,"metadata":{"seed":9007199254740993}}`},
+		{"request", `{"kind":"multipart","fields":{"prompt":["first","second"],"model":["client-model"],"channel_id":["ops-canary"]},"files":[{"field":"image","filename":"input.png","mime_type":"image/png","size":42}],"unavailable":"uploaded_file_bytes_omitted"}`, `{"kind":"multipart","fields":{"prompt":["first","second"],"model":["client-model"]},"files":[{"field":"image","filename":"input.png","mime_type":"image/png","size":42}],"unavailable":"uploaded_file_bytes_omitted"}`},
+		{"accepted", `{"status_code":200,"content_type":"application/json","body":{"id":"public-id","status":"queued","model":"mapped-canary","admin_info":{"channel":"ops-canary"},"unknown":{"prompt":"ops-canary"}}}`, `{"status_code":200,"content_type":"application/json","body":{"id":"public-id","status":"queued"}}`},
+		{"accepted", `{"events":[{"event":"response.completed","data":{"status":"completed","model":"mapped-canary","output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}]}}]}`, `{"events":[{"event":"response.completed","data":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}]}}]}`},
+		{"result", `{"task_id":"public-id","status":"SUCCESS","data":{"id":"vendor-id","model":"mapped-canary","content":{"video_url":"https://cdn.example/video?token=credential-canary&width=720","last_frame_url":"https://cdn.example/frame"},"usage":{"total_tokens":9007199254740993,"price":"ops-canary"},"resolution":"720p","duration":5,"node_name":"ops-canary","unknown":"ops-canary"}}`, `{"task_id":"public-id","status":"SUCCESS","data":{"id":"vendor-id","content":{"video_url":"https://cdn.example/video?token=%5BREDACTED%5D&width=720","last_frame_url":"https://cdn.example/frame"},"usage":{"total_tokens":9007199254740993},"resolution":"720p","duration":5}}`},
+	} {
+		t.Run(tc.kind+tc.detail[:12], func(t *testing.T) {
+			stored := `{"admin_info":{"complete":true,"payload":` + tc.detail + `}}`
+			event := model.TaskEvent{Kind: tc.kind, Payload: stored}
+			require.NoError(t, event.ProjectDetail(false))
+			assert.JSONEq(t, tc.want, event.Payload)
+			require.NotNil(t, event.DetailComplete)
+			assert.True(t, *event.DetailComplete)
+			assert.NotContains(t, event.Payload, "canary")
+			admin := model.TaskEvent{Kind: tc.kind, Payload: stored}
+			require.NoError(t, admin.ProjectDetail(true))
+			assert.NotContains(t, admin.Payload, "credential-canary")
+		})
+	}
+	for _, info := range []string{"", `,"admin_info":{"complete":false,"unavailable":"size_limit_exceeded"}`} {
+		event := model.TaskEvent{Kind: "request", Payload: `{"model":"client-model"` + info + `}`}
+		require.NoError(t, event.ProjectDetail(false))
+		require.NotNil(t, event.DetailComplete)
+		assert.False(t, *event.DetailComplete)
+		assert.NotEmpty(t, event.DetailUnavailable)
+		assert.JSONEq(t, `{"model":"client-model"}`, event.Payload)
+	}
 }
 
 func TestTaskEventCredentialTextAndEnvelopes(t *testing.T) {

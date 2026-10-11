@@ -181,29 +181,105 @@ func (event *TaskEvent) ProjectDetail(admin bool) error {
 	}
 	info := payload["admin_info"]
 	delete(payload, "admin_info")
-	if admin {
-		var detail struct {
-			Payload     json.RawMessage `json:"payload"`
-			Complete    bool            `json:"complete"`
-			Unavailable string          `json:"unavailable"`
+	var detail struct {
+		Payload     json.RawMessage `json:"payload"`
+		Complete    bool            `json:"complete"`
+		Unavailable string          `json:"unavailable"`
+	}
+	if len(info) > 0 {
+		if err := common.Unmarshal(info, &detail); err != nil {
+			return err
 		}
-		if len(info) > 0 {
-			if err := common.Unmarshal(info, &detail); err != nil {
-				return err
-			}
-		} else {
-			detail.Unavailable = "not_recorded"
-		}
-		event.DetailComplete = &detail.Complete
-		event.DetailUnavailable = detail.Unavailable
-		if len(detail.Payload) > 0 {
-			event.Payload = string(detail.Payload)
-			return nil
+	} else {
+		detail.Unavailable = "not_recorded"
+	}
+	if len(detail.Payload) == 0 && detail.Complete {
+		detail.Complete = false
+		detail.Unavailable = "not_recorded"
+	}
+	event.DetailComplete = &detail.Complete
+	event.DetailUnavailable = detail.Unavailable
+	encoded := detail.Payload
+	if len(encoded) == 0 {
+		var err error
+		encoded, err = common.Marshal(payload)
+		if err != nil {
+			return err
 		}
 	}
-	encoded, err := common.Marshal(payload)
-	event.Payload = string(encoded)
+	if !admin {
+		var err error
+		encoded, err = projectTaskEventBusinessJSON(encoded, event.Kind == "request", true, "")
+		if err != nil {
+			return err
+		}
+	}
+	// Redact again at the read boundary, including historical snapshots.
+	redacted, err := redactTaskEventJSON(encoded)
+	event.Payload = string(redacted)
 	return err
+}
+
+// Project only reviewed business fields, never arbitrary provider metadata.
+// Model is safe only in the original client request (including form fields),
+// not in provider responses or nested request metadata. RawMessage preserves
+// explicit zero/false values and numeric lexemes without a float64 round trip.
+func projectTaskEventBusinessJSON(encoded json.RawMessage, request, root bool, container string) (json.RawMessage, error) {
+	switch common.GetJsonType(encoded) {
+	case "array":
+		var items []json.RawMessage
+		if err := common.Unmarshal(encoded, &items); err != nil {
+			return nil, err
+		}
+		for i := range items {
+			value, err := projectTaskEventBusinessJSON(items[i], request, false, container)
+			if err != nil {
+				return nil, err
+			}
+			items[i] = value
+		}
+		return common.Marshal(items)
+	case "object":
+		var object map[string]json.RawMessage
+		if err := common.Unmarshal(encoded, &object); err != nil {
+			return nil, err
+		}
+		filtered := make(map[string]json.RawMessage)
+		for key, value := range object {
+			allowed := false
+			switch key {
+			case "model":
+				allowed = request && (root || container == "fields")
+			case "kind", "fields", "files":
+				allowed = request && root
+			case "field", "filename", "mime_type":
+				allowed = request && container == "files"
+			case "status_code", "content_type", "body", "events", "unavailable":
+				allowed = root
+			case "event":
+				allowed = container == "events"
+			case "prompt", "negative_prompt", "seed", "n", "seconds", "duration", "duration_seconds", "durationSeconds", "resolution", "size", "width", "height", "quality", "aspect_ratio", "fps", "generate_audio", "audio", "watermark", "camera_fixed", "return_last_frame", "image", "images", "image_url", "image_urls", "video_url", "video_urls", "reference_video", "reference_videos", "reference_video_url", "reference_video_urls", "first_frame", "last_frame", "last_frame_url", "audio_url", "url", "b64_json", "revised_prompt", "text", "type", "role":
+				allowed = container != "usage"
+			case "metadata", "parameters", "input":
+				allowed = request
+			case "id", "task_id", "status", "task_status", "progress", "created", "created_at", "updated_at", "completed_at", "finished_at", "expires_at", "error", "code", "message", "fail_reason", "result_url", "object", "output", "content", "data", "result", "results", "videos", "choices", "usage", "video_info", "has_reference_video":
+				allowed = container != "usage"
+			case "total_tokens", "completion_tokens", "prompt_tokens", "input_tokens", "output_tokens", "image_count", "output_image_count", "video_count":
+				allowed = container == "usage"
+			}
+			if !allowed {
+				continue
+			}
+			projected, err := projectTaskEventBusinessJSON(value, request, false, key)
+			if err != nil {
+				return nil, err
+			}
+			filtered[key] = projected
+		}
+		return common.Marshal(filtered)
+	default:
+		return encoded, nil
+	}
 }
 
 func GetTaskByID(taskID int64, userID int) (*Task, bool, error) {

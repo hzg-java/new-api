@@ -33,7 +33,9 @@ import {
   formatTimestampToDate,
   formatUseTime,
 } from '@/lib/format'
+import { ROLE } from '@/lib/roles'
 import { cn } from '@/lib/utils'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { getTaskEvents } from '../../api'
 import { taskActionMapper, taskStatusMapper } from '../../lib/mappers'
@@ -121,7 +123,12 @@ function formatTaskEventPayload(payload: string): string {
 
 export function TaskTimeline(props: { events: TaskEvent[] }) {
   const { t } = useTranslation()
-  const visibleEvents = props.events.filter((event) => event.kind !== 'result')
+  const isAdmin = useAuthStore(
+    (state) => (state.auth.user?.role ?? ROLE.GUEST) >= ROLE.ADMIN
+  )
+  const visibleEvents = props.events.filter(
+    (event) => isAdmin || event.kind !== 'result'
+  )
   const labels = {
     request: t('User Request'),
     accepted: t('Submission Accepted'),
