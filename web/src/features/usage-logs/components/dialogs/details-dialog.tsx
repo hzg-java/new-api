@@ -64,7 +64,9 @@ import { PolicyDecisionRecord } from '@/features/system-settings/request-policie
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
 import { formatBillingCurrencyFromUSD } from '@/lib/currency'
 import { formatLogQuota, formatTokens, formatUseTime } from '@/lib/format'
+import { ROLE } from '@/lib/roles'
 import { cn } from '@/lib/utils'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { AuditDetailFields } from '../../audit/components/audit-detail-fields'
 import type { UsageLog } from '../../data/schema'
@@ -91,6 +93,7 @@ import { USAGE_BILLING_PATH, type LogOtherData } from '../../types'
 import { ResponseModelDetails } from '../model-badge'
 import { PluginAuthorLink } from '../plugin-author-link'
 import { DetailRow, DetailSection } from './log-detail-layout'
+import { FailedTaskSubmission, LogTaskEvents } from './log-task-events'
 
 // Maps a channel-update changed-field token (as recorded by the backend audit)
 // to its i18n label key for display in the audit details.
@@ -479,6 +482,23 @@ export function DetailsDialog(props: DetailsDialogProps) {
   const { copiedText, copyToClipboard } = useCopyToClipboard({ notify: false })
   const other = parseLogOther(props.log.other)
   const typeConfig = getLogTypeConfig(props.log.type)
+  const viewer = useAuthStore((state) => state.auth.user)
+  const taskId = typeof other?.task_id === 'string' ? other.task_id : ''
+  const showFailedSubmission =
+    props.open &&
+    props.isAdmin &&
+    (viewer?.role ?? ROLE.GUEST) >= ROLE.ADMIN &&
+    props.log.type === 5 &&
+    !!(other?.admin_info?.task_submission || other?.admin_info?.task_plugin)
+  const showTaskEvents =
+    props.open &&
+    props.isAdmin &&
+    (viewer?.role ?? ROLE.GUEST) >= ROLE.ADMIN &&
+    viewer != null &&
+    props.log.type === 2 &&
+    taskId.trim().length > 0 &&
+    Number.isSafeInteger(props.log.user_id) &&
+    props.log.user_id > 0
 
   const isViolation = isViolationFeeLog(other)
   const isRefund = props.log.type === 6
@@ -639,7 +659,9 @@ export function DetailsDialog(props: DetailsDialogProps) {
       contentClassName={cn(
         'min-w-0 overflow-hidden',
         'max-sm:max-h-(--dialog-available-height) max-sm:w-[calc(100vw-1.5rem)] max-sm:max-w-[calc(100vw-1.5rem)] max-sm:p-4',
-        isTieredBilling ? 'sm:max-w-4xl lg:max-w-5xl' : 'sm:max-w-lg'
+        isTieredBilling || props.log.type === 5
+          ? 'sm:max-w-4xl lg:max-w-5xl'
+          : 'sm:max-w-lg'
       )}
       headerClassName='max-sm:gap-1'
       titleClassName='flex items-center gap-2 text-base'
@@ -748,6 +770,20 @@ export function DetailsDialog(props: DetailsDialogProps) {
             />
           )}
         </div>
+
+        {showTaskEvents && viewer && (
+          <LogTaskEvents
+            taskId={taskId}
+            ownerId={props.log.user_id}
+            viewerId={viewer.id}
+          />
+        )}
+
+        {showFailedSubmission && (
+          <FailedTaskSubmission
+            submission={other?.admin_info?.task_submission}
+          />
+        )}
 
         {/* Request conversion (admin only, not for refund) */}
         {showConversion && (

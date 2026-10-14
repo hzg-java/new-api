@@ -28,6 +28,7 @@ func TestRelayTaskPluginEndpointPreservesUnclaimedFallback(t *testing.T) {
 func TestRelayTaskPluginEndpointNeverEntersOrdinaryRelayWhenClaimed(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
 	c.Set(jsplugin.ContextKeyPinnedEndpoint, jsplugin.PinnedEndpoint{
 		Generation: &jsplugin.RoutingGeneration{},
 		Plugin:     &jsplugin.LoadedPlugin{},

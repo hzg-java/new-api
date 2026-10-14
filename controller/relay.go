@@ -407,8 +407,12 @@ func RelayTaskPluginEndpoint(c *gin.Context, fallback gin.HandlerFunc) {
 	}
 	switch pinned.Protocol {
 	case "openai_responses":
+		if pinned.Operation.Name == "create" {
+			capture.arm(c, taskEventOriginalRequest(c))
+		}
 		serveTaskPluginProtocol(c, pinned, defaultPluginProtocolBridgeDeps())
 	case pluginruntime.ProtocolOpenAIImage:
+		capture.arm(c, taskEventOriginalRequest(c))
 		serveTaskPluginImageProtocol(c, pinned, defaultPluginProtocolBridgeDeps())
 	default:
 		fallback(c)
@@ -438,6 +442,7 @@ type taskSubmissionOutcome struct {
 
 func RelayTask(c *gin.Context) {
 	capture := installTaskEventResponseCapture(c)
+	capture.arm(c, taskEventOriginalRequest(c))
 	defer capture.record()
 	relayInfo, err := relaycommon.GenRelayInfo(c, types.RelayFormatTask, nil, nil)
 	if err != nil {
@@ -486,7 +491,59 @@ type taskEventResponseCapture struct {
 	gin.ResponseWriter
 	body                            bytes.Buffer
 	task                            *model.Task
+	context                         *gin.Context
+	request, attemptError           json.RawMessage
+	pending                         []taskSubmissionErrorLog
+	finalErrorLog                   *model.Log
+	finalError                      *types.NewAPIError
 	overflow, writeFailed, recorded bool
+}
+
+type taskSubmissionErrorLog struct {
+	log   *model.Log
+	write func()
+}
+
+// Error details are JSON values, never encoded strings or float64 round trips.
+func safeTaskSubmissionDetail(value any) json.RawMessage {
+	encoded, err := model.RedactTaskEventDetail(value)
+	if err != nil {
+		return json.RawMessage(`{"unavailable":"redaction_failed"}`)
+	}
+	if len(encoded) > model.TaskEventPayloadLimit {
+		return json.RawMessage(`{"unavailable":"size_limit_exceeded"}`)
+	}
+	return encoded
+}
+
+func (w *taskEventResponseCapture) arm(c *gin.Context, request any) {
+	if w.request != nil {
+		return
+	}
+	w.context = c
+	w.request = safeTaskSubmissionDetail(request)
+	c.Set(model.ContextKeyErrorLogCollector, func(log *model.Log, write func()) {
+		var other map[string]json.RawMessage
+		_ = common.UnmarshalJsonStr(log.Other, &other)
+		if other == nil {
+			other = make(map[string]json.RawMessage)
+		}
+		var admin map[string]json.RawMessage
+		_ = common.Unmarshal(other["admin_info"], &admin)
+		if admin == nil {
+			admin = make(map[string]json.RawMessage)
+		}
+		response := w.attemptError
+		if response == nil {
+			response = safeTaskSubmissionDetail(map[string]any{"message": log.Content})
+		}
+		admin["task_submission"], _ = common.Marshal(map[string]json.RawMessage{"request": w.request, "response": response})
+		other["admin_info"], _ = common.Marshal(admin)
+		encoded, _ := common.Marshal(other)
+		log.Other = string(encoded)
+		w.pending = append(w.pending, taskSubmissionErrorLog{log: log, write: write})
+		w.finalErrorLog = log
+	})
 }
 
 func installTaskEventResponseCapture(c *gin.Context) *taskEventResponseCapture {
@@ -523,10 +580,56 @@ func (w *taskEventResponseCapture) WriteString(text string) (int, error) {
 func (w *taskEventResponseCapture) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (w *taskEventResponseCapture) record() {
-	if w.recorded || w.task == nil {
+	if w.recorded {
 		return
 	}
 	w.recorded = true
+	if w.context != nil {
+		// Only a failed final presentation may replace the last attempt snapshot.
+		// Successful retry responses must never be attached to earlier errors.
+		failed := w.finalError != nil || w.Status() >= http.StatusBadRequest
+		if failed && w.finalErrorLog == nil {
+			err := w.finalError
+			if err == nil {
+				err = types.NewErrorWithStatusCode(errors.New("task submission failed"), types.ErrorCodeBadResponseStatusCode, w.Status())
+			}
+			service.RecordRelayErrorLog(w.context, w.context.GetInt("channel_id"), err, nil)
+		}
+		for _, pending := range w.pending {
+			if pending.log == w.finalErrorLog && failed {
+				response := json.RawMessage(`{"unavailable":"response_not_written"}`)
+				switch {
+				case w.task != nil && w.task.PrivateData.ResultDiscarded:
+					response = json.RawMessage(`{"unavailable":"result_discarded"}`)
+				case w.overflow:
+					response = json.RawMessage(`{"unavailable":"size_limit_exceeded"}`)
+				case w.writeFailed:
+					response = json.RawMessage(`{"unavailable":"write_failed"}`)
+				case w.body.Len() > 0:
+					var raw json.RawMessage
+					if common.Unmarshal(w.body.Bytes(), &raw) == nil {
+						response = safeTaskSubmissionDetail(raw)
+					} else {
+						response = json.RawMessage(`{"unavailable":"non_json_response"}`)
+					}
+				}
+				var other map[string]json.RawMessage
+				_ = common.UnmarshalJsonStr(pending.log.Other, &other)
+				var admin map[string]json.RawMessage
+				_ = common.Unmarshal(other["admin_info"], &admin)
+				admin["task_submission"], _ = common.Marshal(map[string]json.RawMessage{"request": w.request, "response": response})
+				other["admin_info"], _ = common.Marshal(admin)
+				encoded, _ := common.Marshal(other)
+				pending.log.Other = string(encoded)
+			}
+			pending.write()
+		}
+		w.pending = nil
+		w.context.Set(model.ContextKeyErrorLogCollector, nil)
+	}
+	if w.task == nil {
+		return
+	}
 	detail := map[string]any{"status_code": w.Status(), "content_type": w.Header().Get("Content-Type")}
 	switch {
 	case w.task.PrivateData.ResultDiscarded:
@@ -628,8 +731,16 @@ func executeTaskSubmissionWith(
 	c *gin.Context,
 	relayInfo *relaycommon.RelayInfo,
 	submit taskSubmitAttempt,
-) (*taskSubmissionOutcome, *taskdto.TaskError) {
+) (outcome *taskSubmissionOutcome, finalTaskErr *taskdto.TaskError) {
 	originalRequest := taskEventOriginalRequest(c)
+	capture := installTaskEventResponseCapture(c)
+	capture.arm(c, originalRequest)
+	defer func() {
+		capture.finalError = nil
+		if finalTaskErr != nil {
+			capture.finalError = taskSubmissionAPIError(finalTaskErr)
+		}
+	}()
 	policy := service.RequestPolicy(c)
 	diagnostics := newTaskPluginSubmitDiagnostics(c)
 	diagnostics.start(relayInfo)
@@ -659,6 +770,9 @@ func executeTaskSubmissionWith(
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
 		stage = "select_channel"
+		capture.finalErrorLog = nil
+		capture.finalError = nil
+		capture.attemptError = nil
 		if requestErr := c.Request.Context().Err(); requestErr != nil {
 			diagnostics.cancelled("before_attempt", retryParam.GetRetry()+1)
 			taskErr = service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
@@ -700,6 +814,8 @@ func executeTaskSubmissionWith(
 		c.Request.Body = io.NopCloser(bodyStorage)
 
 		stage = "submit"
+		capture.finalErrorLog = nil
+		capture.attemptError = nil
 		result, taskErr = submit(c, relayInfo)
 		if requestErr := c.Request.Context().Err(); requestErr != nil {
 			diagnostics.cancelled("after_submit", retryParam.GetRetry()+1)
@@ -711,7 +827,9 @@ func executeTaskSubmissionWith(
 			break
 		}
 
+		capture.attemptError = safeTaskSubmissionDetail(taskErr)
 		taskAPIError := taskSubmissionAPIError(taskErr)
+		capture.finalError = taskAPIError
 		relayInfo.LastError = taskAPIError
 		decision := decideTaskRetry(c, taskErr, common.RetryTimes-retryParam.GetRetry())
 		service.RecordPolicyFailure(c, channel.Id, taskAPIError, decision)
@@ -721,6 +839,8 @@ func executeTaskSubmissionWith(
 					common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()),
 				taskAPIError,
 				relayInfo)
+		} else {
+			service.RecordRelayErrorLog(c, channel.Id, taskAPIError, relayInfo)
 		}
 
 		willRetry := decision.Action == "retry"
@@ -942,6 +1062,7 @@ func presentTaskSubmission(c *gin.Context, outcome *taskSubmissionOutcome) {
 }
 
 func respondTaskSubmissionError(c *gin.Context, taskErr *taskdto.TaskError) {
+	installTaskEventResponseCapture(c).finalError = taskSubmissionAPIError(taskErr)
 	service.RecordRequestPolicyTermination(c, taskSubmissionAPIError(taskErr))
 	newTaskPluginSubmitDiagnostics(c).presentError(taskErr)
 	if middleware.RespondTaskPluginError(c, taskErr) {

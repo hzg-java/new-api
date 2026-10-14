@@ -73,6 +73,12 @@ func ProcessChannelError(c *gin.Context, channelError types.ChannelError, err *t
 		})
 	}
 
+	RecordRelayErrorLog(c, channelError.ChannelId, err, relayInfo)
+}
+
+// RecordRelayErrorLog applies the same logging policy to local task failures
+// without running upstream channel-disable side effects.
+func RecordRelayErrorLog(c *gin.Context, channelID int, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {
 	if constant.ErrorLogEnabled && types.IsRecordErrorLog(err) {
 		userId := c.GetInt("id")
 		tokenName := c.GetString("token_name")
@@ -94,6 +100,6 @@ func ProcessChannelError(c *gin.Context, channelError types.ChannelError, err *t
 			startTime = time.Now()
 		}
 		useTimeSeconds := int(time.Since(startTime).Seconds())
-		model.RecordErrorLog(c, userId, channelError.ChannelId, modelName, tokenName, err.MaskSensitiveErrorWithStatusCode(), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
+		model.RecordErrorLog(c, userId, channelID, modelName, tokenName, err.MaskSensitiveErrorWithStatusCode(), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
 	}
 }

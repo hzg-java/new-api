@@ -287,6 +287,11 @@ func serveTaskPluginProtocol(
 		outcome, taskErr = deps.submit(c, relayInfo)
 	}()
 
+	if taskErr != nil {
+		installTaskEventResponseCapture(c).finalError = taskSubmissionAPIError(taskErr)
+	} else if relayInfoErr != nil {
+		installTaskEventResponseCapture(c).finalError = types.NewErrorWithStatusCode(relayInfoErr, types.ErrorCodeBadResponseStatusCode, http.StatusInternalServerError)
+	}
 	if clientRequest.Context().Err() != nil {
 		logger.LogDebug(c, "task_plugin subsystem=protocol event=client_disconnected generation=%d plugin=%q stage=%s", generation, pluginKey, submissionStage)
 		return
@@ -1270,6 +1275,9 @@ func writeTaskPluginProtocolEvent(c *gin.Context, event dto.PluginResponsesStrea
 }
 
 func respondPluginProtocolSubmissionError(c *gin.Context, taskErr *dto.TaskError) {
+	if taskErr != nil {
+		installTaskEventResponseCapture(c).finalError = taskSubmissionAPIError(taskErr)
+	}
 	status := http.StatusInternalServerError
 	if taskErr != nil && taskErr.StatusCode >= 400 && taskErr.StatusCode <= 599 {
 		status = taskErr.StatusCode
@@ -1293,6 +1301,10 @@ func respondPluginProtocolSubmissionError(c *gin.Context, taskErr *dto.TaskError
 }
 
 func respondPluginProtocolError(c *gin.Context, status int, code, message string) {
+	capture := installTaskEventResponseCapture(c)
+	if capture.finalError == nil {
+		capture.finalError = types.NewErrorWithStatusCode(errors.New(message), types.ErrorCodeBadResponseStatusCode, status)
+	}
 	c.JSON(status, gin.H{
 		"error": gin.H{
 			"message": message,

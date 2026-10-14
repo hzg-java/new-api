@@ -138,7 +138,7 @@ func formatUserLogs(logs []*Log, startIdx int) {
 				}
 			}
 		}
-		log.Other = formatLogOtherJSON(log.Other, logOtherVisibilityUser)
+		log.Other = formatLogOtherJSON(log.Other, logOtherVisibilityUser, log.Type)
 	}
 	assignDisplayLogIds(logs, startIdx)
 }
@@ -147,7 +147,7 @@ func formatUserLogs(logs []*Log, startIdx int) {
 // admin_info. Root callers must not pass their results through this formatter.
 func FormatAdminLogs(logs []*Log) {
 	for i := range logs {
-		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityAdmin)
+		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityAdmin, logs[i].Type)
 	}
 }
 
@@ -155,7 +155,7 @@ func FormatAdminLogs(logs []*Log) {
 // without removing root-only diagnostics.
 func FormatRootLogs(logs []*Log) {
 	for i := range logs {
-		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityRoot)
+		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityRoot, logs[i].Type)
 	}
 }
 
@@ -297,6 +297,10 @@ func RecordTopupLog(userId int, content string, callerIp string, paymentMethod s
 	}
 }
 
+// ContextKeyErrorLogCollector is armed only by task submission handlers. The
+// collector owns the one-shot insert callback; ordinary relay logs write immediately.
+const ContextKeyErrorLogCollector = "task_submission_error_log_collector"
+
 func RecordErrorLog(c *gin.Context, userId int, channelId int, modelName string, tokenName string, content string, tokenId int, useTimeSeconds int,
 	isStream bool, group string, other *LogOther) {
 	logger.LogInfo(c, fmt.Sprintf("record error log: userId=%d, channelId=%d, modelName=%s, tokenName=%s, content=%s", userId, channelId, modelName, tokenName, common.LocalLogPreview(content)))
@@ -337,10 +341,18 @@ func RecordErrorLog(c *gin.Context, userId int, channelId int, modelName string,
 		UpstreamRequestId: upstreamRequestId,
 		Other:             otherStr,
 	}
-	err := createLog(log)
-	if err != nil {
-		logger.LogError(c, "failed to record log: "+err.Error())
+	write := func() {
+		if err := createLog(log); err != nil {
+			logger.LogError(c, "failed to record log: "+err.Error())
+		}
 	}
+	if value, ok := c.Get(ContextKeyErrorLogCollector); ok {
+		if collect, ok := value.(func(*Log, func())); ok {
+			collect(log, write)
+			return
+		}
+	}
+	write()
 }
 
 type RecordConsumeLogParams struct {
@@ -628,13 +640,14 @@ func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int
 }
 
 type Stat struct {
-	Quota int `json:"quota"`
-	Rpm   int `json:"rpm"`
-	Tpm   int `json:"tpm"`
+	Quota       int   `json:"quota"`
+	Rpm         int   `json:"rpm"`
+	Tpm         int   `json:"tpm"`
+	TotalTokens int64 `json:"total_tokens"`
 }
 
 func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, channel int, group string) (stat Stat, err error) {
-	tx := LOG_DB.Table("logs").Select("COALESCE(sum(quota), 0) quota")
+	tx := LOG_DB.Table("logs").Select("COALESCE(sum(quota), 0) quota, COALESCE(sum(prompt_tokens), 0) + COALESCE(sum(completion_tokens), 0) total_tokens")
 
 	// 为rpm和tpm创建单独的查询
 	rpmTpmQuery := LOG_DB.Table("logs").Select("count(*) rpm, COALESCE(sum(prompt_tokens), 0) + COALESCE(sum(completion_tokens), 0) tpm")

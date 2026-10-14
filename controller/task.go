@@ -78,6 +78,50 @@ func GetTaskArtifacts(c *gin.Context) {
 	writeTaskArtifacts(c, task, false)
 }
 
+func GetLogTaskEvents(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
+	if c.GetInt("role") < common.RoleAdminUser || c.GetInt("token_id") != 0 {
+		c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "Insufficient permission"})
+		return
+	}
+	taskID := c.Query("task_id")
+	userID, err := strconv.Atoi(c.Query("user_id"))
+	if strings.TrimSpace(taskID) == "" || err != nil || userID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "Invalid task_id or user_id"})
+		return
+	}
+	var tasks []model.Task
+	if err := model.DB.Select("id").Where("task_id = ? AND user_id = ?", taskID, userID).Limit(2).Find(&tasks).Error; err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if len(tasks) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"success": false, "message": "Task not found"})
+		return
+	}
+	if len(tasks) != 1 {
+		c.JSON(http.StatusConflict, gin.H{"success": false, "message": "Ambiguous task"})
+		return
+	}
+	events, err := model.GetTaskEvents(tasks[0].ID)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	visibleEvents := make([]model.TaskEvent, 0, 2)
+	for _, event := range events {
+		if event.Kind != "request" && event.Kind != "accepted" {
+			continue
+		}
+		if err := event.ProjectDetail(true); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		visibleEvents = append(visibleEvents, event)
+	}
+	common.ApiSuccess(c, visibleEvents)
+}
+
 func GetDashboardTaskEvents(c *gin.Context) {
 	c.Header("Cache-Control", "private, no-store")
 	taskID, parseErr := strconv.ParseInt(c.Param("task_id"), 10, 64)

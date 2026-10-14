@@ -27,6 +27,7 @@ import {
   fireEvent,
   render as renderUI,
   screen,
+  waitFor,
   within,
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
@@ -545,9 +546,15 @@ describe('task log presentation', () => {
       </QueryClientProvider>
     )
     const dialog = within(await screen.findByRole('dialog'))
-    expect(await dialog.findByText('User Request')).toBeVisible()
-    expect(dialog.getByText('Submission Accepted')).toBeVisible()
-    expect(dialog.getByText('Task Result')).toBeVisible()
+    expect(
+      await dialog.findByRole('heading', { name: 'User Request' })
+    ).toBeVisible()
+    expect(
+      dialog.getByRole('heading', { name: 'Submission Accepted' })
+    ).toBeVisible()
+    expect(
+      dialog.queryByRole('heading', { name: 'Task Result', level: 4 })
+    ).not.toBeInTheDocument()
     expect(dialog.getByText('Full Chain Events')).toBeVisible()
     expect(dialog.getByText('Task Duration')).toBeVisible()
     expect(
@@ -556,7 +563,7 @@ describe('task log presentation', () => {
     expect(dialog.getByText('Cost')).toBeVisible()
     expect(dialog.getByText('Model')).toBeVisible()
     expect(dialog.getAllByText('public-model').length).toBeGreaterThan(0)
-    expect(dialog.getByText('hello')).toBeVisible()
+    expect(dialog.getByText(/"hello"/)).toBeVisible()
     expect(dialog.queryByText('private-model')).not.toBeInTheDocument()
     expect(api.get).toHaveBeenCalledWith('/api/task/1/events')
   })
@@ -584,7 +591,7 @@ describe('task log presentation', () => {
     expect(dialog.queryByText('User Request')).not.toBeInTheDocument()
   })
 
-  test('given a task finishes while the dialog remains open, it loads the result event', async () => {
+  test('given a task finishes while the user dialog remains open, it refreshes without exposing the result event', async () => {
     const get = vi.spyOn(api, 'get')
     get.mockResolvedValueOnce({
       data: {
@@ -632,14 +639,18 @@ describe('task log presentation', () => {
         {component('IN_PROGRESS')}
       </QueryClientProvider>
     )
-    expect(await screen.findByText('Submission Accepted')).toBeVisible()
+    expect(
+      await screen.findByRole('heading', { name: 'Submission Accepted' })
+    ).toBeVisible()
     view.rerender(
       <QueryClientProvider client={client}>
         {component('SUCCESS')}
       </QueryClientProvider>
     )
-    expect(await screen.findByText('Task Result')).toBeVisible()
-    expect(get).toHaveBeenCalledTimes(2)
+    await waitFor(() => expect(get).toHaveBeenCalledTimes(2))
+    expect(
+      screen.queryByRole('heading', { name: 'Task Result', level: 4 })
+    ).not.toBeInTheDocument()
   })
 
   test('given the event request fails, the dialog shows an error rather than an empty timeline', async () => {

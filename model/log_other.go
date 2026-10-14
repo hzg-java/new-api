@@ -238,7 +238,7 @@ func userLogOtherKey(key string) bool {
 // formatLogOtherJSON applies the role projection while keeping untouched JSON
 // values as RawMessage. This preserves integers larger than JavaScript's safe
 // range instead of round-tripping them through float64.
-func formatLogOtherJSON(value string, visibility logOtherVisibility) string {
+func formatLogOtherJSON(value string, visibility logOtherVisibility, logType int) string {
 	if value == "" {
 		return ""
 	}
@@ -254,6 +254,24 @@ func formatLogOtherJSON(value string, visibility logOtherVisibility) string {
 	changed := false
 	if visibility == logOtherVisibilityUser {
 		for key := range values {
+			if key == "op" && logType == LogTypeTopup {
+				var operation struct {
+					Action string                     `json:"action"`
+					Params map[string]json.RawMessage `json:"params"`
+				}
+				if common.Unmarshal(values[key], &operation) == nil && slices.Contains([]string{"user.quota_add", "user.quota_subtract", "user.quota_override"}, operation.Action) {
+					for param := range operation.Params {
+						if !slices.Contains([]string{"from", "to", "quota", "mode", "requested_quota", "target_user_id", "target_username"}, param) {
+							delete(operation.Params, param)
+						}
+					}
+					if encoded, err := common.Marshal(operation); err == nil {
+						values[key] = encoded
+						changed = true
+						continue
+					}
+				}
+			}
 			if !userLogOtherKey(key) {
 				delete(values, key)
 				changed = true

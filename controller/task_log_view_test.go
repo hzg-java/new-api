@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,11 +19,187 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
+
+func TestFailedTaskSubmissionErrorSnapshots(t *testing.T) {
+	for _, tc := range []struct {
+		name                                                              string
+		local, retry, success, oversized, disabled, fallback, suppressed  bool
+		want                                                              int
+		disconnected, discarded, missingResult, cancelBefore, cancelAfter bool
+	}{
+		{name: "upstream without task ID", want: 1},
+		{name: "local without task ID", local: true, want: 1},
+		{name: "retry final failure", retry: true, want: 2},
+		{name: "retry then success", retry: true, success: true, want: 1},
+		{name: "bounded details", oversized: true, want: 1},
+		{name: "logging disabled", local: true, disabled: true},
+		{name: "error policy suppressed", suppressed: true},
+		{name: "ordinary fallback", fallback: true, want: 1},
+		{name: "discarded durable response", discarded: true, want: 1},
+		{name: "disconnected missing result", disconnected: true, missingResult: true, want: 1},
+		{name: "disconnected before attempt", disconnected: true, cancelBefore: true, want: 1},
+		{name: "disconnected after submit", disconnected: true, cancelAfter: true, want: 1},
+		{name: "disconnected local attempt", disconnected: true, local: true, want: 1},
+		{name: "disconnected retry then missing result", disconnected: true, retry: true, missingResult: true, want: 2},
+		{name: "disconnected suppressed", disconnected: true, suppressed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TEST_TASK_DB_DIALECT", "sqlite")
+			db, _ := openTaskDialectDatabase(t, &model.User{}, &model.Log{}, &model.Task{}, &model.TaskEvent{}, &model.Channel{})
+			oldDB, oldLog := model.DB, model.LOG_DB
+			oldEnabled, oldRetries := constant.ErrorLogEnabled, common.RetryTimes
+			oldRedis, oldMemory := common.RedisEnabled, common.MemoryCacheEnabled
+			oldConsume := common.LogConsumeEnabled
+			common.LogConsumeEnabled = false
+			model.DB, model.LOG_DB = db, db
+			constant.ErrorLogEnabled, common.RetryTimes = !tc.disabled, 1
+			common.RedisEnabled, common.MemoryCacheEnabled = false, false
+			t.Cleanup(func() {
+				model.DB, model.LOG_DB = oldDB, oldLog
+				constant.ErrorLogEnabled, common.RetryTimes = oldEnabled, oldRetries
+				common.RedisEnabled, common.MemoryCacheEnabled = oldRedis, oldMemory
+				common.LogConsumeEnabled = oldConsume
+			})
+			require.NoError(t, db.Create(&model.User{Id: 7, Username: "snapshot-owner", AffCode: "snapshot"}).Error)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			body := `{"prompt":"original","api_key":"request-canary","count":9007199254740993}`
+			if tc.oversized {
+				body = `{"prompt":"` + strings.Repeat("x", 61*1024) + `"}`
+			}
+			c.Request = httptest.NewRequest(http.MethodPost, "/plugin/submit", strings.NewReader(body))
+			c.Request.Header.Set("Content-Type", "application/json")
+			requestContext, cancel := context.WithCancel(c.Request.Context())
+			defer cancel()
+			c.Request = c.Request.WithContext(requestContext)
+			if tc.cancelBefore {
+				cancel()
+			}
+			c.Set("id", 7)
+			c.Set("token_id", 12)
+			t.Cleanup(func() { common.CleanupBodyStorage(c) })
+			if tc.suppressed {
+				capture := installTaskEventResponseCapture(c)
+				capture.arm(c, taskEventOriginalRequest(c))
+				capture.finalError = types.NewErrorWithStatusCode(fmt.Errorf("policy rejection"), types.ErrorCodeBadResponseStatusCode, 400, types.ErrOptionWithNoRecordErrorLog())
+				service.RecordRelayErrorLog(c, 1, capture.finalError, nil)
+				if !tc.disconnected {
+					c.JSON(400, gin.H{"error": "policy rejection"})
+				}
+				capture.record()
+			} else if tc.fallback {
+				RelayTaskPluginEndpoint(c, func(c *gin.Context) {
+					service.ProcessChannelError(c, types.ChannelError{ChannelId: 1}, taskSubmissionAPIError(&dto.TaskError{Message: "ordinary", StatusCode: 400}), nil)
+					c.JSON(400, gin.H{"error": "ordinary"})
+				})
+			} else {
+				capture := installTaskEventResponseCapture(c)
+				info := taskSubmissionRelayInfo(nil)
+				info.UserId = 7
+				// A context-selected channel can be reused without channel-cache fixtures.
+				info.LockedChannel, info.ChannelMeta = nil, nil
+				c.Set("channel_id", 1)
+				attempts := 0
+				_, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, _ *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+					attempts++
+					if tc.cancelAfter {
+						cancel()
+					}
+					if tc.missingResult && (!tc.retry || attempts == 2) {
+						return nil, nil
+					}
+					if attempts == 2 && tc.success {
+						info.ChannelMeta = &relaycommon.ChannelMeta{ChannelId: 1}
+						return &relay.TaskSubmitResult{Platform: "video"}, nil
+					}
+					status := 400
+					if tc.retry && attempts == 1 {
+						status = 503
+					}
+					return nil, &dto.TaskError{Code: fmt.Sprintf("attempt_%d", attempts), Message: fmt.Sprintf("attempt %d api_key=error-canary", attempts), StatusCode: status, LocalError: tc.local}
+				})
+				if tc.success {
+					// A later successful presenter must never replace the earlier error snapshot.
+					c.JSON(200, gin.H{"result": "success-canary"})
+				} else {
+					require.NotNil(t, taskErr)
+					if tc.disconnected {
+						assert.False(t, c.Writer.Written())
+					} else {
+						respondTaskSubmissionError(c, taskErr)
+					}
+					if tc.discarded {
+						capture.task = &model.Task{ID: 1, SubmitTime: 1700000000, PrivateData: model.TaskPrivateData{ResultDiscarded: true}}
+					}
+					// Native presenters may own the final envelope; capture must use it.
+					if tc.oversized {
+						_, err := c.Writer.WriteString(strings.Repeat("x", 61*1024))
+						require.NoError(t, err)
+					}
+				}
+				capture.record()
+				capture.record()
+			}
+			var rows []*model.Log
+			require.NoError(t, db.Order("id").Find(&rows).Error)
+			require.Len(t, rows, tc.want)
+			for i, row := range rows {
+				if tc.fallback {
+					assert.NotContains(t, row.Other, "task_submission")
+					continue
+				}
+				var stored struct {
+					Admin struct {
+						Submission struct{ Request, Response json.RawMessage } `json:"task_submission"`
+					} `json:"admin_info"`
+				}
+				require.NoError(t, common.UnmarshalJsonStr(row.Other, &stored))
+				require.NotEmpty(t, stored.Admin.Submission.Request)
+				require.NotEmpty(t, stored.Admin.Submission.Response)
+				assert.LessOrEqual(t, len(stored.Admin.Submission.Request), model.TaskEventPayloadLimit)
+				assert.LessOrEqual(t, len(stored.Admin.Submission.Response), model.TaskEventPayloadLimit)
+				assert.NotContains(t, row.Other, "canary")
+				if tc.oversized {
+					assert.Contains(t, string(stored.Admin.Submission.Request), "size_limit_exceeded")
+					assert.Contains(t, string(stored.Admin.Submission.Response), "size_limit_exceeded")
+				} else {
+					assert.Contains(t, string(stored.Admin.Submission.Request), "9007199254740993")
+					assert.Contains(t, string(stored.Admin.Submission.Request), "original")
+				}
+				if tc.discarded {
+					assert.JSONEq(t, `{"unavailable":"result_discarded"}`, string(stored.Admin.Submission.Response))
+				} else if tc.disconnected && i == len(rows)-1 {
+					assert.JSONEq(t, `{"unavailable":"response_not_written"}`, string(stored.Admin.Submission.Response))
+				}
+				if !tc.success && !tc.oversized && !tc.discarded && !tc.disconnected && i == len(rows)-1 {
+					redacted, err := model.RedactTaskEventDetail(json.RawMessage(recorder.Body.Bytes()))
+					require.NoError(t, err)
+					assert.JSONEq(t, string(redacted), string(stored.Admin.Submission.Response))
+				}
+				if tc.retry && i == 0 {
+					assert.Contains(t, string(stored.Admin.Submission.Response), "attempt_1")
+					assert.NotContains(t, string(stored.Admin.Submission.Response), "attempt_2")
+				}
+				admin := *row
+				model.FormatAdminLogs([]*model.Log{&admin})
+				assert.Contains(t, admin.Other, "task_submission")
+			}
+			userRows, err := model.GetLogByTokenId(12)
+			require.NoError(t, err)
+			for _, row := range userRows {
+				assert.NotContains(t, row.Other, "task_submission")
+				assert.NotContains(t, row.Other, "original")
+			}
+		})
+	}
+}
 
 func TestVideoTaskDisplayBillingProjection(t *testing.T) {
 	for _, tc := range []struct {
@@ -235,6 +412,102 @@ func TestTaskEventsMigrateTwiceWithoutLosingHistoricalTasks(t *testing.T) {
 	var loaded model.Task
 	require.NoError(t, db.First(&loaded, task.ID).Error)
 	assert.Equal(t, "historical", loaded.TaskID)
+}
+
+func TestLogTaskEventsAdminSubmissionView(t *testing.T) {
+	db, _ := openTaskDialectDatabase(t, &model.Task{}, &model.TaskEvent{}, &model.Log{})
+	previousDB := model.DB
+	model.DB = db
+	t.Cleanup(func() { model.DB = previousDB })
+	tasks := []model.Task{
+		{TaskID: "shared-public-id", UserId: 7},
+		{TaskID: "shared-public-id", UserId: 8},
+		{TaskID: "ambiguous", UserId: 7},
+		{TaskID: "ambiguous", UserId: 7},
+		{TaskID: "historical", UserId: 7},
+	}
+	require.NoError(t, db.Create(&tasks).Error)
+	// Seed historical, unsanitized details directly to verify read-time redaction.
+	events := []model.TaskEvent{
+		{TaskID: tasks[0].ID, Kind: "request", Timestamp: 1, Payload: `{"admin_info":{"complete":true,"payload":{"prompt":"owner-seven","api_key":"key-canary","nested":{"authorization":"Bearer bearer-canary"},"url":"https://user:pass@cdn.example/input?token=url-canary&width=720","count":9007199254740993}}}`},
+		{TaskID: tasks[0].ID, Kind: "accepted", Timestamp: 2, Payload: `{"admin_info":{"complete":true,"payload":{"body":{"id":"shared-public-id","status":"queued","token":"response-canary"}}}}`},
+		{TaskID: tasks[0].ID, Kind: "result", Timestamp: 3, Payload: `{"status":"result-hidden"}`},
+		{TaskID: tasks[0].ID, Kind: "future-kind", Timestamp: 4, Payload: `{"message":"future-hidden"}`},
+		{TaskID: tasks[1].ID, Kind: "request", Timestamp: 1, Payload: `{"model":"owner-eight"}`},
+	}
+	require.NoError(t, db.Create(&events).Error)
+	logs := []model.Log{{UserId: 7, Type: model.LogTypeConsume, Other: `{"task_id":"shared-public-id"}`}}
+	require.NoError(t, db.Create(&logs).Error)
+	for _, tc := range []struct {
+		name, query                string
+		role, token, status, count int
+		want                       string
+	}{
+		{"admin", "task_id=shared-public-id&user_id=7", common.RoleAdminUser, 0, 200, 2, "owner-seven"},
+		{"root", "task_id=shared-public-id&user_id=7", common.RoleRootUser, 0, 200, 2, "owner-seven"},
+		{"other owner", "task_id=shared-public-id&user_id=8", common.RoleAdminUser, 0, 200, 1, "owner-eight"},
+		{"ordinary owner", "task_id=shared-public-id&user_id=7", common.RoleCommonUser, 0, 403, 0, ""},
+		{"guest", "task_id=shared-public-id&user_id=7", common.RoleGuestUser, 0, 403, 0, ""},
+		{"admin token", "task_id=shared-public-id&user_id=7", common.RoleAdminUser, 1, 403, 0, ""},
+		{"root token", "task_id=shared-public-id&user_id=7", common.RoleRootUser, 1, 403, 0, ""},
+		{"missing", "task_id=missing&user_id=7", common.RoleAdminUser, 0, 404, 0, ""},
+		{"wrong owner", "task_id=shared-public-id&user_id=9", common.RoleAdminUser, 0, 404, 0, ""},
+		{"ambiguous", "task_id=ambiguous&user_id=7", common.RoleAdminUser, 0, 409, 0, ""},
+		{"historical", "task_id=historical&user_id=7", common.RoleAdminUser, 0, 200, 0, ""},
+		{"no task", "user_id=7", common.RoleAdminUser, 0, 400, 0, ""},
+		{"no owner", "task_id=shared-public-id", common.RoleAdminUser, 0, 400, 0, ""},
+		{"invalid owner", "task_id=shared-public-id&user_id=abc", common.RoleAdminUser, 0, 400, 0, ""},
+		{"zero owner", "task_id=shared-public-id&user_id=0", common.RoleAdminUser, 0, 400, 0, ""},
+		{"negative owner", "task_id=shared-public-id&user_id=-7", common.RoleAdminUser, 0, 400, 0, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, "/api/log/task-events?"+tc.query, nil)
+			c.Set("id", 7)
+			c.Set("role", tc.role)
+			c.Set("token_id", tc.token)
+			GetLogTaskEvents(c)
+			require.Equal(t, tc.status, recorder.Code, recorder.Body.String())
+			assert.Contains(t, recorder.Header().Get("Cache-Control"), "no-store")
+			var response struct {
+				Success bool              `json:"success"`
+				Data    []model.TaskEvent `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			assert.Equal(t, tc.status == 200, response.Success)
+			assert.Len(t, response.Data, tc.count)
+			body := recorder.Body.String()
+			assert.NotContains(t, body, "canary")
+			assert.NotContains(t, body, "user:pass")
+			assert.NotContains(t, body, "result-hidden")
+			assert.NotContains(t, body, "future-hidden")
+			if tc.want != "" {
+				assert.Contains(t, body, tc.want)
+			}
+			if tc.count == 2 {
+				assert.Equal(t, "request", response.Data[0].Kind)
+				assert.Equal(t, "accepted", response.Data[1].Kind)
+				assert.Contains(t, response.Data[0].Payload, "9007199254740993")
+				assert.Contains(t, response.Data[0].Payload, "width=720")
+				require.NotNil(t, response.Data[0].DetailComplete)
+				assert.True(t, *response.Data[0].DetailComplete)
+				assert.NotContains(t, body, "owner-eight")
+			}
+			if tc.name == "historical" {
+				assert.Contains(t, body, `"data":[]`)
+			}
+		})
+	}
+	var afterTasks []model.Task
+	var afterEvents []model.TaskEvent
+	var afterLogs []model.Log
+	require.NoError(t, db.Order("id").Find(&afterTasks).Error)
+	require.NoError(t, db.Order("id").Find(&afterEvents).Error)
+	require.NoError(t, db.Order("id").Find(&afterLogs).Error)
+	assert.Equal(t, tasks, afterTasks)
+	assert.Equal(t, events, afterEvents)
+	assert.Equal(t, logs, afterLogs)
 }
 
 func TestTaskEventTimelinePreservesSafeSnapshotsAndOwnership(t *testing.T) {

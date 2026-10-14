@@ -147,6 +147,10 @@ export interface LogOtherData {
     // Reject / intercept reason (admin only)
     reject_reason?: string
     task_plugin?: TaskPluginInfo
+    task_submission?: {
+      request?: unknown
+      response?: unknown
+    }
   }
   root_info?: {
     task_plugin?: TaskPluginRuntimeInfo
@@ -281,6 +285,7 @@ export interface LogStatistics {
   quota: number
   rpm: number
   tpm: number
+  total_tokens: number
 }
 
 // ============================================================================

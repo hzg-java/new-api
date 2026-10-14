@@ -88,7 +88,7 @@ func TestUserLogBillingPrivacy(t *testing.T) {
 	const stored = `{"model_ratio":1.23,"completion_ratio":2,"cache_ratio":0.1,"cache_creation_ratio":1.2,"cache_creation_ratio_5m":1.3,"cache_creation_ratio_1h":2,"group_ratio":0.8,"user_group_ratio":0.7,"audio_ratio":4,"audio_completion_ratio":5,"image_ratio":6,"audio_input_price":7,"model_price":0.004,"fixed_price":0.1,"expr_b64":"secret-expression","request_rules":{"multiplier":3},"custom_multiplier":8,"custom_string_multiplier":"9.2","custom_nested":{"price":10},"request_path":"/v1/videos","is_task":true,"task_id":"public-task","image_count":2,"cache_tokens":9007199254740993,"usage_facts":{"tokens":12,"seconds":5},"billing_tokens":{"p":12,"c":0},"pre_consumed_quota":100,"actual_quota":80,"billing_mode":"tiered_expr","tool_surcharges":[{"name":"search","count":2,"price":10}],"admin_info":{"diagnostic":true}}`
 	for _, visibility := range []logOtherVisibility{logOtherVisibilityUser, logOtherVisibilityAdmin, logOtherVisibilityRoot} {
 		t.Run([]string{"user", "admin", "root"}[visibility], func(t *testing.T) {
-			formatted := formatLogOtherJSON(stored, visibility)
+			formatted := formatLogOtherJSON(stored, visibility, LogTypeConsume)
 			if visibility != logOtherVisibilityUser {
 				assert.Equal(t, stored, formatted)
 				return
@@ -99,9 +99,31 @@ func TestUserLogBillingPrivacy(t *testing.T) {
 	}
 }
 
+func TestUserTopupLogsRetainBalanceSnapshots(t *testing.T) {
+	for _, action := range []string{"user.quota_add", "user.quota_subtract", "user.quota_override", "user.delete"} {
+		for _, logType := range []int{LogTypeTopup, LogTypeConsume} {
+			stored, err := common.Marshal(map[string]any{
+				"op": map[string]any{"action": action, "secret": "private", "params": map[string]any{
+					"from": 500000, "to": 1000000, "quota": 500000, "internal_price": 123,
+				}},
+				"admin_info": map[string]any{"admin_username": "private"},
+				"root_info":  map[string]any{"secret": "private"},
+			})
+			require.NoError(t, err)
+			log := &Log{Type: logType, Other: string(stored)}
+			formatUserLogs([]*Log{log}, 0)
+			if logType != LogTypeTopup || action == "user.delete" {
+				assert.JSONEq(t, `{}`, log.Other)
+				continue
+			}
+			assert.JSONEq(t, `{"op":{"action":"`+action+`","params":{"from":500000,"to":1000000,"quota":500000}}}`, log.Other)
+		}
+	}
+}
+
 func TestUserLogsRetainLegacyToolUsageAndChargedQuota(t *testing.T) {
 	const stored = `{"web_search":true,"web_search_call_count":2,"web_search_price":5,"file_search":true,"file_search_call_count":1,"file_search_price":3,"image_generation_call":true,"image_generation_call_count":4,"image_generation_call_price":10,"violation_fee":true,"fee_quota":50,"violation_fee_code":"policy","violation_fee_marker":"blocked"}`
-	assert.JSONEq(t, `{"web_search":true,"web_search_call_count":2,"file_search":true,"file_search_call_count":1,"image_generation_call":true,"image_generation_call_count":4,"violation_fee":true,"fee_quota":50,"violation_fee_code":"policy","violation_fee_marker":"blocked"}`, formatLogOtherJSON(stored, logOtherVisibilityUser))
+	assert.JSONEq(t, `{"web_search":true,"web_search_call_count":2,"file_search":true,"file_search_call_count":1,"image_generation_call":true,"image_generation_call_count":4,"violation_fee":true,"fee_quota":50,"violation_fee_code":"policy","violation_fee_marker":"blocked"}`, formatLogOtherJSON(stored, logOtherVisibilityUser, LogTypeConsume))
 }
 
 func TestUserTaskLogContentPrivacy(t *testing.T) {

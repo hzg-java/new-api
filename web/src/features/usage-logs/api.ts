@@ -114,6 +114,19 @@ export const getAllTaskLogs = (params: GetTaskLogsParams) =>
 export const getUserTaskLogs = (params: GetTaskLogsParams) =>
   fetchLogs('/api/task', params, false)
 
+export async function getLogTaskEvents(
+  taskId: string,
+  userId: number,
+  signal?: AbortSignal
+): Promise<TaskEventsResponse> {
+  const params = buildQueryParams({ task_id: taskId, user_id: userId })
+  const response = await api.get<TaskEventsResponse>(
+    `/api/log/task-events?${params}`,
+    { signal, disableDuplicate: true }
+  )
+  return response.data
+}
+
 export async function getTaskEvents(
   taskId: number
 ): Promise<TaskEventsResponse> {

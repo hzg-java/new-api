@@ -74,6 +74,11 @@ func serveTaskPluginImageProtocol(c *gin.Context, pinned pluginruntime.PinnedEnd
 		}
 		outcome, taskErr = deps.submit(c, relayInfo)
 	}()
+	if taskErr != nil {
+		installTaskEventResponseCapture(c).finalError = taskSubmissionAPIError(taskErr)
+	} else if relayInfoErr != nil {
+		installTaskEventResponseCapture(c).finalError = types.NewErrorWithStatusCode(relayInfoErr, types.ErrorCodeBadResponseStatusCode, http.StatusInternalServerError)
+	}
 	if clientRequest.Context().Err() != nil {
 		// The client is gone. A durable task keeps its settlement and consume
 		// log; an asynchronous one is finished by the background poller.
@@ -228,6 +233,7 @@ func taskPluginImageResponseFormat(request pluginruntime.ProtocolRequestContext)
 // API. DashScope failure bodies arrive as JSON {code, message}; their message
 // is surfaced so a client sees the vendor reason instead of raw JSON.
 func respondTaskPluginImageError(c *gin.Context, taskErr *dto.TaskError) {
+	installTaskEventResponseCapture(c).finalError = taskSubmissionAPIError(taskErr)
 	service.RecordRequestPolicyTermination(c, taskSubmissionAPIError(taskErr))
 	status := http.StatusInternalServerError
 	if taskErr.StatusCode >= 400 && taskErr.StatusCode <= 599 {
