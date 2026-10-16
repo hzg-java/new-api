@@ -151,6 +151,10 @@ export interface LogOtherData {
       request?: unknown
       response?: unknown
     }
+    relay_error?: {
+      request?: unknown
+      response?: unknown
+    }
   }
   root_info?: {
     task_plugin?: TaskPluginRuntimeInfo

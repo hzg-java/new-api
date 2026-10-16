@@ -74,6 +74,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		c.Writer = &chatCompletionResponseWriter{ResponseWriter: c.Writer}
 	}
 
+	var errorCapture *taskEventResponseCapture
+	if relayFormat != types.RelayFormatOpenAIRealtime && constant.ErrorLogEnabled {
+		errorCapture = installRelayErrorCapture(c)
+		defer errorCapture.record()
+	}
+
 	requestId := c.GetString(common.RequestIdKey)
 	//group := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
 	//originalModel := common.GetContextKeyString(c, constant.ContextKeyOriginalModel)
@@ -95,6 +101,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	defer func() {
 		if newAPIError != nil {
+			if errorCapture != nil {
+				errorCapture.finalError = newAPIError
+			}
 			service.RecordRequestPolicyTermination(c, newAPIError)
 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
@@ -105,6 +114,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				c.JSON(newAPIError.StatusCode, gin.H{
 					"type":  "error",
 					"error": newAPIError.ToClaudeError(),
+				})
+			case types.RelayFormatOpenAI, types.RelayFormatOpenAIImage, types.RelayFormatOpenAIAudio, types.RelayFormatOpenAIResponses, types.RelayFormatOpenAIResponsesCompaction, types.RelayFormatOpenAIAlphaSearch, types.RelayFormatEmbedding:
+				c.JSON(newAPIError.StatusCode, gin.H{
+					"error": newAPIError.ToOpenAIRelayError(),
 				})
 			default:
 				c.JSON(newAPIError.StatusCode, gin.H{
@@ -493,6 +506,7 @@ type taskEventResponseCapture struct {
 	task                            *model.Task
 	context                         *gin.Context
 	request, attemptError           json.RawMessage
+	detailKey                       string
 	pending                         []taskSubmissionErrorLog
 	finalErrorLog                   *model.Log
 	finalError                      *types.NewAPIError
@@ -521,8 +535,17 @@ func (w *taskEventResponseCapture) arm(c *gin.Context, request any) {
 		return
 	}
 	w.context = c
+	if w.detailKey == "" {
+		w.detailKey = "task_submission"
+	}
 	w.request = safeTaskSubmissionDetail(request)
 	c.Set(model.ContextKeyErrorLogCollector, func(log *model.Log, write func()) {
+		if w.detailKey == "relay_error" && len(w.pending) == 0 {
+			mediaType, _, _ := mime.ParseMediaType(c.Request.Header.Get("Content-Type"))
+			if mediaType == "application/json" {
+				w.request = safeTaskSubmissionDetail(taskEventOriginalRequest(c))
+			}
+		}
 		var other map[string]json.RawMessage
 		_ = common.UnmarshalJsonStr(log.Other, &other)
 		if other == nil {
@@ -537,13 +560,20 @@ func (w *taskEventResponseCapture) arm(c *gin.Context, request any) {
 		if response == nil {
 			response = safeTaskSubmissionDetail(map[string]any{"message": log.Content})
 		}
-		admin["task_submission"], _ = common.Marshal(map[string]json.RawMessage{"request": w.request, "response": response})
+		admin[w.detailKey], _ = common.Marshal(map[string]json.RawMessage{"request": w.request, "response": response})
 		other["admin_info"], _ = common.Marshal(admin)
 		encoded, _ := common.Marshal(other)
 		log.Other = string(encoded)
 		w.pending = append(w.pending, taskSubmissionErrorLog{log: log, write: write})
 		w.finalErrorLog = log
 	})
+}
+
+func installRelayErrorCapture(c *gin.Context) *taskEventResponseCapture {
+	capture := &taskEventResponseCapture{ResponseWriter: c.Writer, detailKey: "relay_error"}
+	capture.arm(c, map[string]any{"unavailable": "unsupported_content_type"})
+	c.Writer = capture
+	return capture
 }
 
 func installTaskEventResponseCapture(c *gin.Context) *taskEventResponseCapture {
@@ -562,6 +592,9 @@ func (w *taskEventResponseCapture) Write(data []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(data)
 	if err != nil {
 		w.writeFailed = true
+	}
+	if w.detailKey == "relay_error" && w.finalError == nil && w.Status() < http.StatusBadRequest {
+		return n, err
 	}
 	if !w.overflow {
 		if w.body.Len()+n > model.TaskEventPayloadLimit {
@@ -617,7 +650,7 @@ func (w *taskEventResponseCapture) record() {
 				_ = common.UnmarshalJsonStr(pending.log.Other, &other)
 				var admin map[string]json.RawMessage
 				_ = common.Unmarshal(other["admin_info"], &admin)
-				admin["task_submission"], _ = common.Marshal(map[string]json.RawMessage{"request": w.request, "response": response})
+				admin[w.detailKey], _ = common.Marshal(map[string]json.RawMessage{"request": w.request, "response": response})
 				other["admin_info"], _ = common.Marshal(admin)
 				encoded, _ := common.Marshal(other)
 				pending.log.Other = string(encoded)

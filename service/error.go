@@ -86,12 +86,14 @@ func ClaudeErrorWrapperLocal(err error, code string, statusCode int) *dto.Claude
 
 func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFail bool) (newApiErr *types.NewAPIError) {
 	newApiErr = types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
-
+	response := types.OpenAIError{Type: "bad_response_status_code"}
+	defer func() { types.ErrOptionWithUpstreamResponse(response)(newApiErr) }()
+	defer CloseResponseBodyGracefully(resp)
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		response.Message = "failed to read response: " + err.Error()
 		return
 	}
-	CloseResponseBodyGracefully(resp)
 	var errResponse dto.GeneralErrorResponse
 	responseBodyText := string(responseBody)
 	responseBodyPreview := common.LocalLogPreview(responseBodyText)
@@ -104,6 +106,10 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 
 	err = common.Unmarshal(responseBody, &errResponse)
 	if err != nil {
+		response.Message = strings.TrimSpace(responseBodyText)
+		if response.Message == "" {
+			response.Message = "Response is empty"
+		}
 		if showBodyWhenFail {
 			newApiErr.Err = buildErrWithBody("")
 		} else {
@@ -111,6 +117,39 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 			newApiErr.Err = fmt.Errorf("bad response status code %d", resp.StatusCode)
 		}
 		return
+	}
+	var topLevel struct {
+		Code  any    `json:"code"`
+		Type  string `json:"type"`
+		Param string `json:"param"`
+	}
+	if common.Unmarshal(responseBody, &topLevel) == nil {
+		response.Code = topLevel.Code
+		if topLevel.Type != "" {
+			response.Type = topLevel.Type
+		}
+		response.Param = topLevel.Param
+	}
+	response.Message = errResponse.ToMessage()
+	if response.Message == "" {
+		var details struct {
+			Reason string `json:"reason"`
+		}
+		if common.Unmarshal(responseBody, &details) == nil {
+			response.Message = details.Reason
+		}
+	}
+	if strings.TrimSpace(responseBodyText) == "" {
+		response.Message = "Response is empty"
+	}
+	if common.GetJsonType(errResponse.Error) == "object" {
+		var parsed types.OpenAIError
+		if common.Unmarshal(errResponse.Error, &parsed) == nil {
+			if parsed.Message == "" {
+				parsed.Message = response.Message
+			}
+			response = parsed
+		}
 	}
 
 	if common.GetJsonType(errResponse.Error) == "object" {

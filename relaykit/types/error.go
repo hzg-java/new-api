@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
@@ -88,14 +90,17 @@ const (
 )
 
 type NewAPIError struct {
-	Err            error
-	RelayError     any
-	skipRetry      bool
-	recordErrorLog *bool
-	errorType      ErrorType
-	errorCode      ErrorCode
-	StatusCode     int
-	Metadata       json.RawMessage
+	Err                   error
+	RelayError            any
+	skipRetry             bool
+	recordErrorLog        *bool
+	errorType             ErrorType
+	errorCode             ErrorCode
+	StatusCode            int
+	Metadata              json.RawMessage
+	upstreamResponse      *OpenAIError
+	transportError        error
+	responseMessageSuffix string
 }
 
 // Unwrap enables errors.Is / errors.As to work with NewAPIError by exposing the underlying error.
@@ -174,8 +179,17 @@ func (e *NewAPIError) MaskSensitiveErrorWithStatusCode() string {
 }
 
 func (e *NewAPIError) SetMessage(message string) {
+	if e.upstreamResponse != nil || e.transportError != nil {
+		if strings.HasPrefix(message, e.Error()) {
+			e.responseMessageSuffix += strings.TrimPrefix(message, e.Error())
+		} else {
+			e.responseMessageSuffix = ""
+		}
+	}
 	e.Err = errors.New(message)
 }
+
+var upstreamMessageWord = regexp.MustCompile(`(?i)\bupstream\b[ \t]*`)
 
 func (e *NewAPIError) ToOpenAIError() OpenAIError {
 	var result OpenAIError
@@ -208,6 +222,60 @@ func (e *NewAPIError) ToOpenAIError() OpenAIError {
 		result.Message = string(e.errorType)
 	}
 	return result
+}
+
+var relayErrorSecrets = regexp.MustCompile(`(?i)(["']?(?:api[_-]?key|authorization|proxy-authorization|cookie|set-cookie|password|access_token|refresh_token|secret)["']?\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\r\n,;]+)`)
+var relayErrorBearer = regexp.MustCompile(`(?i)\bBearer\s+[^\s"',;]+`)
+var relayErrorKey = regexp.MustCompile(`\b(?:sk|AIza)[-_A-Za-z0-9]{6,}\b`)
+var relayErrorSourcePrefix = regexp.MustCompile(`(?i)^\s*(?:upstream\s*(?:error\s*)?:?\s*|error:\s*|bad response status code\s+\d+\s*[,;:]?\s*|(?:body|message):\s*)`)
+
+func (e *NewAPIError) ToOpenAIRelayError() OpenAIError {
+	if e.upstreamResponse == nil && e.transportError == nil {
+		return e.ToOpenAIError()
+	}
+	result := OpenAIError{Type: "api_error", Code: e.StatusCode}
+	if e.upstreamResponse != nil {
+		result = *e.upstreamResponse
+		if result.Code == nil || result.Code == "" {
+			result.Code = e.StatusCode
+		}
+	} else {
+		err := e.transportError
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			err = urlErr.Err
+		}
+		result.Message = err.Error()
+	}
+	result.Message = relayErrorSecrets.ReplaceAllString(result.Message, "${1}***")
+	result.Message = relayErrorBearer.ReplaceAllString(result.Message, "Bearer ***")
+	result.Message = relayErrorKey.ReplaceAllString(result.Message, "***")
+	result.Message = kitutil.MaskSensitiveInfo(result.Message)
+	for {
+		cleaned := relayErrorSourcePrefix.ReplaceAllString(result.Message, "")
+		if cleaned == result.Message {
+			break
+		}
+		result.Message = cleaned
+	}
+	result.Message = strings.TrimSpace(upstreamMessageWord.ReplaceAllString(result.Message, ""))
+	if result.Message == "" {
+		result.Message = "Request failed"
+	}
+	if result.Type == "" || result.Type == string(ErrorTypeNewAPIError) {
+		result.Type = "api_error"
+	}
+	result.Metadata = nil
+	result.Message += e.responseMessageSuffix
+	return result
+}
+
+func ErrOptionWithUpstreamResponse(response OpenAIError) NewAPIErrorOptions {
+	return func(e *NewAPIError) { e.upstreamResponse = &response }
+}
+
+func ErrOptionWithTransportError(err error) NewAPIErrorOptions {
+	return func(e *NewAPIError) { e.transportError = err }
 }
 
 func (e *NewAPIError) ToClaudeError() ClaudeError {

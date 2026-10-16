@@ -27,6 +27,79 @@ import (
 	"gorm.io/gorm"
 )
 
+func TestRelayErrorSnapshots(t *testing.T) {
+	t.Setenv("TEST_TASK_DB_DIALECT", "sqlite")
+	db, _ := openTaskDialectDatabase(t, &model.User{}, &model.Log{})
+	oldDB, oldLog, oldEnabled := model.DB, model.LOG_DB, constant.ErrorLogEnabled
+	oldRedis, oldMemory := common.RedisEnabled, common.MemoryCacheEnabled
+	common.RedisEnabled, common.MemoryCacheEnabled = false, false
+	model.DB, model.LOG_DB, constant.ErrorLogEnabled = db, db, true
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB, constant.ErrorLogEnabled = oldDB, oldLog, oldEnabled
+		common.RedisEnabled, common.MemoryCacheEnabled = oldRedis, oldMemory
+	})
+	require.NoError(t, db.Create(&model.User{Id: 7, Username: "relay-owner", AffCode: "relay"}).Error)
+	for _, tc := range []struct{ name, body string }{
+		{"json", `{"model":"original","api_key":"secret-canary","count":9007199254740993}`},
+		{"oversized", `{"prompt":"` + strings.Repeat("x", model.TaskEventPayloadLimit+1) + `"}`},
+		{"invalid", `{"broken"`},
+		{"relay handler", `{"broken"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(tc.body))
+			c.Request.Header.Set("Content-Type", "application/json")
+			c.Set("id", 7)
+			c.Set("token_id", 12)
+			t.Cleanup(func() { common.CleanupBodyStorage(c) })
+			if tc.name == "relay handler" {
+				Relay(c, types.RelayFormatOpenAI)
+			} else {
+				capture := installRelayErrorCapture(c)
+				service.RecordRelayErrorLog(c, 1, types.NewErrorWithStatusCode(fmt.Errorf("failure"), types.ErrorCodeBadResponseStatusCode, 400), nil)
+				c.JSON(400, gin.H{"error": gin.H{"message": "failure", "api_key": "secret-canary"}})
+				capture.record()
+			}
+			var row model.Log
+			require.NoError(t, db.Order("id desc").First(&row).Error)
+			var stored struct {
+				Admin struct {
+					Detail struct{ Request, Response json.RawMessage } `json:"relay_error"`
+				} `json:"admin_info"`
+			}
+			require.NoError(t, common.UnmarshalJsonStr(row.Other, &stored))
+			require.NotEmpty(t, stored.Admin.Detail.Request)
+			require.NotEmpty(t, stored.Admin.Detail.Response)
+			assert.NotContains(t, row.Other, "secret-canary")
+			redactedResponse, err := model.RedactTaskEventDetail(json.RawMessage(recorder.Body.Bytes()))
+			require.NoError(t, err)
+			assert.JSONEq(t, string(redactedResponse), string(stored.Admin.Detail.Response))
+			storage, err := common.GetBodyStorage(c)
+			require.NoError(t, err)
+			original, err := io.ReadAll(storage)
+			require.NoError(t, err)
+			assert.Equal(t, tc.body, string(original))
+			if tc.name == "json" {
+				assert.Contains(t, string(stored.Admin.Detail.Request), "9007199254740993")
+			}
+			if tc.name == "oversized" {
+				assert.Contains(t, string(stored.Admin.Detail.Request), "size_limit_exceeded")
+			}
+			if tc.name == "invalid" {
+				assert.Contains(t, string(stored.Admin.Detail.Request), "non_json_request")
+			}
+			model.FormatAdminLogs([]*model.Log{&row})
+			assert.Contains(t, row.Other, "relay_error")
+			rows, err := model.GetLogByTokenId(12)
+			require.NoError(t, err)
+			for _, userRow := range rows {
+				assert.NotContains(t, userRow.Other, "relay_error")
+			}
+		})
+	}
+}
+
 func TestFailedTaskSubmissionErrorSnapshots(t *testing.T) {
 	for _, tc := range []struct {
 		name                                                              string

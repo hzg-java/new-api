@@ -489,7 +489,11 @@ export function DetailsDialog(props: DetailsDialogProps) {
     props.isAdmin &&
     (viewer?.role ?? ROLE.GUEST) >= ROLE.ADMIN &&
     props.log.type === 5 &&
-    !!(other?.admin_info?.task_submission || other?.admin_info?.task_plugin)
+    !!(
+      other?.admin_info?.relay_error ||
+      other?.admin_info?.task_submission ||
+      other?.admin_info?.task_plugin
+    )
   const showTaskEvents =
     props.open &&
     props.isAdmin &&
@@ -781,7 +785,10 @@ export function DetailsDialog(props: DetailsDialogProps) {
 
         {showFailedSubmission && (
           <FailedTaskSubmission
-            submission={other?.admin_info?.task_submission}
+            submission={
+              other?.admin_info?.relay_error ??
+              other?.admin_info?.task_submission
+            }
           />
         )}
 

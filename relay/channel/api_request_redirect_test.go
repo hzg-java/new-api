@@ -2,6 +2,8 @@ package channel
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,11 +12,33 @@ import (
 	"testing"
 
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestDoRequestPreservesTransportFailure(t *testing.T) {
+	service.InitHttpClient()
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/relay", nil)
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, "https://upstream.invalid/images?key=secret-value", bytes.NewReader(nil))
+	require.NoError(t, err)
+	resp, err := doRequest(ctx, req, &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}})
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.False(t, errors.Is(err, context.Canceled))
+	var apiErr *types.NewAPIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, "upstream error: do request failed", apiErr.ToOpenAIError().Message)
+	out := apiErr.ToOpenAIRelayError()
+	assert.Contains(t, out.Message, "context canceled")
+	assert.NotContains(t, out.Message, "secret-value")
+	assert.NotContains(t, out.Message, "upstream.invalid")
+}
 
 func TestDoRequestReturnsUpstreamRedirectWithoutFollowing(t *testing.T) {
 	service.InitHttpClient()

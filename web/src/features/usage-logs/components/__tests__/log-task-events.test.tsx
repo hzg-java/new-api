@@ -93,7 +93,9 @@ describe('task events in consumption details', () => {
     const dialog = screen.getByRole('dialog')
     expect(dialog.classList.contains('sm:max-w-4xl')).toBe(true)
     expect(dialog.classList.contains('lg:max-w-5xl')).toBe(true)
-    expect(dialog.classList.contains('max-sm:w-[calc(100vw-1.5rem)]')).toBe(true)
+    expect(dialog.classList.contains('max-sm:w-[calc(100vw-1.5rem)]')).toBe(
+      true
+    )
   })
 
   test('failed submission without task ID displays saved request and error response', () => {
@@ -125,6 +127,51 @@ describe('task events in consumption details', () => {
     )
     expect(get).not.toHaveBeenCalled()
   })
+
+  test.each([true, false])(
+    'relay error snapshots respect administrator visibility (%s)',
+    (isAdmin) => {
+      useAuthStore
+        .getState()
+        .auth.setUser({
+          id: 7,
+          username: 'viewer',
+          role: isAdmin ? ROLE.ADMIN : ROLE.USER,
+        })
+      render(
+        details({
+          isAdmin,
+          log: {
+            ...log,
+            type: 5,
+            other: JSON.stringify({
+              admin_info: {
+                relay_error: {
+                  request: { messages: [{ content: 'relay-request-canary' }] },
+                  response: { error: { message: 'relay-response-canary' } },
+                },
+              },
+            }),
+          },
+        })
+      )
+      if (isAdmin) {
+        expect(
+          screen.getByRole('textbox', { name: 'User Request' })
+        ).toHaveTextContent('relay-request-canary')
+        expect(
+          screen.getByRole('textbox', { name: 'Response' })
+        ).toHaveTextContent('relay-response-canary')
+      } else {
+        expect(
+          screen.queryByRole('textbox', { name: 'User Request' })
+        ).not.toBeInTheDocument()
+        expect(
+          screen.queryByText(/relay-response-canary/)
+        ).not.toBeInTheDocument()
+      }
+    }
+  )
 
   test('historical failed task submission marks missing bodies as not recorded', () => {
     render(
