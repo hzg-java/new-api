@@ -622,7 +622,7 @@ describe('TopenRouter configuration', () => {
     expect(toggle).toHaveAttribute('aria-checked', 'false')
     expect(
       screen.getByText(
-        'TopenRouter material integration is unavailable. Enable it on the backend, then reload this page.'
+        'TopenRouter material integration is unavailable. Check the backend service, then reload this page.'
       )
     ).toBeVisible()
     const save = screen.getByRole('button', { name: 'Save configuration' })

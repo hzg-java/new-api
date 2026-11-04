@@ -89,9 +89,6 @@ func topenRouterMaterialConfigBinding(raw string) (int, string, error) {
 func GetTopenRouterMaterialConfigView() (*TopenRouterMaterialConfigView, error) {
 	view := &TopenRouterMaterialConfigView{Endpoint: TopenRouterMaterialDefaultEndpoint}
 	raw, err := model.ReadMaterialIntegrationConfig(model.TopenRouterMaterialConfigOption)
-	if errors.Is(err, model.ErrMobileCloudMaterialTestOnly) {
-		return view, nil
-	}
 	if err != nil {
 		return nil, ErrTopenRouterMaterialConfig
 	}
@@ -176,7 +173,7 @@ func SaveTopenRouterMaterialConfiguration(input TopenRouterMaterialConfiguration
 		sealed := aead.Seal(nonce, nonce, plain, []byte(model.TopenRouterMaterialConfigOption+":v2:"+binding))
 		return "v2." + binding + "." + base64.StdEncoding.EncodeToString(sealed), nil
 	})
-	if err != nil && !errors.Is(err, model.ErrMobileCloudMaterialTestOnly) && !errors.Is(err, ErrTopenRouterMaterialInput) && !errors.Is(err, ErrMobileCloudMaterialEncryption) {
+	if err != nil && !errors.Is(err, ErrTopenRouterMaterialInput) && !errors.Is(err, ErrMobileCloudMaterialEncryption) {
 		return ErrTopenRouterMaterialConfig
 	}
 	return err

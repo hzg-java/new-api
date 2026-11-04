@@ -512,7 +512,7 @@ describe('Mobile Cloud configuration', () => {
       enabled: false,
       encryption_ready: true,
       instruction:
-        /Enable the Mobile Cloud material integration on the test backend/,
+        'Mobile Cloud material integration is unavailable. Check the backend service, then reload this page.',
     },
   ])(
     'disables saving and explains setup when available=$available and encryption_ready=$encryption_ready',

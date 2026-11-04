@@ -7,7 +7,6 @@ import (
 	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
@@ -38,9 +37,6 @@ func UpdateMobileCloudMaterialConfig(c *gin.Context) {
 	}
 	if err := service.SaveMobileCloudMaterialConfiguration(input); err != nil {
 		status := http.StatusServiceUnavailable
-		if errors.Is(err, model.ErrMobileCloudMaterialTestOnly) {
-			status = http.StatusForbidden
-		}
 		if errors.Is(err, service.ErrMobileCloudMaterialInput) {
 			status = http.StatusBadRequest
 		}

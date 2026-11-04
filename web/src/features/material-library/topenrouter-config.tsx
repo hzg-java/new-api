@@ -172,7 +172,7 @@ function TopenRouterConfigForm(props: { config: TopenRouterConfig }) {
           <Alert>
             <AlertDescription>
               {t(
-                'TopenRouter material integration is unavailable. Enable it on the backend, then reload this page.'
+                'TopenRouter material integration is unavailable. Check the backend service, then reload this page.'
               )}
             </AlertDescription>
           </Alert>

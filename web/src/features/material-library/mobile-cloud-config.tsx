@@ -167,7 +167,7 @@ function MobileCloudConfigForm(props: { config: MobileCloudConfig }) {
           <Alert>
             <AlertDescription>
               {t(
-                'Enable the Mobile Cloud material integration on the test backend, then reload this page. This setup is for testing only; do not use a production backend.'
+                'Mobile Cloud material integration is unavailable. Check the backend service, then reload this page.'
               )}
             </AlertDescription>
           </Alert>

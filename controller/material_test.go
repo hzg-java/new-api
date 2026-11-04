@@ -751,7 +751,7 @@ func TestAIGCMaterialDailyGroups(t *testing.T) {
 			assert.Equal(t, tc.groupID, binding.GroupID)
 			assert.Equal(t, tc.groupName, provider.groupName)
 			assert.Equal(t, 1, provider.groups, "one group per user, resource space and day")
-			assert.NotEmpty(t, provider.groupDescription, "daily names need a distinct recovery ownership marker")
+			assert.False(t, provider.groupDescriptionProvided, "group creation must omit the description parameter")
 			materials = append(materials, material)
 		})
 	}
@@ -792,21 +792,24 @@ func TestAIGCMaterialDailyGroupUnknownRecovery(t *testing.T) {
 	provider := &materialPreparationProvider{status: "ACTIVE", groupErr: context.DeadlineExceeded}
 	require.NoError(t, service.PrepareMaterial(t.Context(), &material, scope, provider))
 	assert.Equal(t, "group-20261104", provider.groupName)
-	require.NotEmpty(t, provider.groupDescription)
+	assert.False(t, provider.groupDescriptionProvided)
 	assert.Zero(t, provider.assets)
 	provider.groupErr = nil
-	provider.groupPages = [][]service.MobileCloudAssetGroup{{
-		{ID: "foreign-group", Type: "AIGC", Name: provider.groupName, Description: "someone-else"},
-		{ID: "upstream-group", Type: "AIGC", Name: provider.groupName, Description: provider.groupDescription},
-	}}
-	retried, err := model.RetryUserMaterial(users[1].Id, material.Id)
-	require.NoError(t, err)
-	require.NoError(t, service.PrepareMaterial(t.Context(), retried, scope, provider))
-	require.NoError(t, db.First(&binding, binding.Id).Error)
-	assert.Equal(t, "ready", binding.State)
-	assert.Equal(t, "upstream-group", binding.GroupID)
-	assert.Equal(t, 1, provider.groups, "recover the original date group, never create a new day group after an unknown result")
-	assert.Equal(t, 1, provider.assets)
+	for _, description := range []string{"someone-else", ""} {
+		provider.groupPages = [][]service.MobileCloudAssetGroup{{
+			{ID: "unconfirmed-group", Type: "AIGC", Name: provider.groupName, Description: description},
+		}}
+		retried, err := model.RetryUserMaterial(users[1].Id, material.Id)
+		require.NoError(t, err)
+		require.NoError(t, service.PrepareMaterial(t.Context(), retried, scope, provider))
+		require.NoError(t, db.First(&binding, binding.Id).Error)
+		assert.Equal(t, "uncertain", binding.State)
+		assert.Empty(t, binding.GroupID, "a same-name group cannot prove ownership without a description marker")
+		assert.Equal(t, "group-20261104", binding.GroupName)
+		assert.Contains(t, binding.FailReason, "unknown")
+		assert.Equal(t, 1, provider.groups, "never create a new day group after an unknown result")
+		assert.Zero(t, provider.assets)
+	}
 }
 
 func TestAIGCMaterialLegacyGroupRecovery(t *testing.T) {
@@ -1290,6 +1293,10 @@ func TestMobileCloudVideoUploadBeforeSubmit(t *testing.T) {
 		switch {
 		case r.Method == http.MethodPost && path == "/asset-group":
 			operations = append(operations, "group")
+			var input map[string]any
+			if assert.NoError(t, common.DecodeJson(r.Body, &input)) {
+				assert.NotContains(t, input, "description")
+			}
 			_, _ = w.Write([]byte(`{"state":"OK","body":{"groupId":"test-group","groupType":"AIGC"}}`))
 		case r.Method == http.MethodPost && path == "/asset":
 			var input service.MobileCloudCreateAssetInput
@@ -1532,6 +1539,7 @@ func TestTopenRouterVideoUploadBeforeSubmit(t *testing.T) {
 		switch action {
 		case "CreateAssetGroup":
 			assert.Equal(t, "AIGC", input["GroupType"])
+			assert.NotContains(t, input, "Description")
 			_, _ = w.Write([]byte(`{"Result":{"Id":"topen-group","GroupType":"AIGC"}}`))
 		case "CreateAsset":
 			assert.Equal(t, "topen-group", input["GroupId"])
@@ -2122,7 +2130,7 @@ func TestVideoMaterialBackgroundSyncStaysInSelectedChannel(t *testing.T) {
 
 func TestVideoMaterialBackgroundWorkerScopes(t *testing.T) {
 	db, users := setupAdminMaterialPostgres(t)
-	t.Setenv("MOBILE_CLOUD_MATERIAL_TEST_ENABLED", "true")
+	t.Setenv("MOBILE_CLOUD_MATERIAL_TEST_ENABLED", "")
 	t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
 	require.NoError(t, db.Where("key IN ?", []string{model.MobileCloudMaterialConfigOption, model.TopenRouterMaterialConfigOption}).Delete(&model.Option{}).Error)
 	require.NoError(t, db.Model(&model.Material{}).Where("status IN ?", []string{"pending", "processing", "failed"}).Update("status", "ready").Error)
@@ -2141,6 +2149,10 @@ func TestVideoMaterialBackgroundWorkerScopes(t *testing.T) {
 		topenCalls[action]++
 		switch action {
 		case "CreateAssetGroup":
+			var input map[string]any
+			if assert.NoError(t, common.DecodeJson(r.Body, &input)) {
+				assert.NotContains(t, input, "Description")
+			}
 			_, _ = w.Write([]byte(`{"Result":{"Id":"selected-group","GroupType":"AIGC"}}`))
 		case "CreateAsset":
 			_, _ = w.Write([]byte(`{"Result":{"Id":"selected-asset","Status":"Active"}}`))
@@ -2195,6 +2207,7 @@ func TestVideoMaterialBackgroundWorkerScopes(t *testing.T) {
 	require.NoError(t, db.Create(&material).Error)
 	binding := model.MaterialBinding{MaterialId: material.Id, Scope: service.TopenRouterMaterialScope(config), Version: model.MaterialSourceVersion(&material), ChannelID: channels[1].Id, State: "pending"}
 	require.NoError(t, db.Create(&binding).Error)
+	assert.True(t, (service.MaterialPreparationHandler{}).Enabled())
 	require.NoError(t, service.RunMaterialPreparationOnce(t.Context()))
 	assert.Zero(t, mobileCalls, "group and image preparation must not reach an unrelated channel")
 	assert.Equal(t, map[string]int{"CreateAssetGroup": 1, "CreateAsset": 1, "GetAsset": 1, "UpdateAssetGroup": 1, "GetAssetGroup": 1}, topenCalls)
@@ -2799,12 +2812,15 @@ func TestAIGCMaterialGroupRecovery(t *testing.T) {
 			provider.groupErr = nil
 			require.NoError(t, service.PrepareMaterial(context.Background(), retried, material.MaterialID, provider))
 			require.NoError(t, db.First(&material, material.Id).Error)
-			assert.Equal(t, "ready", material.Status)
-			wantGroups := 1
-			if rejected {
-				wantGroups = 2
+			if !rejected {
+				assert.Equal(t, "failed", material.Status)
+				assert.Contains(t, material.FailReason, "unknown")
+				assert.Equal(t, 1, provider.groups)
+				assert.Zero(t, provider.assets)
+				return
 			}
-			assert.Equal(t, wantGroups, provider.groups)
+			assert.Equal(t, "ready", material.Status)
+			assert.Equal(t, 2, provider.groups)
 			assert.Equal(t, 1, provider.assets)
 		})
 	}
@@ -2909,6 +2925,8 @@ func TestAIGCMaterialChannelSync(t *testing.T) {
 		assert.Equal(t, group.Name, first.groupName)
 		assert.Equal(t, 1, first.groups)
 		assert.Equal(t, 1, second.groups)
+		assert.False(t, first.groupDescriptionProvided, "group creation must omit the description parameter")
+		assert.False(t, second.groupDescriptionProvided, "group creation must omit the description parameter")
 		var bindings []model.MaterialBinding
 		require.NoError(t, db.Where("material_id = ?", material.Id).Order("channel_id").Find(&bindings).Error)
 		require.Len(t, bindings, 2)
@@ -3067,7 +3085,22 @@ func TestAIGCMaterialChannelSync(t *testing.T) {
 		provider.omitLookup, provider.groupErr = false, nil
 		require.NoError(t, service.SyncMaterialGroup(context.Background(), &group, channels))
 		require.NoError(t, db.First(&group, group.Id).Error)
+		assert.Equal(t, "failed", group.Status)
+		assert.Contains(t, group.FailReason, "unknown")
+		assert.Equal(t, 1, provider.groups)
+		assert.Zero(t, provider.updates)
+	})
+	t.Run("legacy marked creation recovers and deletion queries before retry", func(t *testing.T) {
+		group := model.MaterialGroup{UserId: users[1].Id, Name: "Unknown legacy create"}
+		require.NoError(t, model.SaveMaterialGroup(&group))
+		binding := model.MaterialGroupBinding{GroupId: group.Id, UserId: group.UserId, Scope: "legacy-group", Name: group.Name, CreationToken: "new-api-material-group:legacy-test", State: "creating"}
+		require.NoError(t, db.Create(&binding).Error)
+		provider := &materialPreparationProvider{groupName: group.Name, groupDescription: binding.CreationToken}
+		channels := []service.MaterialChannel{{ChannelID: 202, Scope: binding.Scope, Client: provider}}
+		require.NoError(t, service.SyncMaterialGroup(context.Background(), &group, channels))
+		require.NoError(t, db.First(&group, group.Id).Error)
 		assert.Equal(t, "ready", group.Status)
+		assert.Zero(t, provider.groups)
 		group.Deleting = true
 		require.NoError(t, db.Model(&group).Update("deleting", true).Error)
 		provider.deleteErr = context.DeadlineExceeded
@@ -3341,6 +3374,7 @@ type materialPreparationProvider struct {
 	groupName                           string
 	groupID                             string
 	groupDescription                    string
+	groupDescriptionProvided            bool
 	onGroupCreate                       func()
 	onAssetGet                          func()
 	updates, groupDeletes, assetDeletes int
@@ -3385,6 +3419,7 @@ func (p *materialPreparationProvider) DeleteAsset(context.Context, string) (bool
 func (p *materialPreparationProvider) CreateAssetGroup(_ context.Context, name string, description *string) (*service.MobileCloudAssetGroup, error) {
 	p.groups++
 	p.groupName = name
+	p.groupDescriptionProvided = description != nil
 	if description != nil {
 		p.groupDescription = *description
 	}

@@ -203,7 +203,7 @@ func PrepareMaterial(ctx context.Context, material *model.Material, scope string
 				return result.Error
 			}
 			if result.RowsAffected == 1 {
-				created, createErr := provider.CreateAssetGroup(ctx, group.Name, &group.CreationToken)
+				created, createErr := provider.CreateAssetGroup(ctx, group.Name, nil)
 				if createErr != nil {
 					if _, rejected := materialRejectionMessage(createErr); rejected {
 						if err := db.Model(&group).Update("state", "pending").Error; err != nil {
@@ -349,10 +349,10 @@ func materialGroupPreparationQueue(db *gorm.DB, scopes []string) *gorm.DB {
 }
 
 func RunMaterialPreparationOnce(ctx context.Context) error {
-	db := model.DB.WithContext(ctx)
-	if err := model.ValidateMobileCloudMaterialTestDatabase(db); err != nil {
-		return err
+	if model.DB == nil {
+		return model.ErrMaterialIntegrationUnavailable
 	}
+	db := model.DB.WithContext(ctx)
 	channels, loadErr := LoadMaterialChannels()
 	var failures []error
 	if loadErr != nil {
@@ -416,7 +416,7 @@ func (MaterialPreparationHandler) Type() string            { return "material_pr
 func (MaterialPreparationHandler) Interval() time.Duration { return 15 * time.Second }
 func (MaterialPreparationHandler) NewPayload() any         { return nil }
 func (MaterialPreparationHandler) Enabled() bool {
-	if model.ValidateMobileCloudMaterialTestDatabase(model.DB) != nil {
+	if model.DB == nil {
 		return false
 	}
 	var count int64

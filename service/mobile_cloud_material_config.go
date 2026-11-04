@@ -149,9 +149,6 @@ func mobileCloudMaterialConfigBinding(raw string) (int, string, error) {
 func GetMobileCloudMaterialConfigView() (*MobileCloudMaterialConfigView, error) {
 	view := &MobileCloudMaterialConfigView{Endpoint: MobileCloudMaterialDefaultEndpoint}
 	raw, err := model.ReadMobileCloudMaterialConfig()
-	if errors.Is(err, model.ErrMobileCloudMaterialTestOnly) {
-		return view, nil
-	}
 	if err != nil {
 		return nil, ErrMobileCloudMaterialConfig
 	}
@@ -188,9 +185,6 @@ func GetMobileCloudMaterialConfigView() (*MobileCloudMaterialConfigView, error) 
 }
 
 func SaveMobileCloudMaterialConfiguration(input MobileCloudMaterialConfiguration) error {
-	if os.Getenv("MOBILE_CLOUD_MATERIAL_TEST_ENABLED") != "true" {
-		return model.ErrMobileCloudMaterialTestOnly
-	}
 	err := model.UpdateMobileCloudMaterialConfig(func(tx *gorm.DB, raw string) (string, error) {
 		var topenRouterConfig model.Option
 		if err := tx.Select("value").Where("key = ?", model.TopenRouterMaterialConfigOption).Find(&topenRouterConfig).Error; err != nil {
@@ -258,7 +252,7 @@ func SaveMobileCloudMaterialConfiguration(input MobileCloudMaterialConfiguration
 		sealed := aead.Seal(nonce, nonce, plain, []byte(model.MobileCloudMaterialConfigOption+":v2:"+binding))
 		return "v2." + binding + "." + base64.StdEncoding.EncodeToString(sealed), nil
 	})
-	if err != nil && !errors.Is(err, model.ErrMobileCloudMaterialTestOnly) && !errors.Is(err, ErrMobileCloudMaterialInput) && !errors.Is(err, ErrMobileCloudMaterialEncryption) {
+	if err != nil && !errors.Is(err, ErrMobileCloudMaterialInput) && !errors.Is(err, ErrMobileCloudMaterialEncryption) {
 		return ErrMobileCloudMaterialConfig
 	}
 	return err
@@ -267,9 +261,6 @@ func SaveMobileCloudMaterialConfiguration(input MobileCloudMaterialConfiguration
 func LoadMobileCloudMaterialConfiguration() (*MobileCloudMaterialConfiguration, error) {
 	raw, err := model.ReadMobileCloudMaterialConfig()
 	if err != nil {
-		if errors.Is(err, model.ErrMobileCloudMaterialTestOnly) {
-			return nil, err
-		}
 		return nil, ErrMobileCloudMaterialConfig
 	}
 	if raw == "" {

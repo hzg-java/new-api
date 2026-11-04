@@ -342,7 +342,7 @@ func syncMaterialGroupBinding(ctx context.Context, group *model.MaterialGroup, b
 		if err := model.SaveMaterialGroupBinding(db, binding, owner); err != nil {
 			return err
 		}
-		created, err := channel.Client.CreateAssetGroup(ctx, binding.Name, &binding.CreationToken)
+		created, err := channel.Client.CreateAssetGroup(ctx, binding.Name, nil)
 		if err != nil || created == nil || validateMobileCloudMaterialID(created.ID) != nil || created.Type != "AIGC" {
 			if _, rejected := materialRejectionMessage(err); rejected {
 				binding.State = "rejected"

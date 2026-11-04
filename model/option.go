@@ -253,7 +253,7 @@ func validateOptionValue(key string, value string) error {
 
 func UpdateOption(key string, value string) error {
 	if key == MobileCloudMaterialConfigOption || key == TopenRouterMaterialConfigOption {
-		return ErrMobileCloudMaterialTestOnly
+		return ErrMaterialIntegrationConfigKey
 	}
 	if key == UserModelPricingMultiplierOption {
 		return UpdateOptionsBulk(map[string]string{key: value})
@@ -294,7 +294,7 @@ func UpdateOption(key string, value string) error {
 func UpdateOptionsBulk(values map[string]string) error {
 	for _, key := range []string{MobileCloudMaterialConfigOption, TopenRouterMaterialConfigOption} {
 		if _, reserved := values[key]; reserved {
-			return ErrMobileCloudMaterialTestOnly
+			return ErrMaterialIntegrationConfigKey
 		}
 	}
 	if len(values) == 0 {

@@ -3,7 +3,6 @@ package model
 import (
 	"context"
 	"errors"
-	"os"
 	"time"
 
 	"gorm.io/gorm"
@@ -15,21 +14,10 @@ const (
 	TopenRouterMaterialConfigOption = "TopenRouterMaterialConfigSecret"
 )
 
-var ErrMobileCloudMaterialTestOnly = errors.New("mobile cloud material configuration is available only in the enabled new-api-test environment")
-
-func ValidateMobileCloudMaterialTestDatabase(tx *gorm.DB) error {
-	if os.Getenv("MOBILE_CLOUD_MATERIAL_TEST_ENABLED") != "true" || tx == nil || tx.Dialector.Name() != "postgres" {
-		return ErrMobileCloudMaterialTestOnly
-	}
-	var database string
-	if err := tx.Raw("SELECT current_database()").Scan(&database).Error; err != nil {
-		return err
-	}
-	if database != "new-api-test" {
-		return ErrMobileCloudMaterialTestOnly
-	}
-	return nil
-}
+var (
+	ErrMaterialIntegrationUnavailable = errors.New("material integration database is unavailable")
+	ErrMaterialIntegrationConfigKey   = errors.New("material credentials must use the dedicated configuration API")
+)
 
 func ReadMobileCloudMaterialConfig() (string, error) {
 	return ReadMaterialIntegrationConfig(MobileCloudMaterialConfigOption)
@@ -37,18 +25,15 @@ func ReadMobileCloudMaterialConfig() (string, error) {
 
 func ReadMaterialIntegrationConfig(key string) (string, error) {
 	if key != MobileCloudMaterialConfigOption && key != TopenRouterMaterialConfigOption {
-		return "", ErrMobileCloudMaterialTestOnly
+		return "", ErrMaterialIntegrationConfigKey
 	}
-	if DB == nil || os.Getenv("MOBILE_CLOUD_MATERIAL_TEST_ENABLED") != "true" {
-		return "", ErrMobileCloudMaterialTestOnly
+	if DB == nil {
+		return "", ErrMaterialIntegrationUnavailable
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var value string
 	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := ValidateMobileCloudMaterialTestDatabase(tx); err != nil {
-			return err
-		}
 		var option Option
 		err := tx.Where("key = ?", key).First(&option).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -66,17 +51,14 @@ func UpdateMobileCloudMaterialConfig(update func(*gorm.DB, string) (string, erro
 
 func UpdateMaterialIntegrationConfig(key string, update func(*gorm.DB, string) (string, error)) error {
 	if key != MobileCloudMaterialConfigOption && key != TopenRouterMaterialConfigOption {
-		return ErrMobileCloudMaterialTestOnly
+		return ErrMaterialIntegrationConfigKey
 	}
-	if DB == nil || os.Getenv("MOBILE_CLOUD_MATERIAL_TEST_ENABLED") != "true" {
-		return ErrMobileCloudMaterialTestOnly
+	if DB == nil {
+		return ErrMaterialIntegrationUnavailable
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := ValidateMobileCloudMaterialTestDatabase(tx); err != nil {
-			return err
-		}
 		var current string
 		// Both suppliers share one binding decision, so acquire their rows in a fixed order.
 		for _, configKey := range []string{MobileCloudMaterialConfigOption, TopenRouterMaterialConfigOption} {

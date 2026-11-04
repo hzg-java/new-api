@@ -178,7 +178,7 @@ type MaterialReservation struct {
 
 func PrepareMobileCloudVideoBody(ctx context.Context, userID int, target *model.Channel, body any) (any, []MaterialPreparationIssue, *MaterialReservation, error) {
 	raw, err := model.ReadMobileCloudMaterialConfig()
-	if errors.Is(err, model.ErrMobileCloudMaterialTestOnly) || err == nil && raw == "" {
+	if err == nil && raw == "" {
 		return body, nil, nil, nil
 	}
 	if err != nil {
@@ -229,7 +229,7 @@ func PrepareMobileCloudVideoBody(ctx context.Context, userID int, target *model.
 
 func PrepareVideoMaterialRequest(ctx context.Context, userID int, target *model.Channel, body any) (any, []MaterialPreparationIssue, *MaterialReservation, error) {
 	raw, err := model.ReadMaterialIntegrationConfig(model.TopenRouterMaterialConfigOption)
-	if err != nil && !errors.Is(err, model.ErrMobileCloudMaterialTestOnly) {
+	if err != nil {
 		return nil, nil, nil, ErrTopenRouterMaterialConfig
 	}
 	if raw != "" {
@@ -253,7 +253,7 @@ func PrepareVideoMaterialRequest(ctx context.Context, userID int, target *model.
 
 func PrepareTopenRouterVideoBody(ctx context.Context, userID int, target *model.Channel, body any) (any, []MaterialPreparationIssue, *MaterialReservation, error) {
 	raw, err := model.ReadMaterialIntegrationConfig(model.TopenRouterMaterialConfigOption)
-	if errors.Is(err, model.ErrMobileCloudMaterialTestOnly) || err == nil && raw == "" {
+	if err == nil && raw == "" {
 		return body, nil, nil, nil
 	}
 	if err != nil {

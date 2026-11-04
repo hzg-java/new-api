@@ -27,7 +27,6 @@ import (
 
 func TestTopenRouterMaterialConfiguration(t *testing.T) {
 	db, users := setupAdminMaterialPostgres(t)
-	t.Setenv("MOBILE_CLOUD_MATERIAL_TEST_ENABLED", "true")
 	t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
 	const optionKey = "TopenRouterMaterialConfigSecret"
 	const endpoint = "https://tp-api.chinadatapay.com:8000"
@@ -220,13 +219,6 @@ func TestTopenRouterMaterialConfiguration(t *testing.T) {
 	t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY", "invalid")
 	requestAdminMaterial(t, router, admin, http.MethodPut, path, `{"endpoint":"`+endpoint+`","token":"test-token"}`, http.StatusServiceUnavailable, false)
 	t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
-	t.Setenv("MOBILE_CLOUD_MATERIAL_TEST_ENABLED", "false")
-	requestAdminMaterial(t, router, admin, http.MethodPut, path, `{"endpoint":"`+endpoint+`","token":"test-token"}`, http.StatusForbidden, false)
-	response = requestAdminMaterial(t, router, admin, http.MethodGet, path, "", http.StatusOK, true)
-	require.NoError(t, common.Unmarshal(response.Data, &view))
-	assert.False(t, view.Available)
-	assert.False(t, view.Configured)
-	t.Setenv("MOBILE_CLOUD_MATERIAL_TEST_ENABLED", "true")
 	t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY", "")
 	missingKey := filepath.Join(t.TempDir(), "missing-material.key")
 	t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY_FILE", missingKey)
@@ -245,9 +237,62 @@ func TestTopenRouterMaterialConfiguration(t *testing.T) {
 	assert.ErrorIs(t, err, os.ErrNotExist)
 }
 
+func TestMaterialIntegrationWithoutTestEnvironment(t *testing.T) {
+	db, users := setupAdminMaterialPostgres(t)
+	t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
+	router := newAdminMaterialRouter(t)
+	for _, enabled := range []string{"", "false"} {
+		for _, provider := range []string{"mobile-cloud", "topenrouter"} {
+			t.Run(provider+"/test-enabled="+enabled, func(t *testing.T) {
+				t.Setenv("MOBILE_CLOUD_MATERIAL_TEST_ENABLED", enabled)
+				require.NoError(t, db.Where("key IN ?", []string{model.MobileCloudMaterialConfigOption, model.TopenRouterMaterialConfigOption}).Delete(&model.Option{}).Error)
+				path := "/api/material/" + provider + "/config"
+				response := requestAdminMaterial(t, router, &users[0], http.MethodGet, path, "", http.StatusOK, true)
+				var view map[string]any
+				require.NoError(t, common.Unmarshal(response.Data, &view))
+				require.Equal(t, true, view["available"])
+				assert.Equal(t, false, view["configured"])
+
+				channel := model.Channel{Name: provider + " configuration", Key: "video-key", Status: common.ChannelStatusEnabled}
+				require.NoError(t, db.Create(&channel).Error)
+				optionKey := model.MobileCloudMaterialConfigOption
+				input := map[string]any{"channel_id": channel.Id, "endpoint": service.MobileCloudMaterialDefaultEndpoint, "access_key": "config-access", "secret_key": "config-secret", "pool_id": "config-pool"}
+				if provider == "topenrouter" {
+					optionKey = model.TopenRouterMaterialConfigOption
+					input = map[string]any{"channel_id": channel.Id, "endpoint": service.TopenRouterMaterialDefaultEndpoint, "token": "config-secret"}
+				}
+				body, err := common.Marshal(input)
+				require.NoError(t, err)
+				requestAdminMaterial(t, router, nil, http.MethodPut, path, string(body), http.StatusUnauthorized, false)
+				requestAdminMaterial(t, router, &users[1], http.MethodPut, path, string(body), http.StatusForbidden, false)
+				response = requestAdminMaterial(t, router, &users[0], http.MethodPut, path, string(body), http.StatusOK, true)
+				require.NoError(t, common.Unmarshal(response.Data, &view))
+				assert.Equal(t, true, view["available"])
+				assert.Equal(t, true, view["configured"])
+				assert.NotContains(t, string(response.Data), "config-secret")
+				var stored model.Option
+				require.NoError(t, db.Where("key = ?", optionKey).First(&stored).Error)
+				assert.NotContains(t, stored.Value, "config-secret")
+				require.Error(t, model.UpdateOption(optionKey, "plaintext"))
+				require.Error(t, model.UpdateOptionsBulk(map[string]string{optionKey: "plaintext"}))
+				channels, err := service.LoadMaterialChannels()
+				require.NoError(t, err)
+				require.Len(t, channels, 1)
+				assert.Equal(t, channel.Id, channels[0].ChannelID)
+				assert.NotNil(t, channels[0].Client)
+				requestBody := map[string]any{"content": []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": "asset://unknown-reference"}}}}
+				_, issues, reservation, err := service.PrepareVideoMaterialRequest(t.Context(), users[1].Id, &channel, requestBody)
+				require.NoError(t, err)
+				assert.NotEmpty(t, issues, "configured channels must enforce material ownership without a test flag")
+				assert.Nil(t, reservation)
+			})
+		}
+	}
+}
+
 func TestMaterialIntegrationEnablement(t *testing.T) {
 	db, users := setupAdminMaterialPostgres(t)
-	t.Setenv("MOBILE_CLOUD_MATERIAL_TEST_ENABLED", "true")
+	t.Setenv("MOBILE_CLOUD_MATERIAL_TEST_ENABLED", "")
 	const masterKey = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 	t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY", masterKey)
 	router := newAdminMaterialRouter(t)
@@ -346,7 +391,6 @@ func TestMaterialIntegrationEnablement(t *testing.T) {
 
 func TestMaterialIntegrationConfigurationSerializesSuppliers(t *testing.T) {
 	db, _ := setupAdminMaterialPostgres(t)
-	t.Setenv("MOBILE_CLOUD_MATERIAL_TEST_ENABLED", "true")
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	isolated, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{
@@ -385,7 +429,6 @@ func TestMaterialIntegrationConfigurationSerializesSuppliers(t *testing.T) {
 
 func TestMobileCloudMaterialConfig(t *testing.T) {
 	db, users := setupAdminMaterialPostgres(t)
-	t.Setenv("MOBILE_CLOUD_MATERIAL_TEST_ENABLED", "true")
 	t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
 	t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY_FILE", filepath.Join(t.TempDir(), "material.key"))
 	const key = "MobileCloudMaterialConfigSecret"
@@ -492,15 +535,6 @@ func TestMobileCloudMaterialConfig(t *testing.T) {
 	require.NoError(t, db.Model(&model.Option{}).Where("key = ?", key).Update("value", replaced.Value[:len(replaced.Value)-8]+"AAAAAAAA").Error)
 	requestAdminMaterial(t, router, admin, http.MethodGet, path, "", http.StatusServiceUnavailable, false)
 	require.NoError(t, db.Model(&model.Option{}).Where("key = ?", key).Update("value", replaced.Value).Error)
-	t.Setenv("MOBILE_CLOUD_MATERIAL_TEST_ENABLED", "false")
-	requestAdminMaterial(t, router, admin, http.MethodPut, path, body, http.StatusForbidden, false)
-	response = requestAdminMaterial(t, router, admin, http.MethodGet, path, "", http.StatusOK, true)
-	require.NoError(t, common.Unmarshal(response.Data, &view))
-	assert.False(t, view.Available)
-	assert.False(t, view.Configured)
-	var after model.Option
-	require.NoError(t, db.Where("key = ?", key).First(&after).Error)
-	assert.Equal(t, replaced.Value, after.Value)
 
 	request := httptest.NewRequest(http.MethodGet, path, nil)
 	request.Header.Set("Authorization", "Bearer "+admin.GetAccessToken())
@@ -511,11 +545,11 @@ func TestMobileCloudMaterialConfig(t *testing.T) {
 
 func TestMobileCloudMaterialConfigAutomaticEncryption(t *testing.T) {
 	db, users := setupAdminMaterialPostgres(t)
-	t.Setenv("MOBILE_CLOUD_MATERIAL_TEST_ENABLED", "true")
+	t.Setenv("MOBILE_CLOUD_MATERIAL_TEST_ENABLED", "")
 	t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY", "")
 	keyPath := filepath.Join(t.TempDir(), "keys", "material.key")
 	t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY_FILE", keyPath)
-	require.NoError(t, db.Where("key = ?", model.MobileCloudMaterialConfigOption).Delete(&model.Option{}).Error)
+	require.NoError(t, db.Where("key IN ?", []string{model.MobileCloudMaterialConfigOption, model.TopenRouterMaterialConfigOption}).Delete(&model.Option{}).Error)
 	router := newAdminMaterialRouter(t)
 	const path = "/api/material/mobile-cloud/config"
 	channel := model.Channel{Name: "Automatic material test channel", Key: "unused-test-key", Status: 1}
@@ -561,10 +595,6 @@ func TestMobileCloudMaterialConfigAutomaticEncryption(t *testing.T) {
 	assert.Equal(t, "invalid", string(persistedKey))
 	require.NoError(t, os.Remove(keyPath))
 	requestAdminMaterial(t, router, admin, http.MethodPut, path, body, http.StatusServiceUnavailable, false)
-	_, err = os.Stat(keyPath)
-	assert.ErrorIs(t, err, os.ErrNotExist)
-	t.Setenv("MOBILE_CLOUD_MATERIAL_TEST_ENABLED", "false")
-	requestAdminMaterial(t, router, admin, http.MethodPut, path, body, http.StatusForbidden, false)
 	_, err = os.Stat(keyPath)
 	assert.ErrorIs(t, err, os.ErrNotExist)
 
