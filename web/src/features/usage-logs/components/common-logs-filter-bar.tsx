@@ -88,6 +88,7 @@ function buildSearchSourceKey(values: {
   endTime?: unknown
   channel?: unknown
   model?: unknown
+  requestId?: unknown
   token?: unknown
   group?: unknown
   username?: unknown
@@ -98,6 +99,7 @@ function buildSearchSourceKey(values: {
     values.endTime,
     values.channel,
     values.model,
+    values.requestId,
     values.token,
     values.group,
     values.username,
@@ -148,6 +150,7 @@ export function CommonLogsFilterBar<TData>(
       endTime: searchParams.endTime,
       channel: searchParams.channel,
       model: searchParams.model,
+      requestId: searchParams.requestId,
       token: searchParams.token,
       group: searchParams.group,
       username: searchParams.username,
@@ -160,6 +163,7 @@ export function CommonLogsFilterBar<TData>(
       endTime: searchParams.endTime ? new Date(searchParams.endTime) : end,
       channel: searchParams.channel || undefined,
       model: searchParams.model || undefined,
+      requestId: searchParams.requestId || undefined,
       token: searchParams.token || undefined,
       group: searchParams.group || undefined,
       username: searchParams.username || undefined,
@@ -174,12 +178,16 @@ export function CommonLogsFilterBar<TData>(
     searchParams.endTime,
     searchParams.channel,
     searchParams.model,
+    searchParams.requestId,
     searchParams.token,
     searchParams.group,
     searchParams.username,
     searchParams.type,
   ])
   const [draft, setDraft] = useState<CommonLogDraft>(() => searchState)
+  if (draft.sourceKey !== searchState.sourceKey) {
+    setDraft(searchState)
+  }
   const activeDraft =
     draft.sourceKey === searchState.sourceKey ? draft : searchState
   const filters = activeDraft.filters
@@ -256,7 +264,11 @@ export function CommonLogsFilterBar<TData>(
 
   const hasTypeFilter = logType !== LOG_TYPE_ALL_VALUE
   const hasAdditionalFilters =
-    !!filters.model || !!filters.group || hasTypeFilter || hasExpandedFilters
+    !!filters.model ||
+    !!filters.requestId ||
+    !!filters.group ||
+    hasTypeFilter ||
+    hasExpandedFilters
 
   const expandedFilterCount = [
     filters.token,
@@ -323,6 +335,17 @@ export function CommonLogsFilterBar<TData>(
         placeholder={t('Model Name')}
         value={filters.model || ''}
         onChange={(e) => handleChange('model', e.target.value)}
+        onKeyDown={handleKeyDown}
+      />
+    </LogsFilterField>
+  )
+  const requestIdFilter = (
+    <LogsFilterField>
+      <LogsFilterInput
+        aria-label={t('Request ID')}
+        placeholder={t('Request ID')}
+        value={filters.requestId || ''}
+        onChange={(e) => handleChange('requestId', e.target.value)}
         onKeyDown={handleKeyDown}
       />
     </LogsFilterField>
@@ -461,6 +484,7 @@ export function CommonLogsFilterBar<TData>(
         <>
           {dateRangeFilter}
           {modelFilter}
+          {requestIdFilter}
           {groupFilter}
           {typeFilter}
         </>
@@ -470,14 +494,16 @@ export function CommonLogsFilterBar<TData>(
       mobileFilters={
         <>
           {modelFilter}
+          {requestIdFilter}
           {groupFilter}
           {typeFilter}
           {advancedFilters}
         </>
       }
       mobileFilterCount={
-        [filters.model, filters.group, hasTypeFilter].filter(Boolean).length +
-        expandedFilterCount
+        [filters.model, filters.requestId, filters.group, hasTypeFilter].filter(
+          Boolean
+        ).length + expandedFilterCount
       }
       hasAdvancedActiveFilters={hasExpandedFilters}
       advancedFilterCount={expandedFilterCount}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"maps"
@@ -81,12 +82,13 @@ const maxTaskArtifacts = 64
 const maxTaskPluginPersistedJSONBytes = 1 << 20
 
 type TaskAdaptor struct {
-	plugin         *pluginruntime.LoadedPlugin
-	info           *relaycommon.RelayInfo
-	submit         *requestDescriptor
-	routeRequest   *pluginruntime.RouteRequestContext
-	requestHeaders map[string]string
-	files          []map[string]any
+	plugin           *pluginruntime.LoadedPlugin
+	info             *relaycommon.RelayInfo
+	submit           *requestDescriptor
+	routeRequest     *pluginruntime.RouteRequestContext
+	requestHeaders   map[string]string
+	files            []map[string]any
+	materialPrepared bool
 }
 
 func New(plugin *pluginruntime.LoadedPlugin) *TaskAdaptor { return &TaskAdaptor{plugin: plugin} }
@@ -236,6 +238,46 @@ func (a *TaskAdaptor) BuildRequestHeader(_ *gin.Context, req *http.Request, _ *r
 	return nil
 }
 
+func (a *TaskAdaptor) PrepareMaterialRequest(c *gin.Context, info *relaycommon.RelayInfo) (func(), *dto.TaskError) {
+	switch constant.NormalizeTaskAction(info.Action) {
+	case constant.TaskActionImageToVideo, constant.TaskActionTextToVideo, constant.TaskActionFirstTailToVideo, constant.TaskActionReferenceToVideo:
+	default:
+		return nil, nil
+	}
+	descriptor, err := a.buildSubmit(c, info)
+	if err != nil {
+		return nil, service.TaskErrorWrapperLocal(err, "plugin_request_invalid", http.StatusBadRequest)
+	}
+	body := descriptor.Body
+	if descriptor.BodyType == "multipart" {
+		body = nil
+	}
+	headers, _ := common.Marshal(info.HeadersOverride)
+	target := &model.Channel{Id: info.ChannelId, Type: info.ChannelType, Key: info.ApiKey, BaseURL: &info.ChannelBaseUrl, HeaderOverride: common.GetPointer(string(headers)), ChannelInfo: model.ChannelInfo{IsMultiKey: info.ChannelIsMultiKey}}
+	prepared, issues, reservation, err := service.PrepareVideoMaterialRequest(c.Request.Context(), info.UserId, target, body)
+	if err != nil || len(issues) > 0 {
+		message := "Video material preparation failed"
+		if err == nil {
+			message = "Video images are not ready; no video request was submitted"
+		}
+		return nil, &dto.TaskError{Code: "material_preparation_failed", Message: message, Data: issues, StatusCode: http.StatusBadRequest, LocalError: true, NoRetry: true}
+	}
+	descriptor.Body = prepared
+	if reservation == nil {
+		return nil, nil
+	}
+	a.materialPrepared = true
+	// Submission must end before the material reservation expires.
+	original := c.Request
+	ctx, cancel := context.WithDeadline(original.Context(), reservation.Deadline)
+	c.Request = original.WithContext(ctx)
+	return func() {
+		cancel()
+		c.Request = original
+		reservation.Release()
+	}, nil
+}
+
 func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayInfo) (io.Reader, error) {
 	descriptor, err := a.buildSubmit(c, info)
 	if err != nil {
@@ -315,6 +357,13 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 	body, err := common.Marshal(inlined)
 	if err != nil {
 		return nil, err
+	}
+	if a.materialPrepared {
+		snapshot := json.RawMessage(body)
+		if len(body) > model.TaskEventPayloadLimit {
+			snapshot = json.RawMessage(`{"unavailable":"size_limit_exceeded"}`)
+		}
+		common.SetContextKey(c, constant.ContextKeyTaskEventUpstreamRequest, snapshot)
 	}
 	return bytes.NewReader(body), nil
 }

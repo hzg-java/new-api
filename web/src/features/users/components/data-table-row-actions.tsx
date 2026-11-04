@@ -28,6 +28,7 @@ import {
   ShieldAlert,
   Link2,
   CreditCard,
+  Receipt,
 } from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -48,6 +49,7 @@ import {
 } from '@/components/ui/tooltip'
 import { UserSubscriptionsDialog } from '@/features/subscriptions/components/dialogs/user-subscriptions-dialog'
 import { handleServerError } from '@/lib/handle-server-error'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { manageUser, resetUserPasskey, resetUserTwoFA } from '../api'
 import {
@@ -59,6 +61,7 @@ import {
 import { getUserActionMessage } from '../lib'
 import type { User, ManageUserAction } from '../types'
 import { UserBindingDialog } from './dialogs/user-binding-dialog'
+import { UserTopupRecordsDrawer } from './user-topup-records-drawer'
 import { useUsers } from './users-provider'
 
 interface DataTableRowActionsProps {
@@ -73,6 +76,10 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
   const [resetTwoFAOpen, setResetTwoFAOpen] = useState(false)
   const [bindingDialogOpen, setBindingDialogOpen] = useState(false)
   const [subscriptionsDialogOpen, setSubscriptionsDialogOpen] = useState(false)
+  const [topupRecordsOpen, setTopupRecordsOpen] = useState(false)
+  const viewerRole = useAuthStore((state) => state.auth.user?.role ?? 0)
+  const canViewTopupRecords =
+    viewerRole === USER_ROLE.ROOT || viewerRole > user.role
 
   const handleEdit = () => {
     setCurrentRow(user)
@@ -221,6 +228,15 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
           </DropdownMenuShortcut>
         </DropdownMenuItem>
 
+        {canViewTopupRecords && (
+          <DropdownMenuItem onClick={() => setTopupRecordsOpen(true)}>
+            {t('Top-up records')}
+            <DropdownMenuShortcut>
+              <Receipt size={16} />
+            </DropdownMenuShortcut>
+          </DropdownMenuItem>
+        )}
+
         <DropdownMenuSeparator />
 
         <DropdownMenuItem
@@ -300,6 +316,14 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
         user={{ id: user.id, username: user.username }}
         onSuccess={triggerRefresh}
       />
+
+      {canViewTopupRecords && (
+        <UserTopupRecordsDrawer
+          open={topupRecordsOpen}
+          onOpenChange={setTopupRecordsOpen}
+          user={user}
+        />
+      )}
     </div>
   )
 }

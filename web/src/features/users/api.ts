@@ -16,6 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import type { UsageLog } from '@/features/usage-logs/data/schema'
 import type { PermissionCatalog } from '@/lib/admin-permissions'
 import { api } from '@/lib/api'
 import type { CustomOAuthBinding } from '@/lib/oauth'
@@ -88,6 +89,17 @@ export async function searchUsers(
  */
 export async function getUser(id: number): Promise<ApiResponse<User>> {
   const res = await api.get(`/api/user/${id}`)
+  return res.data
+}
+
+export async function getUserTopupLogs(
+  userId: number,
+  page: number,
+  pageSize: number
+): Promise<ApiResponse<{ items: UsageLog[]; total: number }>> {
+  const res = await api.get(`/api/user/${userId}/topup-logs`, {
+    params: { p: page, page_size: pageSize },
+  })
   return res.data
 }
 

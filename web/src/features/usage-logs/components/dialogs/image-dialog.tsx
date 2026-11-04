@@ -28,6 +28,9 @@ interface ImageDialogProps {
   taskId?: string
   open: boolean
   onOpenChange: (open: boolean) => void
+  description?: string
+  imageAlt?: string
+  showUrl?: boolean
 }
 
 export function ImageDialog({
@@ -35,6 +38,9 @@ export function ImageDialog({
   taskId,
   open,
   onOpenChange,
+  description,
+  imageAlt,
+  showUrl = true,
 }: ImageDialogProps) {
   const { t } = useTranslation()
   const [isLoading, setIsLoading] = useState(true)
@@ -58,15 +64,20 @@ export function ImageDialog({
     setIsLoading(false)
     setHasError(true)
   }
+  let imageDescription = description
+  if (imageDescription === undefined) {
+    imageDescription = taskId
+      ? `${t('Task ID:')} ${taskId}`
+      : t('View the generated image')
+  }
 
   return (
     <Dialog
       open={open}
       onOpenChange={handleOpenChange}
       title={t('Image Preview')}
-      description={
-        taskId ? `${t('Task ID:')} ${taskId}` : t('View the generated image')
-      }
+      description={imageDescription}
+      descriptionClassName='break-all'
       contentClassName='sm:max-w-3xl'
       contentHeight='auto'
       bodyClassName='space-y-4'
@@ -82,7 +93,8 @@ export function ImageDialog({
             {/* Actual Image */}
             <img
               src={imageUrl}
-              alt={t('Generated image')}
+              alt={imageAlt ?? t('Generated image')}
+              referrerPolicy='no-referrer'
               className={`max-h-[550px] w-full rounded-lg object-contain ${
                 isLoading || hasError ? 'opacity-0' : 'opacity-100'
               }`}
@@ -101,12 +113,13 @@ export function ImageDialog({
             )}
           </div>
 
-          {/* Image URL */}
-          <div className='bg-muted mt-4 rounded-md p-3'>
-            <p className='text-muted-foreground font-mono text-xs break-all'>
-              {imageUrl}
-            </p>
-          </div>
+          {showUrl && (
+            <div className='bg-muted mt-4 rounded-md p-3'>
+              <p className='text-muted-foreground font-mono text-xs break-all'>
+                {imageUrl}
+              </p>
+            </div>
+          )}
         </div>
       </ScrollArea>
     </Dialog>

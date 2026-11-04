@@ -93,6 +93,193 @@ func performManageUserRequest(t *testing.T, body string) *httptest.ResponseRecor
 	return recorder
 }
 
+func performAdminUserTopupLogsRequest(t *testing.T, id string, role int, query string) *httptest.ResponseRecorder {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/user/"+id+"/topup-logs"+query, nil)
+	c.Params = gin.Params{{Key: "id", Value: id}}
+	c.Set("id", 9999)
+	c.Set("role", role)
+	GetUserTopupLogsByAdmin(c)
+	return recorder
+}
+
+func TestGetUserTopupLogsByAdminPaginationAndIsolation(t *testing.T) {
+	db := setupManageUserTestDB(t)
+	users := []model.User{
+		{Id: 1, Username: "topup-target", Role: common.RoleCommonUser, AffCode: "topup-target"},
+		{Id: 2, Username: "topup-other", Role: common.RoleCommonUser, AffCode: "topup-other"},
+		{Id: 3, Username: "topup-empty", Role: common.RoleCommonUser, AffCode: "topup-empty"},
+	}
+	require.NoError(t, db.Create(&users).Error)
+	logs := []model.Log{
+		{Id: 10, UserId: 1, Type: model.LogTypeTopup, Content: "First recharge"},
+		{Id: 20, UserId: 1, Type: model.LogTypeTopup, Content: "Second recharge"},
+		{Id: 30, UserId: 1, Type: model.LogTypeConsume, Content: "Not a recharge"},
+		{Id: 40, UserId: 2, Type: model.LogTypeTopup, Content: "Another user's recharge"},
+		{Id: 50, UserId: 1, Type: model.LogTypeTopup, Content: "Latest recharge"},
+		{Id: 60, UserId: 1, Type: model.LogTypeRefund, Content: "Not a recharge refund"},
+	}
+	for i := range logs {
+		logs[i].Other = `{"admin_info":{"admin_username":"private-operator"},"root_info":{"diagnostic":"private-diagnostic"}}`
+	}
+	require.NoError(t, model.LOG_DB.Create(&logs).Error)
+
+	for _, tc := range []struct {
+		name, id, query string
+		page, total     int
+		contents        []string
+	}{
+		{"first_page_ignores_user_and_type_overrides", "1", "?p=1&page_size=2&type=2&user_id=2", 1, 3, []string{"Latest recharge", "Second recharge"}},
+		{"second_page", "1", "?p=2&page_size=2", 2, 3, []string{"First recharge"}},
+		{"past_last_page", "1", "?p=3&page_size=2", 3, 3, nil},
+		{"no_topups_for_target", "3", "?p=1&page_size=2", 1, 0, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := performAdminUserTopupLogsRequest(t, tc.id, common.RoleAdminUser, tc.query)
+			require.Equal(t, http.StatusOK, recorder.Code)
+			var response struct {
+				Success bool `json:"success"`
+				Data    struct {
+					common.PageInfo
+					Items []model.Log `json:"items"`
+				} `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			require.True(t, response.Success, recorder.Body.String())
+			assert.Equal(t, tc.page, response.Data.Page)
+			assert.Equal(t, 2, response.Data.PageSize)
+			assert.Equal(t, tc.total, response.Data.Total)
+			require.Len(t, response.Data.Items, len(tc.contents))
+			assert.NotNil(t, response.Data.Items, "empty pages must be JSON arrays")
+			for i, log := range response.Data.Items {
+				assert.Equal(t, 1, log.UserId)
+				assert.Equal(t, model.LogTypeTopup, log.Type)
+				assert.Equal(t, tc.contents[i], log.Content)
+				assert.Equal(t, (tc.page-1)*2+i+1, log.Id)
+				assert.JSONEq(t, `{}`, log.Other, "retain the sanitized user projection even for administrators")
+			}
+		})
+	}
+}
+
+func TestGetUserTopupLogsByAdminRejectsInvalidPagination(t *testing.T) {
+	db := setupManageUserTestDB(t)
+	require.NoError(t, db.Create(&model.User{Id: 1, Username: "pagination-target", Role: common.RoleCommonUser}).Error)
+	require.NoError(t, model.LOG_DB.Create(&model.Log{UserId: 1, Type: model.LogTypeTopup, Content: "Target recharge"}).Error)
+	for _, query := range []string{"?page_size=-1", "?ps=-2", "?size=-3", "?p=-1&page_size=10"} {
+		t.Run(query, func(t *testing.T) {
+			recorder := performAdminUserTopupLogsRequest(t, "1", common.RoleAdminUser, query)
+			var response struct {
+				Success bool   `json:"success"`
+				Message string `json:"message"`
+				Data    any    `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			assert.False(t, response.Success)
+			assert.Equal(t, "invalid pagination parameters", response.Message)
+			assert.Nil(t, response.Data)
+		})
+	}
+}
+
+func TestGetUserTopupLogsByAdminValidatesTargetAndRole(t *testing.T) {
+	for _, tc := range []struct {
+		name, id, message        string
+		operatorRole, targetRole int
+	}{
+		{"invalid_id", "invalid", "invalid user id", common.RoleRootUser, common.RoleCommonUser},
+		{"zero_id", "0", "invalid user id", common.RoleRootUser, common.RoleCommonUser},
+		{"negative_id", "-1", "invalid user id", common.RoleRootUser, common.RoleCommonUser},
+		{"overflow_id", "9223372036854775808", "invalid user id", common.RoleRootUser, common.RoleCommonUser},
+		{"missing_user", "777", gorm.ErrRecordNotFound.Error(), common.RoleRootUser, common.RoleCommonUser},
+		{"same_role_admin", "1", "no permission", common.RoleAdminUser, common.RoleAdminUser},
+		{"higher_role_root", "1", "no permission", common.RoleAdminUser, common.RoleRootUser},
+		{"root_views_admin", "1", "", common.RoleRootUser, common.RoleAdminUser},
+		{"root_views_root", "1", "", common.RoleRootUser, common.RoleRootUser},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupManageUserTestDB(t)
+			target := model.User{Id: 1, Username: "topup-target", Role: tc.targetRole}
+			require.NoError(t, db.Create(&target).Error)
+			require.NoError(t, model.LOG_DB.Create(&model.Log{UserId: target.Id, Type: model.LogTypeTopup, Content: "Target recharge"}).Error)
+
+			recorder := performAdminUserTopupLogsRequest(t, tc.id, tc.operatorRole, "")
+			require.Equal(t, http.StatusOK, recorder.Code)
+			var response struct {
+				Success bool   `json:"success"`
+				Message string `json:"message"`
+				Data    *struct {
+					Total int         `json:"total"`
+					Items []model.Log `json:"items"`
+				} `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			assert.Equal(t, tc.message == "", response.Success)
+			assert.Equal(t, tc.message, response.Message)
+			if tc.message != "" {
+				assert.Nil(t, response.Data, "rejected requests must not expose recharge records")
+				return
+			}
+			require.NotNil(t, response.Data)
+			assert.Equal(t, 1, response.Data.Total)
+			require.Len(t, response.Data.Items, 1)
+			assert.Equal(t, "Target recharge", response.Data.Items[0].Content)
+		})
+	}
+}
+
+func TestGetUserTopupLogsByAdminMiddleware(t *testing.T) {
+	db := setupManageUserTestDB(t)
+	target := model.User{Username: "topup-target", Role: common.RoleCommonUser}
+	require.NoError(t, db.Create(&target).Error)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	adminRoute := router.Group("/api/user")
+	adminRoute.Use(middleware.AdminAuth())
+	adminRoute.GET("/:id/topup-logs", middleware.DisableCache(), GetUserTopupLogsByAdmin)
+
+	for _, tc := range []struct {
+		name, token, code string
+		role, status      int
+	}{
+		{"unauthenticated", "", "AUTH_UNAUTHORIZED", 0, http.StatusUnauthorized},
+		{"ordinary_user", "topup-viewer-user-token", "AUTH_INSUFFICIENT_PRIVILEGE", common.RoleCommonUser, http.StatusForbidden},
+		{"admin", "topup-viewer-admin-token", "", common.RoleAdminUser, http.StatusOK},
+		{"root", "topup-viewer-root-token", "", common.RoleRootUser, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.token != "" {
+				operator := model.User{
+					Username: "topup-viewer-" + tc.name, Role: tc.role,
+					Status: common.UserStatusEnabled, AuthVersion: 1,
+					AccessToken: &tc.token, AffCode: "topup-viewer-" + tc.name,
+				}
+				require.NoError(t, db.Create(&operator).Error)
+			}
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/user/%d/topup-logs", target.Id), nil)
+			if tc.token != "" {
+				request.Header.Set("Authorization", "Bearer "+tc.token)
+			}
+			router.ServeHTTP(recorder, request)
+			require.Equal(t, tc.status, recorder.Code, recorder.Body.String())
+			var response struct {
+				Success bool   `json:"success"`
+				Code    string `json:"code"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			assert.Equal(t, tc.status == http.StatusOK, response.Success)
+			assert.Equal(t, tc.code, response.Code)
+			if tc.status == http.StatusOK {
+				assert.Contains(t, recorder.Header().Get("Cache-Control"), "no-store")
+			}
+		})
+	}
+}
+
 func TestManageUserDisableAdvancesAuthVersionOnceAndRevokesSession(t *testing.T) {
 	db := setupManageUserTestDB(t)
 	now := time.Now().Unix()

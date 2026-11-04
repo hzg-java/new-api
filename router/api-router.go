@@ -152,6 +152,7 @@ func SetApiRouter(router *gin.Engine) {
 				adminRoute.DELETE("/:id/oauth/bindings/:provider_id", controller.UnbindCustomOAuthByAdmin)
 				adminRoute.DELETE("/:id/bindings/:binding_type", controller.AdminClearUserBinding)
 				adminRoute.GET("/:id", controller.GetUser)
+				adminRoute.GET("/:id/topup-logs", middleware.DisableCache(), controller.GetUserTopupLogsByAdmin)
 				adminRoute.GET("/:id/model-pricing", middleware.RootAuth(), middleware.DisableCache(), controller.GetUserModelPricing)
 				adminRoute.PUT("/:id/model-pricing", middleware.RootAuth(), middleware.DisableCache(), controller.PutUserModelPricing)
 				adminRoute.POST("/", controller.CreateUser)
@@ -286,6 +287,24 @@ func SetApiRouter(router *gin.Engine) {
 			tokenRoute.DELETE("/:id", controller.DeleteToken)
 			tokenRoute.POST("/batch", controller.DeleteTokenBatch)
 			tokenRoute.POST("/batch/keys", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.GetTokenKeysBatch)
+		}
+
+		controller.RegisterMaterialLibraryRoutes(apiRouter)
+		materialAdminRoute := apiRouter.Group("/material")
+		materialAdminRoute.Use(middleware.DisableCache(), middleware.AdminAuth())
+		{
+			materialRouteAdmin := materialAdminRoute.Group("/route")
+			{
+				materialRouteAdmin.GET("/all", controller.ListMaterialRoutes)
+				materialRouteAdmin.POST("/", controller.CreateMaterialRoute)
+				materialRouteAdmin.PUT("/:id", controller.UpdateMaterialRoute)
+				materialRouteAdmin.DELETE("/:id", controller.DeleteMaterialRoute)
+			}
+			materialCapabilityAdmin := materialAdminRoute.Group("/capability")
+			{
+				materialCapabilityAdmin.GET("/all", controller.ListMaterialCapabilities)
+				materialCapabilityAdmin.PUT("/", controller.UpsertMaterialCapability)
+			}
 		}
 
 		usageRoute := apiRouter.Group("/usage")

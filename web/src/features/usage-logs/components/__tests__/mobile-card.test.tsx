@@ -59,6 +59,7 @@ const log = usageLogSchema.parse({
 function Fixture(props: {
   admin?: boolean
   desktop?: boolean
+  desktopColumn?: string
   visibility?: VisibilityState
   logs?: UsageLog[]
   loading?: boolean
@@ -75,10 +76,11 @@ function Fixture(props: {
     return (
       <>
         {table.getRowModel().rows.map((row) => {
+          const columnId = props.desktopColumn ?? 'model_name'
           const cell = row
             .getVisibleCells()
-            .find((cell) => cell.column.id === 'model_name')
-          if (!cell) throw new Error('Missing model column')
+            .find((cell) => cell.column.id === columnId)
+          if (!cell) return null
           return (
             <div key={row.id}>
               {flexRender(cell.column.columnDef.cell, cell.getContext())}
@@ -418,4 +420,66 @@ it('shows loading placeholders without displaying stale log fields', () => {
   expect(
     screen.queryByRole('button', { name: /^Model:/ })
   ).not.toBeInTheDocument()
+})
+
+const requestId =
+  '20261029123456789012abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQR'
+
+it.each([
+  { admin: false, desktop: true },
+  { admin: true, desktop: true },
+  { admin: false, desktop: false },
+  { admin: true, desktop: false },
+])(
+  'shows and copies the full request ID for admin=$admin desktop=$desktop',
+  async (view) => {
+    const user = userEvent.setup()
+    const copy = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue()
+    renderLogs({
+      ...view,
+      desktopColumn: 'request_id',
+      logs: [{ ...log, request_id: requestId }],
+    })
+
+    const text = screen.getByText(requestId)
+    expect(text).toBeVisible()
+    expect(text).toHaveClass('truncate')
+    if (view.desktop) {
+      await user.hover(text)
+      await waitFor(() => {
+        const preview = screen
+          .getAllByText(requestId)
+          .find((node) => node !== text)
+        expect(preview).toBeVisible()
+      })
+      await user.unhover(text)
+    } else {
+      await user.click(
+        screen.getByRole('button', { name: `Request ID: ${requestId}` })
+      )
+      const dialog = await screen.findByRole('dialog', { name: 'Request ID' })
+      expect(within(dialog).getByText(requestId)).toBeVisible()
+    }
+    const button = screen.getByRole('button', { name: 'Copy to clipboard' })
+    button.focus()
+    await user.keyboard('{Enter}')
+    expect(copy).toHaveBeenCalledWith(requestId)
+    expect(screen.getByRole('button', { name: 'Copied' })).toBeVisible()
+  }
+)
+
+it('shows a placeholder without a copy action when the request ID is empty', () => {
+  renderLogs({ desktop: true, desktopColumn: 'request_id' })
+  expect(screen.getByText('-')).toBeVisible()
+  expect(
+    screen.queryByRole('button', { name: 'Copy to clipboard' })
+  ).not.toBeInTheDocument()
+})
+
+it('omits the request ID in the mobile summary when its column is hidden', () => {
+  renderLogs({
+    visibility: { request_id: false },
+    logs: [{ ...log, request_id: requestId }],
+  })
+  expect(screen.queryByText(requestId)).not.toBeInTheDocument()
 })

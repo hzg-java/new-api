@@ -40,6 +40,8 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import zhTW from '@/i18n/locales/zh-TW.json'
 import zh from '@/i18n/locales/zh.json'
 import { api } from '@/lib/api'
+import { Route as UsageLogsRoute } from '@/routes/_authenticated/usage-logs/$section'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { buildSearchParams } from '../../lib/filter'
 import { buildApiParams, fetchLogsByCategory } from '../../lib/utils'
@@ -83,19 +85,24 @@ async function renderMobileFilter(task = false, mobile = true) {
     ...original(query),
     matches: mobile && query === '(max-width: 640px)',
   }))
-  vi.spyOn(api, 'get').mockImplementation(async (url) => ({
-    data: {
-      success: true,
-      data: url === '/api/user/self/groups' ? {} : { quota: 0, rpm: 0, tpm: 0 },
-    },
-  }))
+  vi.spyOn(api, 'get').mockImplementation(async (url) => {
+    if (url === '/api/user/self/groups') {
+      return { data: { success: true, data: {} } }
+    }
+    if (url === '/api/group/') {
+      return { data: { success: true, data: [] } }
+    }
+    return {
+      data: { success: true, data: { quota: 0, rpm: 0, tpm: 0 } },
+    }
+  })
   const root = createRootRoute()
   const auth = createRoute({ getParentRoute: () => root, id: '_authenticated' })
   const logs = createRoute({
     getParentRoute: () => auth,
     path: '/usage-logs/$section',
     component: () => <Fixture task={task} />,
-    validateSearch: (search: Record<string, unknown>) => search,
+    validateSearch: UsageLogsRoute.options.validateSearch,
   })
   const router = createRouter({
     routeTree: root.addChildren([auth.addChildren([logs])]),
@@ -130,6 +137,7 @@ afterEach(async () => {
   cleanup()
   vi.restoreAllMocks()
   vi.useRealTimers()
+  useAuthStore.getState().auth.setUser(null)
   await i18next.changeLanguage('en')
 })
 
@@ -240,40 +248,167 @@ it.each([true, false])(
   }
 )
 
-it('discards legacy request ID filters from common search and statistics', async () => {
-  const router = await renderMobileFilter()
-  const user = userEvent.setup()
-  await user.click(screen.getByRole('button', { name: 'Filter' }))
-  expect(screen.queryByPlaceholderText('Request ID')).not.toBeInTheDocument()
-  expect(
-    screen.queryByPlaceholderText('Upstream Request ID')
-  ).not.toBeInTheDocument()
-  const legacy = {
-    model: 'client-model',
-    requestId: 'old',
-    upstreamRequestId: 'old-upstream',
+it.each([
+  { mobile: true, admin: false },
+  { mobile: true, admin: true },
+  { mobile: false, admin: false },
+  { mobile: false, admin: true },
+])(
+  'queries an exact request ID while retaining filters and resets it (mobile=$mobile admin=$admin)',
+  async ({ mobile, admin }) => {
+    useAuthStore.getState().auth.setUser({
+      id: 1,
+      username: admin ? 'admin' : 'user',
+      role: admin ? 10 : 1,
+    })
+    const router = await renderMobileFilter(false, mobile)
+    const user = userEvent.setup()
+    if (mobile) await user.click(screen.getByRole('button', { name: 'Filter' }))
+    const input = screen.getByRole('textbox', { name: 'Request ID' })
+    expect(input).toHaveValue('old')
+    expect(
+      screen.queryByPlaceholderText('Upstream Request ID')
+    ).not.toBeInTheDocument()
+    await user.clear(input)
+    await user.type(input, '  request-20261029-exact  ')
+    expect(router.state.location.search).toMatchObject({
+      page: 3,
+      requestId: 'old',
+    })
+    if (mobile) {
+      await user.click(
+        within(screen.getByRole('dialog', { name: 'Filter' })).getByRole(
+          'button',
+          { name: 'Search' }
+        )
+      )
+    } else {
+      await user.keyboard('{Enter}')
+    }
+    await waitFor(() =>
+      expect(router.state.location.search).toMatchObject({
+        page: 1,
+        requestId: 'request-20261029-exact',
+        group: 'default',
+        type: ['2'],
+      })
+    )
+    const config = {
+      logCategory: 'common' as const,
+      isAdmin: admin,
+      page: 1,
+      pageSize: 20,
+      searchParams: router.state.location.search,
+      columnFilters: [],
+    }
+    await fetchLogsByCategory(config)
+    const url = new URL(
+      String(vi.mocked(api.get).mock.calls.at(-1)?.[0]),
+      'http://localhost'
+    )
+    expect(url.pathname).toBe(admin ? '/api/log' : '/api/log/self')
+    expect(url.searchParams.get('request_id')).toBe('request-20261029-exact')
+    expect(url.searchParams.get('group')).toBe('default')
+    expect(url.searchParams.get('type')).toBe('2')
+    expect(url.searchParams.has('upstream_request_id')).toBe(false)
+    await waitFor(() => {
+      const statsCalls = vi
+        .mocked(api.get)
+        .mock.calls.filter(([path]) => path.includes('/stat?'))
+      expect(statsCalls.length).toBeGreaterThan(0)
+      for (const [path] of statsCalls) {
+        expect(path).not.toContain('request_id=')
+      }
+    })
+    if (mobile) await user.click(screen.getByRole('button', { name: 'Filter' }))
+    expect(screen.getByRole('textbox', { name: 'Request ID' })).toHaveValue(
+      'request-20261029-exact'
+    )
+    await user.click(screen.getByRole('button', { name: 'Reset' }))
+    await waitFor(() =>
+      expect(router.state.location.search.requestId).toBeFalsy()
+    )
+    await fetchLogsByCategory({
+      ...config,
+      searchParams: router.state.location.search,
+    })
+    expect(vi.mocked(api.get).mock.calls.at(-1)?.[0]).not.toContain(
+      'request_id='
+    )
   }
-  expect(buildSearchParams(legacy, 'common')).toEqual({ model: 'client-model' })
-  const params = buildApiParams({
-    page: 1,
-    pageSize: 20,
-    isAdmin: true,
-    searchParams: legacy,
+)
+
+it('restores the request ID draft when the URL changes without losing it on pagination', async () => {
+  const router = await renderMobileFilter(false, false)
+  const user = userEvent.setup()
+  const input = screen.getByRole('textbox', { name: 'Request ID' })
+  expect(input).toHaveValue('old')
+  await user.clear(input)
+  await user.type(input, 'unsent-draft')
+  await router.navigate({
+    to: '/usage-logs/$section',
+    params: { section: 'common' },
+    search: { ...router.state.location.search, page: 4 },
   })
-  expect(params).not.toHaveProperty('request_id')
-  expect(params).not.toHaveProperty('upstream_request_id')
-  await user.click(
-    within(screen.getByRole('dialog', { name: 'Filter' })).getByRole('button', {
-      name: 'Search',
+  expect(input).toHaveValue('unsent-draft')
+  await router.navigate({
+    to: '/usage-logs/$section',
+    params: { section: 'common' },
+    search: { ...router.state.location.search, requestId: 'linked-request' },
+  })
+  await waitFor(() => expect(input).toHaveValue('linked-request'))
+  await user.click(screen.getByRole('button', { name: 'Search' }))
+  await waitFor(() =>
+    expect(router.state.location.search).toMatchObject({
+      page: 1,
+      requestId: 'linked-request',
     })
   )
-  await waitFor(() =>
-    expect(router.state.location.search).not.toHaveProperty('requestId')
-  )
-  for (const [url] of vi.mocked(api.get).mock.calls) {
-    expect(url).not.toContain('request_id=')
-  }
 })
+
+it('restores the request ID after Search followed by browser Back and Forward', async () => {
+  const router = await renderMobileFilter(false, false)
+  const user = userEvent.setup()
+  const input = screen.getByRole('textbox', { name: 'Request ID' })
+  await user.clear(input)
+  await user.type(input, 'new-request')
+  await user.click(screen.getByRole('button', { name: 'Search' }))
+  await waitFor(() =>
+    expect(router.state.location.search.requestId).toBe('new-request')
+  )
+  router.history.back()
+  await waitFor(() => {
+    expect(router.state.location.search.requestId).toBe('old')
+    expect(input).toHaveValue('old')
+  })
+  router.history.forward()
+  await waitFor(() => {
+    expect(router.state.location.search.requestId).toBe('new-request')
+    expect(input).toHaveValue('new-request')
+  })
+})
+
+it.each(['', '   ', undefined])(
+  'omits an empty request ID (%j) and never forwards upstream ID filters',
+  (requestId) => {
+    const filters = {
+      model: 'client-model',
+      requestId,
+      upstreamRequestId: 'old-upstream',
+    }
+    expect(buildSearchParams(filters, 'common')).toEqual({
+      model: 'client-model',
+    })
+    const params = buildApiParams({
+      page: 1,
+      pageSize: 20,
+      isAdmin: false,
+      searchParams: filters,
+    })
+    expect(params).not.toHaveProperty('request_id')
+    expect(params).not.toHaveProperty('upstream_request_id')
+  }
+)
 
 it('keeps all quick actions visible without opening a menu', async () => {
   await renderMobileFilter()

@@ -21,6 +21,8 @@ import { GitBranch, Sparkles, KeyRound } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { CopyButton } from '@/components/copy-button'
+import { TruncatedCell } from '@/components/data-table'
 import { GroupBadge } from '@/components/group-badge'
 import { StatusBadge, type StatusBadgeProps } from '@/components/status-badge'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
@@ -377,6 +379,26 @@ export function useCommonLogsColumns(
         },
         enableHiding: false,
         size: 180,
+      },
+      {
+        accessorKey: 'request_id',
+        header: t('Request ID'),
+        size: 220,
+        cell: ({ row }) => {
+          const requestId = row.original.request_id
+          if (!requestId) {
+            return <span className='text-muted-foreground'>-</span>
+          }
+
+          return (
+            <div className='flex max-w-[220px] min-w-0 items-center gap-1'>
+              <TruncatedCell className='min-w-0 flex-1 font-mono text-xs'>
+                {requestId}
+              </TruncatedCell>
+              <CopyButton value={requestId} className='size-6' />
+            </div>
+          )
+        },
       },
     ]
 

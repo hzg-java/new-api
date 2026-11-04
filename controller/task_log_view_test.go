@@ -806,10 +806,7 @@ func TestTaskEventAdminDetailProjection(t *testing.T) {
 }
 
 func TestTaskEventOriginalRequestAndActualResponse(t *testing.T) {
-	db, _ := openTaskDialectDatabase(t, &model.Task{}, &model.TaskEvent{}, &model.User{}, &model.Channel{})
-	previousDB := model.DB
-	model.DB = db
-	t.Cleanup(func() { model.DB = previousDB })
+	_, users := setupAdminMaterialPostgres(t)
 	oldConsume := common.LogConsumeEnabled
 	common.LogConsumeEnabled = false
 	t.Cleanup(func() { common.LogConsumeEnabled = oldConsume })
@@ -818,8 +815,11 @@ func TestTaskEventOriginalRequestAndActualResponse(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 	capture := installTaskEventResponseCapture(c)
 	var billing []string
-	outcome, taskErr := executeTaskSubmissionWith(c, taskSubmissionRelayInfo(&taskSubmissionTestBilling{events: &billing}), func(c *gin.Context, _ *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+	info := taskSubmissionRelayInfo(&taskSubmissionTestBilling{events: &billing})
+	info.UserId = users[1].Id
+	outcome, taskErr := executeTaskSubmissionWith(c, info, func(c *gin.Context, _ *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
 		c.Set("task_request", map[string]any{"prompt": "mutated prompt"})
+		c.Set("task_event_upstream_request", json.RawMessage(`{"model":"mapped-model","image_url":"asset://resolved-material","api_key":"request-canary"}`))
 		return &relay.TaskSubmitResult{Platform: "video", UpstreamTaskID: "vendor-id"}, nil
 	})
 	require.Nil(t, taskErr)
@@ -833,9 +833,89 @@ func TestTaskEventOriginalRequestAndActualResponse(t *testing.T) {
 	assert.Contains(t, events[0].Payload, "original prompt")
 	assert.NotContains(t, events[0].Payload, "mutated prompt")
 	assert.Contains(t, events[0].Payload, "9007199254740993")
+	encoded, err := common.Marshal(events[0])
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), "asset://resolved-material")
+	assert.NotContains(t, string(encoded), "request-canary")
 	require.NoError(t, events[1].ProjectDetail(true))
 	assert.Contains(t, events[1].Payload, "actual presenter failure")
 	assert.NotContains(t, events[1].Payload, "response-canary")
+	for _, role := range []int{common.RoleAdminUser, common.RoleRootUser, common.RoleCommonUser} {
+		recorder := httptest.NewRecorder()
+		viewer, _ := gin.CreateTestContext(recorder)
+		viewer.Request = httptest.NewRequest(http.MethodGet, "/api/task/events", nil)
+		viewer.Params = gin.Params{{Key: "task_id", Value: strconv.FormatInt(outcome.Task.ID, 10)}}
+		viewer.Set("id", users[1].Id)
+		viewer.Set("role", role)
+		GetDashboardTaskEvents(viewer)
+		require.Equal(t, http.StatusOK, recorder.Code)
+		if role >= common.RoleAdminUser {
+			assert.Contains(t, recorder.Body.String(), "asset://resolved-material")
+		} else {
+			assert.NotContains(t, recorder.Body.String(), "upstream_request")
+			assert.NotContains(t, recorder.Body.String(), "mapped-model")
+		}
+		assert.NotContains(t, recorder.Body.String(), "request-canary")
+	}
+	t.Run("oversized combined requests preserve the original request", func(t *testing.T) {
+		upstream, err := common.Marshal(map[string]any{"prompt": strings.Repeat("u", 34000)})
+		require.NoError(t, err)
+		original := map[string]any{"prompt": strings.Repeat("o", 34000)}
+		require.NoError(t, model.RecordTaskEventDetail(outcome.Task.ID, "request", outcome.Task.SubmitTime, model.TaskEventRequestDetail{Request: original, UpstreamRequest: upstream}))
+		stored, err := model.GetTaskEvents(outcome.Task.ID)
+		require.NoError(t, err)
+		require.NotEmpty(t, stored)
+		assert.LessOrEqual(t, len(stored[0].Payload), model.TaskEventPayloadLimit)
+		require.NoError(t, stored[0].ProjectDetail(true))
+		encoded, err := common.Marshal(stored[0])
+		require.NoError(t, err)
+		assert.Contains(t, string(encoded), "size_limit_exceeded")
+		assert.Contains(t, stored[0].Payload, strings.Repeat("o", 34000))
+	})
+	t.Run("upstream size marker cannot displace a valid original request", func(t *testing.T) {
+		original := json.RawMessage(`{"prompt":"` + strings.Repeat("o", 61340) + `"}`)
+		require.NoError(t, model.RecordTaskEventDetail(outcome.Task.ID, "request", outcome.Task.SubmitTime, original))
+		baseline, err := model.GetTaskEvents(outcome.Task.ID)
+		require.NoError(t, err)
+		require.NoError(t, baseline[0].ProjectDetail(true))
+		require.True(t, *baseline[0].DetailComplete)
+		upstream := json.RawMessage(`{"prompt":"` + strings.Repeat("u", 34000) + `"}`)
+		require.NoError(t, model.RecordTaskEventDetail(outcome.Task.ID, "request", outcome.Task.SubmitTime, model.TaskEventRequestDetail{Request: original, UpstreamRequest: upstream}))
+		stored, err := model.GetTaskEvents(outcome.Task.ID)
+		require.NoError(t, err)
+		assert.LessOrEqual(t, len(stored[0].Payload), model.TaskEventPayloadLimit)
+		require.NoError(t, stored[0].ProjectDetail(true))
+		require.True(t, *stored[0].DetailComplete)
+		assert.Equal(t, len(baseline[0].Payload), len(stored[0].Payload))
+		assert.Empty(t, stored[0].UpstreamRequest)
+	})
+}
+
+func TestTaskEventUpstreamRequestProjection(t *testing.T) {
+	for _, admin := range []bool{true, false} {
+		event := model.TaskEvent{Kind: "request", Payload: `{"model":"client-model","admin_info":{"complete":true,"payload":{"model":"client-model","prompt":"original","generate_audio":false},"upstream_request":{"model":"mapped-model","content":[{"type":"image_url","image_url":{"url":"asset://resolved-material"}}],"seed":9007199254740993,"scale":1.2300,"duration":0,"generate_audio":false,"api_key":"credential-canary"}}}`}
+		require.NoError(t, event.ProjectDetail(admin))
+		encoded, err := common.Marshal(event)
+		require.NoError(t, err)
+		var projected map[string]json.RawMessage
+		require.NoError(t, common.Unmarshal(encoded, &projected))
+		assert.JSONEq(t, `{"model":"client-model","prompt":"original","generate_audio":false}`, event.Payload)
+		if admin {
+			require.Contains(t, projected, "upstream_request")
+			var upstream string
+			require.NoError(t, common.Unmarshal(projected["upstream_request"], &upstream))
+			assert.Contains(t, upstream, "asset://resolved-material")
+			assert.Contains(t, upstream, "9007199254740993")
+			assert.Contains(t, upstream, "1.2300")
+			assert.Contains(t, upstream, `"duration":0`)
+			assert.Contains(t, upstream, `"generate_audio":false`)
+			assert.NotContains(t, upstream, "credential-canary")
+		} else {
+			assert.NotContains(t, projected, "upstream_request")
+			assert.NotContains(t, string(encoded), "mapped-model")
+			assert.NotContains(t, string(encoded), "resolved-material")
+		}
+	}
 }
 
 func TestTaskEventBusinessDetailProjection(t *testing.T) {

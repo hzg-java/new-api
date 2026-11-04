@@ -25,17 +25,51 @@ import {
 } from '@tanstack/react-router'
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from 'vitest'
 
 import { api } from '@/lib/api'
+import { ROLE } from '@/lib/roles'
+import { STATUS_QUERY_KEY } from '@/lib/status-query'
 import { useAuthStore } from '@/stores/auth-store'
 import { useSystemConfigStore } from '@/stores/system-config-store'
 
 import { OverviewDashboard } from '../overview-dashboard'
 
 const storageKey = 'dashboard_overview_setup_guide_expanded'
+const originalGetAnimations = Object.getOwnPropertyDescriptor(
+  HTMLElement.prototype,
+  'getAnimations'
+)
 let client: QueryClient
 let keyLookupError: Error | null
+
+beforeAll(() => {
+  Object.defineProperty(HTMLElement.prototype, 'getAnimations', {
+    configurable: true,
+    value: () => [],
+  })
+})
+
+afterAll(() => {
+  if (originalGetAnimations) {
+    Object.defineProperty(
+      HTMLElement.prototype,
+      'getAnimations',
+      originalGetAnimations
+    )
+  } else {
+    Reflect.deleteProperty(HTMLElement.prototype, 'getAnimations')
+  }
+})
 
 beforeEach(() => {
   window.localStorage.clear()
@@ -79,6 +113,8 @@ beforeEach(() => {
         return { data: { success: true, data: ['gpt-4o-mini'] } }
       case '/api/data/self':
         return { data: { success: true, data: [] } }
+      case '/api/perf-metrics/summary':
+        return { data: { success: true, data: { models: [] } } }
       default:
         throw new Error(`Unexpected dashboard request: ${url}`)
     }
@@ -105,6 +141,48 @@ async function renderOverview() {
     </QueryClientProvider>
   )
 }
+
+describe('overview content visibility', () => {
+  it.each([ROLE.USER, ROLE.ADMIN])(
+    'hides enabled announcements for role %s while keeping FAQ and usage visible',
+    async (role) => {
+      useAuthStore.getState().auth.setUser({
+        id: 1,
+        username: 'dashboard-user',
+        role,
+        quota: 1000000,
+        used_quota: 1000,
+        request_count: 1,
+      })
+      client.setQueryData(STATUS_QUERY_KEY, {
+        api_info_enabled: false,
+        announcements_enabled: true,
+        announcements: [{ id: 1, content: 'Platform announcement' }],
+        faq_enabled: true,
+        faq: [
+          { id: 1, question: 'How do I start?', answer: 'Create an API key.' },
+        ],
+        uptime_kuma_enabled: false,
+      })
+
+      await renderOverview()
+
+      expect(await screen.findByText('FAQ')).toBeVisible()
+      expect(
+        screen.getByRole('heading', { name: 'Usage at a glance' })
+      ).toBeVisible()
+      expect(screen.queryByText('Announcements')).not.toBeInTheDocument()
+      expect(
+        screen.queryByText('Platform announcement')
+      ).not.toBeInTheDocument()
+      if (role === ROLE.ADMIN) {
+        expect(
+          screen.getByRole('heading', { name: 'Performance health' })
+        ).toBeVisible()
+      }
+    }
+  )
+})
 
 describe('overview setup guide', () => {
   it('shows usage first and only a header entry when setup is complete', async () => {

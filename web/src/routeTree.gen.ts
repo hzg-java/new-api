@@ -28,6 +28,9 @@ import { Route as errors404RouteImport } from './routes/(errors)/404'
 import { Route as errors500RouteImport } from './routes/(errors)/500'
 import { Route as errors503RouteImport } from './routes/(errors)/503'
 import { Route as AuthenticatedChat2linkRouteImport } from './routes/_authenticated/chat2link'
+import { Route as AuthenticatedMaterialCapabilitiesRouteImport } from './routes/_authenticated/material-capabilities'
+import { Route as AuthenticatedMaterialRecordsRouteImport } from './routes/_authenticated/material-records'
+import { Route as AuthenticatedMaterialsRouteImport } from './routes/_authenticated/materials'
 import { Route as AuthenticatedSystemSettingsRouteRouteImport } from './routes/_authenticated/system-settings/route'
 import { Route as AboutIndexRouteImport } from './routes/about/index'
 import { Route as OauthProviderRouteImport } from './routes/oauth/$provider'
@@ -165,6 +168,23 @@ const errors503Route = errors503RouteImport.update({
 const AuthenticatedChat2linkRoute = AuthenticatedChat2linkRouteImport.update({
   id: '/chat2link',
   path: '/chat2link',
+  getParentRoute: () => AuthenticatedRouteRoute,
+} as any)
+const AuthenticatedMaterialCapabilitiesRoute =
+  AuthenticatedMaterialCapabilitiesRouteImport.update({
+    id: '/material-capabilities',
+    path: '/material-capabilities',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
+const AuthenticatedMaterialRecordsRoute =
+  AuthenticatedMaterialRecordsRouteImport.update({
+    id: '/material-records',
+    path: '/material-records',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
+const AuthenticatedMaterialsRoute = AuthenticatedMaterialsRouteImport.update({
+  id: '/materials',
+  path: '/materials',
   getParentRoute: () => AuthenticatedRouteRoute,
 } as any)
 const AuthenticatedSystemSettingsRouteRoute =
@@ -447,6 +467,9 @@ export interface FileRoutesByFullPath {
   '/500': typeof errors500Route
   '/503': typeof errors503Route
   '/chat2link': typeof AuthenticatedChat2linkRoute
+  '/material-capabilities': typeof AuthenticatedMaterialCapabilitiesRoute
+  '/material-records': typeof AuthenticatedMaterialRecordsRoute
+  '/materials': typeof AuthenticatedMaterialsRoute
   '/oauth/$provider': typeof OauthProviderRoute
   '/about/': typeof AboutIndexRoute
   '/pricing/': typeof PricingIndexRoute
@@ -510,6 +533,9 @@ export interface FileRoutesByTo {
   '/500': typeof errors500Route
   '/503': typeof errors503Route
   '/chat2link': typeof AuthenticatedChat2linkRoute
+  '/material-capabilities': typeof AuthenticatedMaterialCapabilitiesRoute
+  '/material-records': typeof AuthenticatedMaterialRecordsRoute
+  '/materials': typeof AuthenticatedMaterialsRoute
   '/oauth/$provider': typeof OauthProviderRoute
   '/about': typeof AboutIndexRoute
   '/pricing': typeof PricingIndexRoute
@@ -577,6 +603,9 @@ export interface FileRoutesById {
   '/(errors)/500': typeof errors500Route
   '/(errors)/503': typeof errors503Route
   '/_authenticated/chat2link': typeof AuthenticatedChat2linkRoute
+  '/_authenticated/material-capabilities': typeof AuthenticatedMaterialCapabilitiesRoute
+  '/_authenticated/material-records': typeof AuthenticatedMaterialRecordsRoute
+  '/_authenticated/materials': typeof AuthenticatedMaterialsRoute
   '/oauth/$provider': typeof OauthProviderRoute
   '/about/': typeof AboutIndexRoute
   '/pricing/': typeof PricingIndexRoute
@@ -643,6 +672,9 @@ export interface FileRouteTypes {
     | '/500'
     | '/503'
     | '/chat2link'
+    | '/material-capabilities'
+    | '/material-records'
+    | '/materials'
     | '/oauth/$provider'
     | '/about/'
     | '/pricing/'
@@ -706,6 +738,9 @@ export interface FileRouteTypes {
     | '/500'
     | '/503'
     | '/chat2link'
+    | '/material-capabilities'
+    | '/material-records'
+    | '/materials'
     | '/oauth/$provider'
     | '/about'
     | '/pricing'
@@ -772,6 +807,9 @@ export interface FileRouteTypes {
     | '/(errors)/500'
     | '/(errors)/503'
     | '/_authenticated/chat2link'
+    | '/_authenticated/material-capabilities'
+    | '/_authenticated/material-records'
+    | '/_authenticated/materials'
     | '/oauth/$provider'
     | '/about/'
     | '/pricing/'
@@ -971,6 +1009,27 @@ declare module '@tanstack/react-router' {
       path: '/chat2link'
       fullPath: '/chat2link'
       preLoaderRoute: typeof AuthenticatedChat2linkRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/material-capabilities': {
+      id: '/_authenticated/material-capabilities'
+      path: '/material-capabilities'
+      fullPath: '/material-capabilities'
+      preLoaderRoute: typeof AuthenticatedMaterialCapabilitiesRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/material-records': {
+      id: '/_authenticated/material-records'
+      path: '/material-records'
+      fullPath: '/material-records'
+      preLoaderRoute: typeof AuthenticatedMaterialRecordsRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/materials': {
+      id: '/_authenticated/materials'
+      path: '/materials'
+      fullPath: '/materials'
+      preLoaderRoute: typeof AuthenticatedMaterialsRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/system-settings': {
@@ -1383,6 +1442,9 @@ const AuthenticatedSystemSettingsRouteRouteWithChildren =
 interface AuthenticatedRouteRouteChildren {
   AuthenticatedSystemSettingsRouteRoute: typeof AuthenticatedSystemSettingsRouteRouteWithChildren
   AuthenticatedChat2linkRoute: typeof AuthenticatedChat2linkRoute
+  AuthenticatedMaterialCapabilitiesRoute: typeof AuthenticatedMaterialCapabilitiesRoute
+  AuthenticatedMaterialRecordsRoute: typeof AuthenticatedMaterialRecordsRoute
+  AuthenticatedMaterialsRoute: typeof AuthenticatedMaterialsRoute
   AuthenticatedChatChatIdRoute: typeof AuthenticatedChatChatIdRoute
   AuthenticatedDashboardSectionRoute: typeof AuthenticatedDashboardSectionRoute
   AuthenticatedErrorsErrorRoute: typeof AuthenticatedErrorsErrorRoute
@@ -1409,6 +1471,10 @@ const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedSystemSettingsRouteRoute:
     AuthenticatedSystemSettingsRouteRouteWithChildren,
   AuthenticatedChat2linkRoute: AuthenticatedChat2linkRoute,
+  AuthenticatedMaterialCapabilitiesRoute:
+    AuthenticatedMaterialCapabilitiesRoute,
+  AuthenticatedMaterialRecordsRoute: AuthenticatedMaterialRecordsRoute,
+  AuthenticatedMaterialsRoute: AuthenticatedMaterialsRoute,
   AuthenticatedChatChatIdRoute: AuthenticatedChatChatIdRoute,
   AuthenticatedDashboardSectionRoute: AuthenticatedDashboardSectionRoute,
   AuthenticatedErrorsErrorRoute: AuthenticatedErrorsErrorRoute,

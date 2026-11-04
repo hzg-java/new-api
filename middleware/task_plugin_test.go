@@ -1212,6 +1212,96 @@ export const native = {error: function(ctx, error) {
 	assert.NotContains(t, recorder.Body.String(), "password")
 }
 
+func TestRespondTaskPluginErrorPreservesMaterialPreparationIssues(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		renderHook string
+		wantNative bool
+	}{
+		{
+			name:       "native error succeeds",
+			renderHook: `export const native = {error: function(ctx, error) { return {code: error.code, data: error.data, native: true}; }};`,
+			wantNative: true,
+		},
+		{name: "missing hook fallback"},
+		{name: "throwing hook fallback", renderHook: `export const native = {error: function() { throw new Error("renderer secret"); }};`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			plugin := compileTaskRoutePlugin(t, genericTaskPluginSource+"\n"+testCase.renderHook)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/vendor/failure", nil)
+			c.Set(jsplugin.ContextKeyPinnedRoute, jsplugin.PinnedRoute{Plugin: plugin})
+			c.Set(jsplugin.ContextKeyRouteRequest, jsplugin.RouteRequestContext{
+				Path: "/vendor/failure", Method: http.MethodPost,
+				Params: map[string]string{}, Query: map[string][]string{},
+			})
+			issues := []service.MaterialPreparationIssue{
+				{Index: 1, Field: "content[1].image_url.url", Usage: "reference_image", MaterialID: "material-pending", Status: "pending", Reason: "Material is not prepared in the selected resource space"},
+				{Index: 4, Field: "content[4].image_url.url", Usage: "first_frame", MaterialID: "material-rejected", Status: "failed", Reason: "Image format unsupported: https://cdn.example.com/image.png?token=signed-secret Authorization: Bearer bearer-secret"},
+			}
+
+			handled := RespondTaskPluginError(c, &dto.TaskError{
+				Code: "material_preparation_failed", Message: "Video images are not ready; no video request was submitted",
+				Data: issues, StatusCode: http.StatusBadRequest, LocalError: true, NoRetry: true,
+			})
+
+			assert.True(t, handled)
+			assert.Equal(t, http.StatusBadRequest, recorder.Code)
+			var body struct {
+				Code   string                             `json:"code"`
+				Data   []service.MaterialPreparationIssue `json:"data"`
+				Native bool                               `json:"native"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &body))
+			assert.Equal(t, "material_preparation_failed", body.Code)
+			assert.Equal(t, testCase.wantNative, body.Native)
+			assert.Equal(t, []service.MaterialPreparationIssue{
+				{Index: 1, Field: "content[1].image_url.url", Usage: "reference_image", MaterialID: "material-pending", Status: "pending", Reason: "Material is not prepared in the selected resource space"},
+				{Index: 4, Field: "content[4].image_url.url", Usage: "first_frame", MaterialID: "material-rejected", Status: "failed", Reason: "Image format unsupported: https://***.com/***?token=*** Authorization: ***"},
+			}, body.Data)
+			assert.Contains(t, issues[1].Reason, "signed-secret", "sanitization must not mutate the original issues")
+			assert.NotContains(t, recorder.Body.String(), "cdn.example.com")
+			assert.NotContains(t, recorder.Body.String(), "signed-secret")
+			assert.NotContains(t, recorder.Body.String(), "bearer-secret")
+			assert.NotContains(t, recorder.Body.String(), "renderer secret")
+		})
+	}
+}
+
+func TestRespondTaskPluginErrorRejectsNonWhitelistedData(t *testing.T) {
+	plugin := compileTaskRoutePlugin(t, genericTaskPluginSource+`
+export const native = {error: function(ctx, error) { return error; }};`)
+	issues := []service.MaterialPreparationIssue{{Index: 2, MaterialID: "must-not-expose", Reason: "must-not-expose"}}
+	for _, testCase := range []struct {
+		name string
+		err  dto.TaskError
+	}{
+		{name: "other code", err: dto.TaskError{Code: "other_failure", StatusCode: http.StatusBadRequest, LocalError: true, NoRetry: true, Data: issues}},
+		{name: "other status", err: dto.TaskError{Code: "material_preparation_failed", StatusCode: http.StatusBadGateway, LocalError: true, NoRetry: true, Data: issues}},
+		{name: "nonlocal error", err: dto.TaskError{Code: "material_preparation_failed", StatusCode: http.StatusBadRequest, NoRetry: true, Data: issues}},
+		{name: "retryable error", err: dto.TaskError{Code: "material_preparation_failed", StatusCode: http.StatusBadRequest, LocalError: true, Data: issues}},
+		{name: "credential map", err: dto.TaskError{Code: "material_preparation_failed", StatusCode: http.StatusBadRequest, LocalError: true, NoRetry: true, Data: map[string]any{"authorization": "Bearer must-not-expose"}}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/vendor/failure", nil)
+			c.Set(jsplugin.ContextKeyPinnedRoute, jsplugin.PinnedRoute{Plugin: plugin})
+			c.Set(jsplugin.ContextKeyRouteRequest, jsplugin.RouteRequestContext{Path: "/vendor/failure", Method: http.MethodPost})
+
+			assert.True(t, RespondTaskPluginError(c, &testCase.err))
+
+			assert.Equal(t, testCase.err.StatusCode, recorder.Code)
+			var body map[string]any
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &body))
+			assert.NotContains(t, body, "data")
+			assert.NotEqual(t, "material_preparation_failed", body["code"])
+			assert.NotContains(t, recorder.Body.String(), "must-not-expose")
+		})
+	}
+}
+
 func TestTaskPluginErrorFallbackIsSanitized(t *testing.T) {
 	for _, testCase := range []struct {
 		name       string

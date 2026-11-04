@@ -50,6 +50,7 @@ type FieldName =
   | 'token'
   | 'group'
   | 'time'
+  | 'request_id'
 type LogField = {
   label: string
   value: string
@@ -93,6 +94,11 @@ export function CommonLogMobileCard<TData>(props: {
       value: formatTimestampToDate(log.created_at),
       visible: props.cells.has('created_at'),
     },
+    request_id: {
+      label: t('Request ID'),
+      value: log.request_id,
+      visible: props.cells.has('request_id') && !!log.request_id,
+    },
     user: {
       label: t('User'),
       value: log.username,
@@ -128,6 +134,7 @@ export function CommonLogMobileCard<TData>(props: {
   const costCell = props.cells.get('quota')
   const contentCell = props.cells.get('content')
   const channelCell = props.cells.get('channel')
+  const requestIdCell = props.cells.get('request_id')
   const cacheRead = other?.cache_tokens || 0
   const cacheWrite =
     (other?.cache_creation_tokens_5m || 0) +
@@ -218,6 +225,26 @@ export function CommonLogMobileCard<TData>(props: {
             </div>
           )}
       </div>
+      {requestIdCell && (
+        <div className='flex min-w-0 items-center gap-2'>
+          <span className='text-muted-foreground shrink-0 text-xs'>
+            {t('Request ID')}
+          </span>
+          {fields.request_id.visible ? (
+            <Button
+              variant='ghost'
+              aria-label={`${fields.request_id.label}: ${log.request_id}`}
+              aria-haspopup='dialog'
+              onClick={() => setSelectedField('request_id')}
+              className='h-auto min-h-8 min-w-0 flex-1 shrink justify-start px-0 py-1 text-left font-mono text-xs font-normal'
+            >
+              <span className='truncate'>{log.request_id}</span>
+            </Button>
+          ) : (
+            <span className='text-muted-foreground'>-</span>
+          )}
+        </div>
+      )}
       {visibleMetadata.length > 0 && (
         <div className='grid min-w-0 grid-cols-2 gap-x-4 gap-y-0.5'>
           {visibleMetadata.map((id) => {

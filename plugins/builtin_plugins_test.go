@@ -2,6 +2,7 @@ package plugins
 
 import (
 	"io/fs"
+	"slices"
 	"strings"
 	"testing"
 
@@ -11,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var expectedKeys = []string{"alibaba", "doubao", "google", "hailuo", "jimeng", "kling", "sora", "sunoapi", "vertex-ai", "vidu"}
+var expectedKeys = []string{"alibaba", "doubao", "google", "hailuo", "jimeng", "kling", "mobile-cloud", "sora", "sunoapi", "vertex-ai", "vidu"}
 
 func TestBuiltInVendorPluginsDeclareNativeRoutesAndLegacyChannelTypes(t *testing.T) {
 	generation := jsplugin.DefaultRegistry.Generation()
@@ -36,6 +37,8 @@ func TestBuiltInVendorPluginsDeclareNativeRoutesAndLegacyChannelTypes(t *testing
 		{"POST", "/doubao/api/v3/contents/generations/tasks", "doubao", jsplugin.RouteTypeSubmit, "", "taskCreated"},
 		{"GET", "/doubao/api/v3/contents/generations/tasks/:task_id", "doubao", jsplugin.RouteTypeQuery, "", "taskStatus"},
 		{"POST", "/doubao/api/v3/images/generations", "doubao", jsplugin.RouteTypeSubmit, "", "imageCreated"},
+		{"POST", "/mobile-cloud/v1/contents/generations/tasks", "mobile-cloud", jsplugin.RouteTypeSubmit, "", "taskCreated"},
+		{"GET", "/mobile-cloud/v1/contents/generations/tasks/:task_id", "mobile-cloud", jsplugin.RouteTypeQuery, "", "taskStatus"},
 	}
 	for _, expected := range routes {
 		t.Run(expected.method+" "+expected.path, func(t *testing.T) {
@@ -108,6 +111,16 @@ func TestBuiltInTaskPluginResponsesAndUsageContracts(t *testing.T) {
 					break
 				}
 			}
+			if key == "mobile-cloud" {
+				assert.False(t, foundResponses)
+				assert.Empty(t, plugin.Meta.UsageSchema, "the documented video API does not define a pricing formula")
+				for _, model := range plugin.Meta.Models {
+					binding, claimed := registry.Generation().LookupEndpoint("POST", "/v1/videos", model)
+					require.True(t, claimed)
+					assert.Same(t, plugin, binding.Plugin)
+				}
+				return
+			}
 			require.True(t, foundResponses, "openai_responses claim must be present")
 			assert.Equal(t, []string{"stream", "sync", "background"}, responsesClaim.Supports)
 			for _, model := range plugin.Meta.Models {
@@ -143,6 +156,9 @@ func TestBuiltInResponsesDecodersEchoChannelMappedAlias(t *testing.T) {
 			plugin, registerErr := registry.RegisterFactory(source, jsplugin.Options{Key: key})
 			require.NoError(t, registerErr)
 			require.NotEmpty(t, plugin.Meta.Models)
+			if !slices.ContainsFunc(plugin.Meta.Protocols, func(claim jsplugin.ProtocolClaim) bool { return claim.Name == "openai_responses" }) {
+				return
+			}
 
 			alias := "alias-under-test"
 			upstreamModel := plugin.Meta.Models[0]
@@ -369,6 +385,221 @@ func TestBuiltInPluginsAddressNewAPIUpstreamOnNativeRoutes(t *testing.T) {
 				_, hasSSEHeader := descriptor.Headers["X-DashScope-Sse"]
 				assert.Equal(t, variant.wantSSEHeader, hasSSEHeader)
 			})
+		}
+	})
+}
+
+func TestMobileCloudNativeRoutesCoexistWithSeedanceProvider(t *testing.T) {
+	source, err := Source("mobile-cloud")
+	require.NoError(t, err)
+	registry := jsplugin.NewRegistry()
+	_, err = registry.RegisterFactory(source, jsplugin.Options{Key: "mobile-cloud"})
+	require.NoError(t, err)
+	provider := `
+export const meta = {
+  apiVersion: 1, key: "buluai-seedance", name: "Seedance Provider", version: "1.0.0",
+  author: {name: "Test"}, models: ["AICC-Doubao-Seedance-2.0"], fetchMode: "per_task",
+  routes: [
+    {method: "POST", path: "/v1/contents/generations/tasks", type: "submit", decode: "create", render: "render"},
+    {method: "GET", path: "/v1/contents/generations/tasks/:task_id", type: "query", render: "render"}
+  ]
+};
+export const native = {
+  create(ctx) { return {kind: "submit", model: ctx.body.value.model, requestBody: ctx.body.value}; },
+  render(ctx, task) { return task.data; }
+};
+export function buildSubmitRequest(ctx) { return {url: ctx.baseUrl + "/v1/contents/generations/tasks", method: "POST", body: ctx.requestBody}; }
+export function parseSubmitResponse(ctx, response) { return {taskId: response.body.id, taskData: response.body}; }
+export function buildQueryRequest(ctx) { return {url: ctx.baseUrl + "/v1/contents/generations/tasks/" + ctx.taskId, method: "GET"}; }
+export function parseTaskResult(ctx, body) { return {status: "UNKNOWN"}; }
+`
+	_, err = registry.Register(provider, jsplugin.Options{Key: "buluai-seedance"})
+	require.NoError(t, err)
+	for path, key := range map[string]string{
+		"/v1/contents/generations/tasks":              "buluai-seedance",
+		"/mobile-cloud/v1/contents/generations/tasks": "mobile-cloud",
+	} {
+		binding, ok := registry.Generation().LookupDeclaredRoute("POST", path)
+		require.True(t, ok)
+		assert.Equal(t, key, binding.Plugin.Meta.Key)
+	}
+}
+
+func TestMobileCloudPluginContract(t *testing.T) {
+	plugin, found := jsplugin.DefaultRegistry.Generation().Get("mobile-cloud")
+	require.True(t, found)
+	call := func(t *testing.T, export string, members []string, args ...any) map[string]any {
+		t.Helper()
+		value, err := plugin.Engine.CallPath(t.Context(), export, members, args...)
+		require.NoError(t, err)
+		encoded, err := common.Marshal(value)
+		require.NoError(t, err)
+		var result map[string]any
+		require.NoError(t, common.Unmarshal(encoded, &result))
+		return result
+	}
+
+	t.Run("CDN download is credentialless and preserves the client method", func(t *testing.T) {
+		for _, method := range []string{"GET", "HEAD"} {
+			descriptor := call(t, "buildContentRequest", nil, map[string]any{
+				"apiKey": "must-not-reach-cdn", "authHeader": "Bearer must-not-reach-cdn", "artifactKey": "video",
+				"data":          map[string]any{"content": map[string]any{"video_url": "https://cdn.example/video.mp4?signature=keep"}},
+				"clientRequest": map[string]any{"method": method},
+			})
+			assert.Equal(t, map[string]any{"url": "https://cdn.example/video.mp4?signature=keep", "method": method, "credentialless": true}, descriptor)
+		}
+	})
+
+	t.Run("native presenters overlay durable host state on the provider snapshot", func(t *testing.T) {
+		for _, tc := range []struct{ host, vendor string }{
+			{"NOT_START", "queued"}, {"QUEUED", "queued"}, {"IN_PROGRESS", "running"}, {"SUCCESS", "succeeded"}, {"FAILURE", "failed"},
+		} {
+			t.Run(tc.host, func(t *testing.T) {
+				for _, presenter := range []string{"taskCreated", "taskStatus"} {
+					task := map[string]any{
+						"task_id": "task_public", "status": tc.host,
+						"data": map[string]any{"id": "private-id", "model": "private-model", "status": "stale-status", "priority": 0, "content": map[string]any{"video_url": "https://cdn.example/video.mp4"}, "error": map[string]any{"code": "provider_code", "message": "stale reason"}},
+					}
+					if tc.host == "FAILURE" {
+						task["fail_reason"] = "Task polling failed"
+					}
+					view := call(t, "native", []string{presenter}, map[string]any{}, task)
+					assert.Equal(t, "task_public", view["id"])
+					assert.Equal(t, tc.vendor, view["status"])
+					assert.NotContains(t, view, "model")
+					assert.Equal(t, float64(0), view["priority"])
+					assert.Equal(t, map[string]any{"video_url": "https://cdn.example/video.mp4"}, view["content"])
+					if tc.host == "FAILURE" {
+						assert.Equal(t, map[string]any{"code": "provider_code", "message": "Task polling failed"}, view["error"])
+					}
+				}
+			})
+		}
+		view := call(t, "native", []string{"taskStatus"}, map[string]any{}, map[string]any{"task_id": "task_public", "status": "FAILURE", "fail_reason": "Timed out"})
+		assert.Equal(t, map[string]any{"id": "task_public", "status": "failed", "error": map[string]any{"message": "Timed out"}}, view)
+	})
+
+	t.Run("video bodies normalize to the documented JSON request", func(t *testing.T) {
+		text := map[string]any{"type": "text", "text": "a cat"}
+		image := map[string]any{"type": "image_url", "image_url": map[string]any{"url": "https://images.example/cat.png"}}
+		asset := map[string]any{"type": "image_url", "image_url": map[string]any{"url": "asset://existing-id"}}
+		for _, tc := range []struct {
+			name    string
+			body    map[string]any
+			content []any
+			extra   map[string]any
+		}{
+			{"native JSON", map[string]any{"kind": "json", "value": map[string]any{"model": "alias", "content": []any{text}, "duration": 5}}, []any{text}, nil},
+			{"multipart text only", map[string]any{"kind": "multipart", "fields": map[string][]string{"model": {"alias"}, "prompt": {"a cat"}, "seconds": {"5"}}, "files": []any{}}, []any{text}, nil},
+			{"form text only", map[string]any{"kind": "form", "fields": map[string][]string{"model": {"alias"}, "prompt": {"a cat"}, "seconds": {"5"}}}, []any{text}, nil},
+			{"image URL", map[string]any{"kind": "multipart", "fields": map[string][]string{"prompt": {"a cat"}, "seconds": {"5"}, "image": {"https://images.example/cat.png"}}}, []any{image, text}, nil},
+			{"repeated images", map[string]any{"kind": "multipart", "fields": map[string][]string{"prompt": {"a cat"}, "seconds": {"5"}, "images": {"https://images.example/cat.png", "asset://existing-id"}}}, []any{image, asset, text}, nil},
+			{"input reference and metadata", map[string]any{"kind": "multipart", "fields": map[string][]string{"prompt": {"a cat"}, "seconds": {"5"}, "input_reference": {"asset://existing-id"}, "metadata": {`{"duration":9,"seed":0,"generate_audio":false,"watermark":false,"camera_fixed":false,"ratio":"adaptive"}`}}}, []any{asset, text}, map[string]any{"seed": float64(0), "generate_audio": false, "watermark": false, "camera_fixed": false, "ratio": "adaptive"}},
+			{"JSON explicit values", map[string]any{"kind": "json", "value": map[string]any{"prompt": "a cat", "seconds": "5", "seed": 0, "generate_audio": false, "metadata": map[string]any{"duration": 9, "seed": 42, "generate_audio": true}}}, []any{text}, map[string]any{"seed": float64(0), "generate_audio": false}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				export, members := "protocols", []string{"openai_video", "decodeRequest"}
+				if tc.name == "native JSON" {
+					export, members = "native", []string{"createTask"}
+				}
+				intent := call(t, export, members, map[string]any{"model": "alias", "body": tc.body})
+				assert.Equal(t, "submit", intent["kind"])
+				assert.Equal(t, "alias", intent["model"])
+				action := "text_to_video"
+				if len(tc.content) > 1 {
+					action = "image_to_video"
+				}
+				assert.Equal(t, action, intent["action"])
+				want := map[string]any{"model": "alias", "content": tc.content, "duration": float64(5)}
+				for key, value := range tc.extra {
+					want[key] = value
+				}
+				assert.Equal(t, want, intent["requestBody"])
+				descriptor := call(t, "buildSubmitRequest", nil, map[string]any{"baseUrl": "https://provider.example/v1/", "apiKey": "key", "model": "alias", "upstreamModel": "seedance-2.0", "requestBody": intent["requestBody"]})
+				want["model"] = "seedance-2.0"
+				assert.Equal(t, want, descriptor["body"])
+				assert.Equal(t, "https://provider.example/v1/contents/generations/tasks", descriptor["url"])
+				assert.Equal(t, "POST", descriptor["method"])
+				assert.Equal(t, map[string]any{"Content-Type": "application/json", "Accept": "application/json", "Authorization": "Bearer key"}, descriptor["headers"])
+			})
+		}
+	})
+
+	t.Run("rejects malformed JSON values and metadata", func(t *testing.T) {
+		for _, invalid := range []any{nil, true, 42, "not an object", []any{}} {
+			_, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{"model": "alias", "body": map[string]any{"kind": "json", "value": invalid}})
+			assert.ErrorContains(t, err, "JSON object required")
+			_, err = plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{"model": "alias", "body": map[string]any{"kind": "json", "value": map[string]any{"prompt": "a cat", "metadata": invalid}}})
+			assert.ErrorContains(t, err, "metadata must be an object")
+		}
+	})
+
+	t.Run("rejects invalid form fields and uploaded files", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			fields map[string][]string
+			files  []any
+			error  string
+		}{
+			{"duplicate prompt", map[string][]string{"prompt": {"one", "two"}}, nil, "prompt must have exactly one value"},
+			{"empty field", map[string][]string{"prompt": {"a cat"}, "seconds": {}}, nil, "seconds must have exactly one value"},
+			{"metadata scalar", map[string][]string{"prompt": {"a cat"}, "metadata": {"false"}}, nil, "metadata must be an object"},
+			{"metadata array", map[string][]string{"prompt": {"a cat"}, "metadata": {"[]"}}, nil, "metadata must be an object"},
+			{"metadata syntax", map[string][]string{"prompt": {"a cat"}, "metadata": {"{"}}, nil, "metadata must be a JSON object"},
+			{"uploaded input", map[string][]string{"prompt": {"a cat"}}, []any{map[string]any{"ref": "request_file:input_reference", "field": "input_reference", "filename": "cat.png", "mimeType": "image/png", "size": 100}}, "Uploaded files are not supported; use a public HTTPS image URL or an asset:// reference"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				_, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{"model": "alias", "body": map[string]any{"kind": "multipart", "fields": tc.fields, "files": tc.files}})
+				assert.ErrorContains(t, err, tc.error)
+			})
+		}
+	})
+
+	t.Run("validates canonical fields on every input surface", func(t *testing.T) {
+		for _, tc := range []struct {
+			field string
+			value any
+			error string
+		}{
+			{"prompt", 42, "prompt must be a string"},
+			{"images", "https://images.example/cat.png", "images must be an array"},
+			{"image", false, "image URL"},
+			{"input_reference", "request_file:input_reference", "Uploaded files are not supported"},
+			{"image", map[string]any{"__fileRef": "request_file:image", "encoding": "dataUrl"}, "Uploaded files are not supported"},
+			{"image", "data:image/png;base64,AA==", "image URL"},
+			{"image", "http://images.example/cat.png", "image URL"},
+			{"image", "https://", "image URL"},
+			{"seconds", true, "duration"},
+			{"seconds", []any{5}, "duration"},
+			{"seconds", "", "duration"},
+			{"seconds", "NaN", "duration"},
+			{"seconds", 0, "duration"},
+			{"seconds", 3601, "duration"},
+		} {
+			t.Run(tc.field+"/"+tc.error, func(t *testing.T) {
+				req := map[string]any{"prompt": "a cat", tc.field: tc.value}
+				_, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{"model": "alias", "body": map[string]any{"kind": "json", "value": req}})
+				assert.ErrorContains(t, err, tc.error)
+			})
+		}
+		for _, kind := range []string{"form", "multipart"} {
+			_, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{"model": "alias", "body": map[string]any{"kind": kind, "fields": map[string][]string{"prompt": {"a cat"}, "seconds": {"3601"}}}})
+			assert.ErrorContains(t, err, "duration")
+			_, err = plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{"model": "alias", "body": map[string]any{"kind": kind, "fields": map[string][]string{"prompt": {"a cat"}, "metadata": {`{"duration":3601}`}}}})
+			assert.ErrorContains(t, err, "duration")
+		}
+		_, err := plugin.Engine.CallPath(t.Context(), "native", []string{"createTask"}, map[string]any{"body": map[string]any{"kind": "json", "value": map[string]any{"model": "seedance-2.5", "content": []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,AA=="}}}}}})
+		assert.ErrorContains(t, err, "image URL")
+	})
+
+	t.Run("query and submit response follow the documented wire contract", func(t *testing.T) {
+		descriptor := call(t, "buildQueryRequest", nil, map[string]any{"baseUrl": "https://provider.example/v1", "apiKey": "key", "taskId": "id/with space"})
+		assert.Equal(t, map[string]any{"url": "https://provider.example/v1/contents/generations/tasks/id%2Fwith%20space", "method": "GET", "headers": map[string]any{"Accept": "application/json", "Authorization": "Bearer key"}}, descriptor)
+		response := call(t, "parseSubmitResponse", nil, map[string]any{}, map[string]any{"body": map[string]any{"id": "upstream-id"}})
+		assert.Equal(t, "upstream-id", response["taskId"])
+		for _, id := range []any{nil, "", "  ", 42} {
+			_, err := plugin.Engine.Call(t.Context(), "parseSubmitResponse", map[string]any{}, map[string]any{"body": map[string]any{"id": id}})
+			assert.ErrorContains(t, err, "video task id is missing")
 		}
 	})
 }

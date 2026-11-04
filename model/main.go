@@ -369,10 +369,16 @@ func migrateDB() error {
 		&SystemInstance{},
 		&SystemTask{},
 		&SystemTaskLock{},
+		&MaterialGroup{},
+		&MaterialRoute{},
+		&MaterialCapability{},
 		&CasbinRule{},
 		&AuthzRole{},
 	)
 	if err != nil {
+		return err
+	}
+	if err := MigrateMaterialPreparation(DB); err != nil {
 		return err
 	}
 	if err := InitializeUserAuthVersions(); err != nil {

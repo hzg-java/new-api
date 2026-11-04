@@ -252,6 +252,9 @@ func validateOptionValue(key string, value string) error {
 }
 
 func UpdateOption(key string, value string) error {
+	if key == MobileCloudMaterialConfigOption || key == TopenRouterMaterialConfigOption {
+		return ErrMobileCloudMaterialTestOnly
+	}
 	if key == UserModelPricingMultiplierOption {
 		return UpdateOptionsBulk(map[string]string{key: value})
 	}
@@ -289,6 +292,11 @@ func UpdateOption(key string, value string) error {
 // is touched — safe for callers that must commit a set of related options
 // atomically (e.g. payment gateway binding).
 func UpdateOptionsBulk(values map[string]string) error {
+	for _, key := range []string{MobileCloudMaterialConfigOption, TopenRouterMaterialConfigOption} {
+		if _, reserved := values[key]; reserved {
+			return ErrMobileCloudMaterialTestOnly
+		}
+	}
 	if len(values) == 0 {
 		return nil
 	}

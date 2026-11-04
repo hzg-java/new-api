@@ -76,7 +76,7 @@ export function CommonLogsStats() {
       const params = buildApiParams({
         page: 1,
         pageSize: 1,
-        searchParams,
+        searchParams: { ...searchParams, requestId: undefined },
         columnFilters: [],
         isAdmin,
       })

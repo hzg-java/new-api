@@ -849,6 +849,7 @@ func executeTaskSubmissionWith(
 		stage = "submit"
 		capture.finalErrorLog = nil
 		capture.attemptError = nil
+		common.SetContextKey(c, constant.ContextKeyTaskEventUpstreamRequest, nil)
 		result, taskErr = submit(c, relayInfo)
 		if requestErr := c.Request.Context().Err(); requestErr != nil {
 			diagnostics.cancelled("after_submit", retryParam.GetRetry()+1)
@@ -1005,7 +1006,8 @@ func executeTaskSubmissionWith(
 	if err := model.RecordTaskEvent(task.ID, "request", task.SubmitTime, map[string]any{"model": relayInfo.OriginModelName}); err != nil {
 		common.SysError("record task request event: " + err.Error())
 	}
-	if err := model.RecordTaskEventDetail(task.ID, "request", task.SubmitTime, originalRequest); err != nil {
+	upstreamRequest, _ := common.GetContextKeyType[json.RawMessage](c, constant.ContextKeyTaskEventUpstreamRequest)
+	if err := model.RecordTaskEventDetail(task.ID, "request", task.SubmitTime, model.TaskEventRequestDetail{Request: originalRequest, UpstreamRequest: upstreamRequest}); err != nil {
 		common.SysError("record task request detail: " + err.Error())
 	}
 	acceptedStatus := "queued"

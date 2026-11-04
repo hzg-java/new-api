@@ -50,6 +50,7 @@ export interface CommonFilters {
  */
 export interface CommonLogFilters extends CommonFilters {
   model?: string
+  requestId?: string
   token?: string
   group?: string
   username?: string
@@ -328,6 +329,7 @@ export interface TaskEvent {
   kind: 'request' | 'accepted' | 'result'
   timestamp: number
   payload: string
+  upstream_request?: string
   detail_complete?: boolean
   detail_unavailable?: string
 }
@@ -458,6 +460,7 @@ export interface GetLogsParams {
   username?: string
   token_name?: string
   model_name?: string
+  request_id?: string
   start_timestamp?: number
   end_timestamp?: number
   channel?: number

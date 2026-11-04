@@ -17,19 +17,60 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, renderHook } from '@testing-library/react'
+import {
+  createMemoryHistory,
+  createRootRoute,
+  createRouter,
+  RouterContextProvider,
+} from '@tanstack/react-router'
+import { cleanup, render, renderHook, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import type { ReactNode } from 'react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from 'vitest'
 
 import { checkIsActive } from '@/components/layout/lib/url-utils'
+import { SearchProvider } from '@/context/search-provider'
 import {
   parseSidebarModulesAdmin,
   serializeSidebarModulesAdmin,
 } from '@/features/system-settings/maintenance/config'
+import { ROLE } from '@/lib/roles'
 import { useAuthStore } from '@/stores/auth-store'
 
-import { useSidebarConfig } from '../use-sidebar-config'
-import { useSidebarData } from '../use-sidebar-data'
+import { useSidebarView } from '../use-sidebar-view'
+
+const originalGetAnimations = Object.getOwnPropertyDescriptor(
+  HTMLElement.prototype,
+  'getAnimations'
+)
+
+beforeAll(() => {
+  Object.defineProperty(HTMLElement.prototype, 'getAnimations', {
+    configurable: true,
+    value: () => [],
+  })
+})
+
+afterAll(() => {
+  if (originalGetAnimations) {
+    Object.defineProperty(
+      HTMLElement.prototype,
+      'getAnimations',
+      originalGetAnimations
+    )
+  } else {
+    Reflect.deleteProperty(HTMLElement.prototype, 'getAnimations')
+  }
+})
 
 beforeEach(() => {
   vi.stubGlobal('localStorage', {
@@ -64,18 +105,23 @@ function sidebarFor(
     permissions: { sidebar_settings: canConfigure },
     sidebar_modules: user ? JSON.stringify(user) : '',
   })
+  const router = createRouter({
+    routeTree: createRootRoute(),
+    history: createMemoryHistory({ initialEntries: ['/materials'] }),
+  })
   function Wrapper(props: { children: ReactNode }) {
     return (
       <QueryClientProvider client={client}>
-        {props.children}
+        <RouterContextProvider router={router}>
+          {props.children}
+        </RouterContextProvider>
       </QueryClientProvider>
     )
   }
-  const result = renderHook(
-    () => useSidebarConfig(useSidebarData().navGroups),
-    { wrapper: Wrapper }
-  )
-  return result
+  const result = renderHook(() => useSidebarView().navGroups, {
+    wrapper: Wrapper,
+  })
+  return { ...result, Wrapper }
 }
 
 describe('security sidebar visibility', () => {
@@ -193,4 +239,150 @@ describe('audit log sidebar entry', () => {
     expect(titles).not.toContain('Usage Logs')
     expect(titles).toContain('Audit Logs')
   })
+})
+
+describe('material sidebar entries', () => {
+  it('keeps administrator material entries out of the ordinary user command menu', async () => {
+    const { Wrapper } = sidebarFor(undefined, undefined, true, ROLE.USER)
+    render(<SearchProvider>{null}</SearchProvider>, { wrapper: Wrapper })
+    const user = userEvent.setup()
+    await user.keyboard('{Control>}k{/Control}')
+
+    expect(await screen.findByRole('option', { name: 'Profile' })).toBeVisible()
+    expect(
+      screen.queryByRole('option', { name: 'Material library' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('option', { name: 'All materials' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('option', { name: 'Material routes' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('option', {
+        name: 'Material integrations',
+      })
+    ).not.toBeInTheDocument()
+  })
+
+  it('keeps disabled material sections out of the administrator command menu', async () => {
+    const { Wrapper } = sidebarFor({
+      console: { enabled: false },
+      admin: { enabled: false },
+    })
+    render(<SearchProvider>{null}</SearchProvider>, { wrapper: Wrapper })
+    const user = userEvent.setup()
+    await user.keyboard('{Control>}k{/Control}')
+
+    expect(await screen.findByRole('option', { name: 'Profile' })).toBeVisible()
+    expect(
+      screen.queryByRole('option', { name: 'Material library' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('option', { name: 'All materials' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('option', { name: 'Material routes' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('option', {
+        name: 'Material integrations',
+      })
+    ).not.toBeInTheDocument()
+  })
+
+  it('keeps material routes out of the administrator command menu even when legacy settings enable it', async () => {
+    const { Wrapper } = sidebarFor(
+      { admin: { enabled: true, material_routes: true } },
+      { admin: { enabled: true, material_routes: true } }
+    )
+    render(<SearchProvider>{null}</SearchProvider>, { wrapper: Wrapper })
+    const user = userEvent.setup()
+    await user.keyboard('{Control>}k{/Control}')
+
+    expect(
+      await screen.findByRole('option', { name: 'All materials' })
+    ).toBeVisible()
+    expect(
+      screen.queryByRole('option', { name: 'Material routes' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('option', { name: 'Material library' })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.getByRole('option', { name: 'Material integrations' })
+    ).toBeVisible()
+  })
+
+  it.each([ROLE.USER, ROLE.ADMIN])(
+    'never restores the retired console entry for role %s even with explicit enablement',
+    (role) => {
+      const { result } = sidebarFor(
+        { console: { enabled: true, materials: true } },
+        { console: { enabled: true, materials: true } },
+        true,
+        role
+      )
+      const urls = result.current.flatMap((group) =>
+        group.items.map((item) => item.url)
+      )
+      expect(urls).not.toContain('/materials')
+      if (role >= ROLE.ADMIN) {
+        expect(urls.filter((url) => url === '/material-records')).toHaveLength(
+          1
+        )
+        return
+      }
+      expect(urls).not.toContain('/material-records')
+      expect(urls).not.toContain('/material-routes')
+      expect(urls).not.toContain('/material-capabilities')
+    }
+  )
+
+  it.each([ROLE.ADMIN, ROLE.SUPER_ADMIN])(
+    'keeps material routes out of the sidebar for role %s with explicit legacy enablement',
+    (role) => {
+      const { result } = sidebarFor(
+        { admin: { enabled: true, channel: true, material_routes: true } },
+        { admin: { enabled: true, channel: true, material_routes: true } },
+        true,
+        role
+      )
+      const items =
+        result.current.find((group) => group.id === 'admin')?.items ?? []
+      expect(items).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            title: 'All materials',
+            url: '/material-records',
+          }),
+          expect.objectContaining({
+            title: 'Material integrations',
+            url: '/material-capabilities',
+          }),
+        ])
+      )
+      expect(items.map((item) => item.url)).not.toContain('/material-routes')
+      expect(
+        items.filter((item) => checkIsActive('/material-records', item))
+      ).toEqual([expect.objectContaining({ url: '/material-records' })])
+    }
+  )
+
+  it.each([
+    [{ console: { enabled: false }, admin: { enabled: false } }, undefined],
+    [undefined, { console: { enabled: false }, admin: { enabled: false } }],
+  ])(
+    'hides material links when their sections are disabled (%j, %j)',
+    (admin, user) => {
+      const { result } = sidebarFor(admin, user)
+      const urls = result.current.flatMap((group) =>
+        group.items.map((item) => item.url)
+      )
+      expect(urls).not.toContain('/materials')
+      expect(urls).not.toContain('/material-records')
+      expect(urls).not.toContain('/material-routes')
+      expect(urls).not.toContain('/material-capabilities')
+    }
+  )
 })

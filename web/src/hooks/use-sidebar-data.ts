@@ -23,6 +23,7 @@ import {
   CreditCard,
   FileText,
   FlaskConical,
+  Grid2X2,
   Key,
   LayoutDashboard,
   ListTodo,
@@ -141,6 +142,18 @@ export function useSidebarData(): SidebarData {
             title: t('Models'),
             url: '/models/metadata',
             icon: Box,
+          },
+          {
+            title: t('All materials'),
+            url: '/material-records',
+            icon: ClipboardList,
+            requiredRole: ROLE.ADMIN,
+          },
+          {
+            title: t('Material integrations'),
+            url: '/material-capabilities',
+            icon: Grid2X2,
+            requiredRole: ROLE.ADMIN,
           },
           {
             title: t('Users'),

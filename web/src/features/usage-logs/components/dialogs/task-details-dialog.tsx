@@ -190,6 +190,25 @@ export function TaskTimeline(props: { events: TaskEvent[] }) {
                     iconClassName='size-3.5'
                   />
                 </CodeBlock>
+                {isAdmin &&
+                event.kind === 'request' &&
+                event.upstream_request ? (
+                  <CodeBlock
+                    code={formatTaskEventPayload(event.upstream_request)}
+                    language='json'
+                    title={t('Actual Model Request')}
+                    enableCollapse={false}
+                    maxExpandedLines={14}
+                    showToolbar
+                    showLineNumbers
+                  >
+                    <CopyButton
+                      value={event.upstream_request}
+                      className='size-8'
+                      iconClassName='size-3.5'
+                    />
+                  </CodeBlock>
+                ) : null}
               </li>
             )
           })}

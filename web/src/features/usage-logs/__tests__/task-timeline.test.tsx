@@ -42,8 +42,165 @@ describe('task event content', () => {
     }
   )
 
+  test.each([ROLE.ADMIN, ROLE.SUPER_ADMIN])(
+    'shows separate original and actual requests with exact copying for administrator role %s',
+    async (role) => {
+      const user = userEvent.setup()
+      useAuthStore.getState().auth.setUser({ id: 7, username: 'admin', role })
+      const payload = '{"image":"https://example.com/input.png","seed":0}'
+      const upstreamRequest =
+        '{"image":"asset://prepared","id":9007199254740993,"options":{"scale":1.2300,"enabled":false},"items":[0,null]}'
+      render(
+        <TaskTimeline
+          events={[
+            {
+              kind: 'request',
+              timestamp: 1700000000,
+              payload,
+              upstream_request: upstreamRequest,
+            },
+          ]}
+        />
+      )
+      expect(screen.getAllByRole('listitem')).toHaveLength(1)
+      expect(
+        screen
+          .getAllByRole('textbox', { name: /Request|Accepted|Result/ })
+          .map((viewer) => viewer.getAttribute('aria-label'))
+      ).toEqual(['User Request', 'Actual Model Request'])
+      const original = screen.getByRole('textbox', { name: 'User Request' })
+      expect(
+        Array.from(
+          original.querySelectorAll('.cm-line'),
+          (line) => line.textContent
+        )
+      ).toEqual([
+        '{',
+        '  "image": "https://example.com/input.png",',
+        '  "seed": 0',
+        '}',
+      ])
+      const actual = screen.getByRole('textbox', {
+        name: 'Actual Model Request',
+      })
+      expect(actual).toHaveAttribute('aria-readonly', 'true')
+      expect(
+        Array.from(
+          actual.querySelectorAll('.cm-line'),
+          (line) => line.textContent
+        )
+      ).toEqual([
+        '{',
+        '  "image": "asset://prepared",',
+        '  "id": 9007199254740993,',
+        '  "options": {',
+        '    "scale": 1.2300,',
+        '    "enabled": false',
+        '  },',
+        '  "items": [',
+        '    0,',
+        '    null',
+        '  ]',
+        '}',
+      ])
+      const copyButtons = screen.getAllByRole('button', {
+        name: 'Copy to clipboard',
+      })
+      expect(copyButtons).toHaveLength(2)
+      await user.click(copyButtons[0])
+      expect(await navigator.clipboard.readText()).toBe(payload)
+      await user.click(copyButtons[1])
+      expect(await navigator.clipboard.readText()).toBe(upstreamRequest)
+    }
+  )
+
+  test.each([undefined, ''])(
+    'omits the actual request block for historical or unconfigured requests with value %s',
+    (upstreamRequest) => {
+      useAuthStore
+        .getState()
+        .auth.setUser({ id: 7, username: 'admin', role: ROLE.ADMIN })
+      render(
+        <TaskTimeline
+          events={[
+            {
+              kind: 'request',
+              timestamp: 1700000000,
+              payload: '{"prompt":"hello"}',
+              upstream_request: upstreamRequest,
+            },
+          ]}
+        />
+      )
+      expect(
+        screen.getAllByRole('textbox', { name: /Request|Accepted|Result/ })
+      ).toHaveLength(1)
+      expect(screen.queryByText('Actual Model Request')).not.toBeInTheDocument()
+      expect(
+        screen.getAllByRole('button', { name: 'Copy to clipboard' })
+      ).toHaveLength(1)
+    }
+  )
+
+  test.each(['accepted', 'result'] as const)(
+    'omits the actual request block on an administrator %s event',
+    (kind) => {
+      useAuthStore
+        .getState()
+        .auth.setUser({ id: 7, username: 'admin', role: ROLE.ADMIN })
+      render(
+        <TaskTimeline
+          events={[
+            {
+              kind,
+              timestamp: 1700000000,
+              payload: '{}',
+              upstream_request: '{"image":"non-request-canary"}',
+            },
+          ]}
+        />
+      )
+      expect(
+        screen.getAllByRole('textbox', { name: /Request|Accepted|Result/ })
+      ).toHaveLength(1)
+      expect(screen.queryByText('Actual Model Request')).not.toBeInTheDocument()
+      expect(screen.queryByText(/non-request-canary/)).not.toBeInTheDocument()
+    }
+  )
+
+  test('shows and copies the actual request unavailability marker without replacing the user request', async () => {
+    const user = userEvent.setup()
+    useAuthStore
+      .getState()
+      .auth.setUser({ id: 7, username: 'admin', role: ROLE.ADMIN })
+    const upstreamRequest = '{"unavailable":"size_limit_exceeded"}'
+    render(
+      <TaskTimeline
+        events={[
+          {
+            kind: 'request',
+            timestamp: 1700000000,
+            payload: '{"prompt":"original-request"}',
+            upstream_request: upstreamRequest,
+          },
+        ]}
+      />
+    )
+    expect(
+      screen.getByRole('textbox', { name: 'User Request' })
+    ).toHaveTextContent('original-request')
+    const actual = screen.getByRole('textbox', { name: 'Actual Model Request' })
+    expect(actual).toHaveTextContent('"unavailable": "size_limit_exceeded"')
+    const copyButtons = screen.getAllByRole('button', {
+      name: 'Copy to clipboard',
+    })
+    expect(copyButtons).toHaveLength(2)
+    await user.click(copyButtons[1])
+    expect(await navigator.clipboard.readText()).toBe(upstreamRequest)
+  })
+
   test.each([ROLE.USER, null])(
-    'hides result but preserves business details for role %s',
+    'hides result and actual request but preserves business details for role %s',
     (role) => {
       useAuthStore
         .getState()
@@ -55,6 +212,7 @@ describe('task event content', () => {
               kind: 'request',
               timestamp: 1700000000,
               payload: '{"prompt":"hello","duration":0}',
+              upstream_request: '{"image":"upstream-request-canary"}',
             },
             {
               kind: 'accepted',
@@ -80,6 +238,10 @@ describe('task event content', () => {
         screen.queryByRole('textbox', { name: 'Task Result' })
       ).not.toBeInTheDocument()
       expect(screen.queryByText(/result-canary/)).not.toBeInTheDocument()
+      expect(screen.queryByText('Actual Model Request')).not.toBeInTheDocument()
+      expect(
+        screen.queryByText(/upstream-request-canary/)
+      ).not.toBeInTheDocument()
       expect(
         screen.getAllByRole('button', { name: 'Copy to clipboard' })
       ).toHaveLength(2)

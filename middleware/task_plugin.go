@@ -1239,18 +1239,38 @@ func RespondTaskPluginError(c *gin.Context, taskErr *dto.TaskError) bool {
 		return false
 	}
 	sanitized := sanitizedTaskPluginError(taskErr.StatusCode, taskErr.Message)
+	var safeData []map[string]any
+	if taskErr.Code == "material_preparation_failed" && taskErr.StatusCode == http.StatusBadRequest && taskErr.LocalError && taskErr.NoRetry {
+		if issues, ok := taskErr.Data.([]service.MaterialPreparationIssue); ok {
+			sanitized.Code = taskErr.Code
+			safeData = make([]map[string]any, len(issues))
+			for i, issue := range issues {
+				reason := types.NewError(errors.New("Material preparation failed"), types.ErrorCodeBadResponse,
+					types.ErrOptionWithUpstreamResponse(types.OpenAIError{Message: issue.Reason})).ToOpenAIRelayError().Message
+				// Explicitly whitelist public fields; never forward arbitrary TaskError.Data.
+				safeData[i] = map[string]any{
+					"index": issue.Index, "field": issue.Field, "usage": issue.Usage,
+					"material_id": issue.MaterialID, "status": issue.Status, "reason": reason,
+				}
+			}
+		}
+	}
 	requestID := c.GetString(common.RequestIdKey)
 	hasRenderer, err := pinned.Plugin.Engine.HasCallablePath(c.Request.Context(), "native", "error")
 	requestValue, exists := c.Get(pluginruntime.ContextKeyRouteRequest)
 	requestContext, ok := requestValue.(pluginruntime.RouteRequestContext)
 	if err == nil && hasRenderer && exists && ok {
-		body, callErr := pinned.Plugin.Engine.CallMember(c.Request.Context(), "native", "error", requestContext.JSValue(), map[string]any{
+		errorValue := map[string]any{
 			"code":       sanitized.Code,
 			"message":    sanitized.Message,
 			"httpStatus": sanitized.HTTPStatus,
 			"retryable":  sanitized.Retryable,
 			"requestId":  requestID,
-		})
+		}
+		if safeData != nil {
+			errorValue["data"] = safeData
+		}
+		body, callErr := pinned.Plugin.Engine.CallMember(c.Request.Context(), "native", "error", requestContext.JSValue(), errorValue)
 		if callErr == nil {
 			logger.LogDebug(
 				c,
@@ -1284,6 +1304,7 @@ func RespondTaskPluginError(c *gin.Context, taskErr *dto.TaskError) bool {
 	c.JSON(sanitized.HTTPStatus, &dto.TaskError{
 		Code:       sanitized.Code,
 		Message:    message,
+		Data:       safeData,
 		StatusCode: sanitized.HTTPStatus,
 	})
 	return true

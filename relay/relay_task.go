@@ -197,7 +197,7 @@ func ApplyOriginTaskAffinity(c *gin.Context, info *relaycommon.RelayInfo) *dto.T
 // 估算计费(EstimateBilling) → 计算价格 → 预扣费（仅首次）→
 // 构建/发送/解析上游请求 → 提交后计费调整(AdjustBillingOnSubmit)。
 // 共享控制器编排负责未落库退款、最终额度预留、落库和结算。
-func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitResult, *dto.TaskError) {
+func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (_ *TaskSubmitResult, finalTaskErr *dto.TaskError) {
 	info.InitChannelMeta(c)
 
 	// 1. 确定 platform → 创建适配器 → 验证请求
@@ -346,12 +346,32 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		}
 	}
 
+	materialReserved := false
+	if preparer, ok := adaptor.(channel.TaskMaterialPreparationProvider); ok {
+		release, taskErr := preparer.PrepareMaterialRequest(c, info)
+		if release != nil {
+			defer release()
+			materialReserved = true
+		}
+		if taskErr != nil {
+			return nil, taskErr
+		}
+	}
+
 	// 8. 构建请求体
 	requestBody, err := adaptor.BuildRequestBody(c, info)
 	if err != nil {
 		return nil, service.TaskErrorWrapper(err, "build_request_failed", http.StatusInternalServerError)
 	}
 
+	// A lost response cannot prove that a reserved video submission was rejected.
+	if materialReserved {
+		defer func() {
+			if finalTaskErr != nil {
+				finalTaskErr.NoRetry = true
+			}
+		}()
+	}
 	// 9. 发送请求
 	resp, err := adaptor.DoRequest(c, info, requestBody)
 	if err != nil {

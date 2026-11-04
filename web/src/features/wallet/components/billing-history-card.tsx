@@ -32,23 +32,33 @@ import { TitledCard } from '@/components/ui/titled-card'
 import { getUserLogs } from '@/features/usage-logs/api'
 import { usageLogSchema } from '@/features/usage-logs/data/schema'
 import { parseLogOther } from '@/features/usage-logs/lib/format'
+import { getUserTopupLogs } from '@/features/users/api'
 import { formatLogQuota } from '@/lib/format'
 import { requireServerSuccess } from '@/lib/server-error-message'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { formatTimestamp } from '../lib/billing'
 
-export function BillingHistoryCard() {
+export function BillingHistoryCard(props: { userId?: number }) {
   const { t } = useTranslation()
-  const userId = useAuthStore((state) => state.auth.user?.id)
+  const currentUserId = useAuthStore((state) => state.auth.user?.id)
+  const userId = props.userId ?? currentUserId
   const [pagination, setPagination] = useState({ pageIndex: 0, pageSize: 10 })
   const page = pagination.pageIndex + 1
   const { pageSize } = pagination
   const history = useQuery({
-    queryKey: ['wallet-topup-logs', userId, page, pageSize],
+    queryKey: [
+      'wallet-topup-logs',
+      props.userId === undefined ? 'self' : 'admin',
+      userId,
+      page,
+      pageSize,
+    ],
     queryFn: async () => {
       const data = requireServerSuccess(
-        await getUserLogs({ p: page, page_size: pageSize, type: 1 })
+        props.userId === undefined
+          ? await getUserLogs({ p: page, page_size: pageSize, type: 1 })
+          : await getUserTopupLogs(props.userId, page, pageSize)
       ).data
       return {
         total: data?.total ?? 0,

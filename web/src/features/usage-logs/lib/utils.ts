@@ -180,11 +180,13 @@ export function buildApiParams(config: {
   }
 
   // Build base params from search params
+  const requestId = String(searchParams.requestId ?? '').trim()
   const params: GetLogsParams = {
     p: page,
     page_size: pageSize,
     ...(searchParams.type ? { type: processType(searchParams.type) } : {}),
     ...(searchParams.model ? { model_name: String(searchParams.model) } : {}),
+    ...(requestId ? { request_id: requestId } : {}),
     ...(searchParams.token ? { token_name: String(searchParams.token) } : {}),
     ...(searchParams.group ? { group: String(searchParams.group) } : {}),
     ...(isAdmin && searchParams.channel

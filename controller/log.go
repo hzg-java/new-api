@@ -232,6 +232,37 @@ func GetUserLogs(c *gin.Context) {
 	return
 }
 
+func GetUserTopupLogsByAdmin(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil || id <= 0 {
+		common.ApiErrorMsg(c, "invalid user id")
+		return
+	}
+	target, err := model.GetUserById(id, false)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if !canManageTargetRole(c.GetInt("role"), target.Role) {
+		common.ApiErrorMsg(c, "no permission")
+		return
+	}
+
+	pageInfo := common.GetPageQuery(c)
+	if pageInfo.Page < 1 || pageInfo.PageSize < 1 {
+		common.ApiErrorMsg(c, "invalid pagination parameters")
+		return
+	}
+	logs, total, err := model.GetUserLogs(id, model.LogTypeTopup, 0, 0, "", "", pageInfo.GetStartIdx(), pageInfo.GetPageSize(), "", "", "")
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	pageInfo.SetTotal(int(total))
+	pageInfo.SetItems(logs)
+	common.ApiSuccess(c, pageInfo)
+}
+
 // Deprecated: SearchAllLogs 已废弃，前端未使用该接口。
 func SearchAllLogs(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
