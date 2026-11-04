@@ -420,9 +420,12 @@ describe('TopenRouter configuration', () => {
     expect(screen.getByLabelText('Token')).toBeDisabled()
     expect(screen.getByLabelText('API endpoint')).toBeDisabled()
     expect(screen.getByLabelText('Channel ID')).toBeDisabled()
-    expect(
-      screen.getByRole('switch', { name: 'Automatic material preparation' })
-    ).toBeDisabled()
+    const toggle = screen.getByRole('switch', {
+      name: 'Automatic material preparation',
+    })
+    expect(toggle).toHaveAttribute('aria-disabled', 'true')
+    await user.click(toggle)
+    expect(toggle).toHaveAttribute('aria-checked', 'true')
     expect(
       screen.getByRole('button', { name: 'Toggle password visibility' })
     ).toBeDisabled()
@@ -497,6 +500,9 @@ describe('TopenRouter configuration', () => {
     await user.type(screen.getByLabelText('Token'), 'next-draft-token')
     await user.clear(screen.getByLabelText('Channel ID'))
     await user.type(screen.getByLabelText('Channel ID'), '84')
+    await user.click(
+      screen.getByRole('switch', { name: 'Automatic material preparation' })
+    )
     await act(async () =>
       finishRefetch({
         data: {
@@ -519,6 +525,9 @@ describe('TopenRouter configuration', () => {
     )
     expect(screen.getByLabelText('Token')).toHaveValue('next-draft-token')
     expect(screen.getByLabelText('Channel ID')).toHaveValue(84)
+    expect(
+      screen.getByRole('switch', { name: 'Automatic material preparation' })
+    ).toHaveAttribute('aria-checked', 'false')
   })
 
   it('refreshes an untouched saved channel after success resets its dirty state', async () => {
@@ -607,7 +616,7 @@ describe('TopenRouter configuration', () => {
     const toggle = screen.getByRole('switch', {
       name: 'Automatic material preparation',
     })
-    expect(toggle).toBeDisabled()
+    expect(toggle).toHaveAttribute('aria-disabled', 'true')
     expect(toggle).toHaveAttribute('aria-checked', 'false')
     await user.click(toggle)
     expect(toggle).toHaveAttribute('aria-checked', 'false')

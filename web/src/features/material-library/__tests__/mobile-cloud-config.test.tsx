@@ -370,9 +370,15 @@ describe('Mobile Cloud configuration', () => {
     await user.clear(screen.getByLabelText('Pool-Id'))
     await user.type(screen.getByLabelText('Pool-Id'), 'unsaved-pool')
     await user.type(screen.getByLabelText('Access key (AK)'), 'next-ak')
+    await user.click(
+      screen.getByRole('switch', { name: 'Automatic material preparation' })
+    )
     await act(async () =>
       finishRefetch({ data: { success: true, data: savedConfig } })
     )
+    expect(
+      screen.getByRole('switch', { name: 'Automatic material preparation' })
+    ).toHaveAttribute('aria-checked', 'false')
     expect(screen.getByLabelText('Pool-Id')).toHaveValue('unsaved-pool')
     expect(screen.getByLabelText('Access key (AK)')).toHaveValue('next-ak')
     expect(localStorage.length).toBe(0)
@@ -476,9 +482,12 @@ describe('Mobile Cloud configuration', () => {
       expect(screen.getByLabelText(label)).toBeDisabled()
     }
     expect(screen.getByRole('button', { name: 'Saving...' })).toBeDisabled()
-    expect(
-      screen.getByRole('switch', { name: 'Automatic material preparation' })
-    ).toBeDisabled()
+    const toggle = screen.getByRole('switch', {
+      name: 'Automatic material preparation',
+    })
+    expect(toggle).toHaveAttribute('aria-disabled', 'true')
+    await user.click(toggle)
+    expect(toggle).toHaveAttribute('aria-checked', 'true')
     expect(
       screen.getByRole('button', { name: 'Toggle password visibility' })
     ).toBeDisabled()
@@ -525,7 +534,7 @@ describe('Mobile Cloud configuration', () => {
       const toggle = screen.getByRole('switch', {
         name: 'Automatic material preparation',
       })
-      expect(toggle).toBeDisabled()
+      expect(toggle).toHaveAttribute('aria-disabled', 'true')
       expect(toggle).toHaveAttribute('aria-checked', 'false')
       await user.click(toggle)
       expect(toggle).toHaveAttribute('aria-checked', 'false')

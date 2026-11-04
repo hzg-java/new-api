@@ -390,7 +390,7 @@ func TestMobileCloudMaterialConfig(t *testing.T) {
 	t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY_FILE", filepath.Join(t.TempDir(), "material.key"))
 	const key = "MobileCloudMaterialConfigSecret"
 	const endpoint = "https://ecloud.10086.cn/api/openapi-maas"
-	require.NoError(t, db.Where("key = ?", key).Delete(&model.Option{}).Error)
+	require.NoError(t, db.Where("key IN ?", []string{key, model.TopenRouterMaterialConfigOption}).Delete(&model.Option{}).Error)
 	router := newAdminMaterialRouter(t)
 	const path = "/api/material/mobile-cloud/config"
 	admin := &users[0]

@@ -322,6 +322,7 @@ it('keeps saved Mobile Cloud configuration when an older background GET finishes
   }
   const saved: MobileCloudConfig = {
     ...previous,
+    enabled: false,
     endpoint: 'https://new.example.test',
     access_key_masked: '********new',
     pool_id: 'new-pool',

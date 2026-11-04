@@ -116,6 +116,9 @@ describe('Material integrations page', () => {
     })
     await user.click(screen.getByRole('tab', { name: 'Mobile Cloud' }))
     expect(await screen.findByLabelText('Access key (AK)')).toBeVisible()
+    expect(
+      screen.getByRole('switch', { name: 'Automatic material preparation' })
+    ).toHaveAttribute('aria-checked', 'true')
     expect(screen.queryByLabelText('Token')).not.toBeInTheDocument()
     vi.mocked(api.get).mockClear()
     await act(async () => {
