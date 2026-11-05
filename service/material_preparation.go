@@ -309,8 +309,18 @@ func PrepareMaterial(ctx context.Context, material *model.Material, scope string
 		}
 		return finishMaterialPreparation(db, material, binding, owner, "processing", "", false)
 	}
-	if asset.ID != binding.AssetID || asset.GroupID != binding.GroupID || asset.Type != "Image" {
-		return finishMaterialPreparation(db, material, binding, owner, "uncertain", "Material response does not match the requested material", false)
+	var mismatchedFields []string
+	if asset.ID != binding.AssetID {
+		mismatchedFields = append(mismatchedFields, "asset ID")
+	}
+	if asset.GroupID != binding.GroupID {
+		mismatchedFields = append(mismatchedFields, "group ID")
+	}
+	if asset.Type != "Image" {
+		mismatchedFields = append(mismatchedFields, "asset type")
+	}
+	if len(mismatchedFields) > 0 {
+		return finishMaterialPreparation(db, material, binding, owner, "uncertain", "Material response does not match the requested material: "+strings.Join(mismatchedFields, ", "), true)
 	}
 	binding.UpstreamStatus = asset.Status
 	switch asset.Status {

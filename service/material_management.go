@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -445,8 +446,12 @@ func SyncMaterial(ctx context.Context, material *model.Material, channels []Mate
 	for _, channel := range channels {
 		targets[channel.Scope] = channel
 	}
+	recheckOnly := material.Status == model.MaterialStatusPending && slices.ContainsFunc(existing, model.MaterialBinding.CanRecheckResponse)
 	channels = make([]MaterialChannel, 0, len(existing))
 	for _, binding := range existing {
+		if recheckOnly && !binding.CanRecheckResponse() {
+			continue
+		}
 		channel, ok := targets[binding.Scope]
 		if !ok {
 			channel = MaterialChannel{ChannelID: binding.ChannelID, ChannelName: binding.ChannelName, Provider: binding.Provider, Scope: binding.Scope}
@@ -461,7 +466,7 @@ func SyncMaterial(ctx context.Context, material *model.Material, channels []Mate
 		return err
 	}
 	var failures []error
-	if material.GroupId != nil {
+	if material.GroupId != nil && !recheckOnly {
 		var group model.MaterialGroup
 		if err := db.Where("id = ? AND user_id = ?", *material.GroupId, material.UserId).First(&group).Error; err != nil {
 			return err

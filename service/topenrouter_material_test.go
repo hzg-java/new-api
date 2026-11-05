@@ -180,6 +180,29 @@ func TestTopenRouterMaterialGroupRecoveryDescription(t *testing.T) {
 }
 
 func TestTopenRouterMaterialStatusAndProcessingPrivacy(t *testing.T) {
+	for _, tc := range []struct {
+		name, detail, reason string
+	}{
+		{"nested review failure", `"Error":{"Code":"InputImageSensitiveContentDetected","Message":"The request failed because the input image may contain sensitive information; https://private.example/input?token=private-token; Authorization: Bearer test-platform-token"}`, "InputImageSensitiveContentDetected: The request failed because the input image may contain sensitive information"},
+		{"nested reason overrides legacy reason", `"Error":{"Code":"InputImageSensitiveContentDetected","Message":"Image rejected"},"ErrorMessage":"Legacy reason"`, "InputImageSensitiveContentDetected: Image rejected"},
+		{"code without message", `"Error":{"Code":"InputImageSensitiveContentDetected"}`, "InputImageSensitiveContentDetected"},
+		{"message without code", `"Error":{"Message":"Image rejected"}`, "Image rejected"},
+		{"empty error preserves legacy reason", `"Error":{},"ErrorMessage":"Unsupported image format"`, "Unsupported image format"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = fmt.Fprintf(w, `{"Result":{"Id":"asset-1","GroupId":"group-1","AssetType":"Image","Status":"Failed",%s}}`, tc.detail)
+			}))
+			defer server.Close()
+			asset, err := newTopenRouterMaterialTestClient(t, server).GetAsset(t.Context(), "asset-1")
+			require.NoError(t, err, "a rejected image is a material state, not a failed GetAsset call")
+			assert.Equal(t, "FAILED", asset.Status)
+			assert.Contains(t, asset.ErrorMessage, tc.reason)
+			for _, private := range []string{"test-platform-token", "private-token", "private.example", "/input", "Legacy reason"} {
+				assert.NotContains(t, asset.ErrorMessage, private)
+			}
+		})
+	}
 	for _, tc := range []struct{ native, normalized string }{{"Processing", "PROCESSING"}, {"Active", "ACTIVE"}, {"Failed", "FAILED"}, {"FutureState", "FUTURESTATE"}} {
 		t.Run(tc.native, func(t *testing.T) {
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

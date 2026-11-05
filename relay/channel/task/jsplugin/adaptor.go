@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -30,6 +31,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
@@ -259,6 +261,20 @@ func (a *TaskAdaptor) PrepareMaterialRequest(c *gin.Context, info *relaycommon.R
 		message := "Video material preparation failed"
 		if err == nil {
 			message = "Video images are not ready; no video request was submitted"
+			var details strings.Builder
+			for i, issue := range issues {
+				if i > 0 {
+					details.WriteString("; ")
+				}
+				details.WriteString(issue.Field)
+				if issue.MaterialID != "" {
+					fmt.Fprintf(&details, " (material %s)", issue.MaterialID)
+				}
+				reason := types.NewError(errors.New("Material preparation failed"), types.ErrorCodeBadResponse,
+					types.ErrOptionWithUpstreamResponse(types.OpenAIError{Message: issue.Reason})).ToOpenAIRelayError().Message
+				fmt.Fprintf(&details, ": %s", reason)
+			}
+			message += ": " + details.String()
 		}
 		return nil, &dto.TaskError{Code: "material_preparation_failed", Message: message, Data: issues, StatusCode: http.StatusBadRequest, LocalError: true, NoRetry: true}
 	}

@@ -2100,6 +2100,7 @@ func TestTopenRouterVideoUploadBeforeSubmit(t *testing.T) {
 	operations := make(map[string]int)
 	var uploadedURLs []string
 	polls := make(map[string]int)
+	rejectedAsset := ""
 	materialServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodPost, r.Method)
 		assert.Equal(t, "/v1/api/assets/", r.URL.Path)
@@ -2129,6 +2130,10 @@ func TestTopenRouterVideoUploadBeforeSubmit(t *testing.T) {
 			id, ok := input["Id"].(string)
 			assert.True(t, ok)
 			polls[id]++
+			if id == rejectedAsset {
+				_, _ = fmt.Fprintf(w, `{"ResponseMetadata":{"Action":"GetAsset"},"Result":{"Id":%q,"GroupId":"topen-group","AssetType":"Image","Status":"Failed","Error":{"Code":"InputImageSensitiveContentDetected","Message":"The request failed because the input image may contain sensitive information; https://private.example/input?token=private-token; Authorization: Bearer test-token"}}}`, id)
+				return
+			}
 			status := "Processing"
 			if polls[id] > 1 {
 				status = "Active"
@@ -2376,6 +2381,82 @@ func TestTopenRouterVideoUploadBeforeSubmit(t *testing.T) {
 	}
 	assert.Equal(t, 7, videoCalls)
 	assert.Equal(t, map[string]int{"CreateAssetGroup": 1, "CreateAsset": 2, "GetAsset": 4, "Processing": 2, "Active": 2}, operations)
+	t.Run("review rejection identifies the image in API errors", func(t *testing.T) {
+		rejectedAsset = "topen-asset-2"
+		defer func() { rejectedAsset = "" }()
+		var failed model.Material
+		require.NoError(t, db.Where("user_id = ? AND source_url = ?", users[1].Id, publicMaterialURL+"?last").First(&failed).Error)
+		require.NoError(t, db.Model(&failed).Update("status", "processing").Error)
+		require.NoError(t, db.Model(&model.MaterialBinding{}).Where("material_id = ? AND channel_id = ?", failed.Id, channel.Id).Updates(map[string]any{"state": "processing", "upstream_status": "PROCESSING"}).Error)
+		renderedPlugin, err := pluginruntime.CompilePlugin(source+"\nnative.error = function(ctx, error) { return {code: error.code, message: error.message}; };", pluginruntime.Options{Key: "mobile-cloud"})
+		require.NoError(t, err)
+		beforeVideo, beforeUpload, beforeGroup := videoCalls, operations["CreateAsset"], operations["CreateAssetGroup"]
+		for _, surface := range []string{"openai_video", "native message-only renderer"} {
+			t.Run(surface, func(t *testing.T) {
+				request := map[string]any{"model": "seedance-2.0", "content": content}
+				recorder := httptest.NewRecorder()
+				path := "/v1/videos"
+				if surface != "openai_video" {
+					path = nativePath
+				}
+				c := newMaterialContext(recorder, http.MethodPost, path, "", users[1].Id)
+				common.SetContextKey(c, constant.ContextKeyOriginalModel, "seedance-2.0")
+				common.SetContextKey(c, constant.ContextKeyChannelId, channel.Id)
+				common.SetContextKey(c, constant.ContextKeyChannelType, channel.Type)
+				common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, videoServer.URL)
+				common.SetContextKey(c, constant.ContextKeyChannelKey, channel.Key)
+				c.Set("task_request", request)
+				c.Set("task_action", constant.TaskActionImageToVideo)
+				c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Plugin: plugin})
+				if surface != "openai_video" {
+					c.Set(pluginruntime.ContextKeyPinnedRoute, pluginruntime.PinnedRoute{Plugin: renderedPlugin})
+					c.Set(pluginruntime.ContextKeyRouteRequest, pluginruntime.RouteRequestContext{Method: http.MethodPost, Path: path})
+				}
+				events := []string{}
+				info := &relaycommon.RelayInfo{UserId: users[1].Id, OriginModelName: "seedance-2.0", UserGroup: "default", UsingGroup: "default", Billing: &taskSubmissionTestBilling{events: &events}, TaskRelayInfo: &relaycommon.TaskRelayInfo{Action: constant.TaskActionImageToVideo}}
+				result, taskErr := relay.RelayTaskSubmit(c, info)
+				assert.Nil(t, result)
+				require.NotNil(t, taskErr)
+				assert.Equal(t, "material_preparation_failed", taskErr.Code)
+				assert.True(t, taskErr.NoRetry)
+				issues, ok := taskErr.Data.([]service.MaterialPreparationIssue)
+				require.True(t, ok)
+				require.Len(t, issues, 1)
+				assert.Equal(t, 2, issues[0].Index)
+				assert.Equal(t, "content[2].image_url.url", issues[0].Field)
+				assert.Equal(t, "last_frame", issues[0].Usage)
+				assert.Equal(t, failed.MaterialID, issues[0].MaterialID)
+				assert.Equal(t, "failed", issues[0].Status)
+				assert.Contains(t, issues[0].Reason, "InputImageSensitiveContentDetected")
+				respondTaskSubmissionError(c, taskErr)
+				assert.Equal(t, http.StatusBadRequest, recorder.Code)
+				var body struct {
+					Message string                             `json:"message"`
+					Data    []service.MaterialPreparationIssue `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &body))
+				for _, detail := range []string{"content[2].image_url.url", failed.MaterialID, "InputImageSensitiveContentDetected", "input image may contain sensitive information"} {
+					assert.Contains(t, body.Message, detail)
+				}
+				if surface == "openai_video" {
+					assert.Equal(t, issues, body.Data)
+				}
+				for _, private := range []string{"test-token", "private-token", "private.example", publicMaterialURL, "/input"} {
+					assert.NotContains(t, recorder.Body.String(), private)
+				}
+			})
+		}
+		var stored model.MaterialBinding
+		require.NoError(t, db.Where("material_id = ? AND channel_id = ?", failed.Id, channel.Id).First(&stored).Error)
+		assert.Equal(t, "failed", stored.State)
+		assert.Equal(t, "FAILED", stored.UpstreamStatus)
+		assert.Contains(t, stored.FailReason, "InputImageSensitiveContentDetected")
+		assert.Equal(t, "topen-asset-2", stored.AssetID)
+		assert.Equal(t, "topen-group", stored.GroupID)
+		assert.Equal(t, beforeVideo, videoCalls)
+		assert.Equal(t, beforeUpload, operations["CreateAsset"])
+		assert.Equal(t, beforeGroup, operations["CreateAssetGroup"])
+	})
 }
 
 func TestTopenRouterVideoBodyChannelBinding(t *testing.T) {
@@ -3284,6 +3365,227 @@ func TestAIGCMaterialRetryRecovery(t *testing.T) {
 	}
 }
 
+func TestAIGCMaterialResponseMismatchRecheck(t *testing.T) {
+	db, users := setupAdminMaterialPostgres(t)
+	for _, tc := range []struct {
+		name       string
+		assetID    string
+		groupID    string
+		assetType  string
+		wantFields string
+		nextStatus string
+		stillWrong bool
+		wantState  string
+		queryError bool
+	}{
+		{"asset ID differs then recovers", "foreign-asset", "upstream-group", "Image", "asset ID", "ACTIVE", false, "ready", false},
+		{"missing group then recovers", "upstream-asset", "", "Image", "group ID", "ACTIVE", false, "ready", false},
+		{"different group stays unavailable", "upstream-asset", "foreign-group", "Image", "group ID", "ACTIVE", true, "uncertain", false},
+		{"missing type resumes processing", "upstream-asset", "upstream-group", "", "asset type", "PROCESSING", false, "processing", false},
+		{"wrong type stays unavailable", "upstream-asset", "upstream-group", "Video", "asset type", "ACTIVE", true, "uncertain", false},
+		{"multiple differences are identified", "https://private.example/asset?token=private-token", "foreign-group", "Video", "asset ID, group ID, asset type", "ACTIVE", false, "ready", false},
+		{"query error preserves the existing upload", "upstream-asset", "", "Image", "group ID", "ACTIVE", false, "ready", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			material := model.Material{MaterialID: model.NewPlatformMaterialID(), UserId: users[1].Id, Name: tc.name, LibraryType: "AIGC", FileType: "Image", SourceURL: publicMaterialURL, Status: "processing"}
+			require.NoError(t, db.Create(&material).Error)
+			binding := model.MaterialBinding{MaterialId: material.Id, Scope: material.MaterialID, Version: model.MaterialSourceVersion(&material), ChannelID: 16, Provider: "topenrouter", GroupID: "upstream-group", AssetID: "upstream-asset", State: "processing", StartedAt: common.GetTimestamp() - 601}
+			require.NoError(t, db.Create(&binding).Error)
+			provider := &materialPreparationProvider{assetResponse: &service.MobileCloudAsset{ID: tc.assetID, GroupID: tc.groupID, Type: tc.assetType, Status: "ACTIVE"}}
+
+			require.NoError(t, service.PrepareMaterial(t.Context(), &material, binding.Scope, provider))
+			require.NoError(t, db.First(&material, material.Id).Error)
+			require.NoError(t, db.First(&binding, binding.Id).Error)
+			assert.Equal(t, "failed", material.Status)
+			assert.True(t, material.CanRetry)
+			assert.Equal(t, "uncertain", binding.State)
+			assert.True(t, binding.CanRetry)
+			assert.Equal(t, "Material response does not match the requested material: "+tc.wantFields, binding.FailReason)
+			assert.NotContains(t, material.FailReason, "private.example")
+			assert.NotContains(t, material.FailReason, "private-token")
+			resolved, issues, err := service.ResolvePreparedMaterials(t.Context(), material.UserId, binding.Scope, []service.MaterialReference{{ID: material.Id}})
+			require.NoError(t, err)
+			assert.Nil(t, resolved)
+			require.Len(t, issues, 1)
+
+			retried, err := model.RetryUserMaterial(material.UserId, material.Id)
+			require.NoError(t, err)
+			if !tc.stillWrong {
+				provider.assetResponse = &service.MobileCloudAsset{ID: binding.AssetID, GroupID: binding.GroupID, Type: "Image", Status: tc.nextStatus}
+			}
+			if tc.queryError {
+				provider.getErr = context.DeadlineExceeded
+				require.NoError(t, service.PrepareMaterial(t.Context(), retried, binding.Scope, provider))
+				require.NoError(t, db.First(&material, material.Id).Error)
+				require.NoError(t, db.First(&binding, binding.Id).Error)
+				assert.Equal(t, "processing", material.Status)
+				assert.Equal(t, "upstream-asset", binding.AssetID)
+				assert.Equal(t, "upstream-group", binding.GroupID)
+				assert.Zero(t, provider.assets)
+				provider.getErr = nil
+			}
+			require.NoError(t, service.PrepareMaterial(t.Context(), retried, binding.Scope, provider))
+			require.NoError(t, db.First(&material, material.Id).Error)
+			require.NoError(t, db.First(&binding, binding.Id).Error)
+			assert.Equal(t, tc.wantState, binding.State)
+			assert.Equal(t, "upstream-asset", binding.AssetID)
+			assert.Equal(t, "upstream-group", binding.GroupID)
+			assert.Zero(t, provider.groups)
+			assert.Zero(t, provider.assets)
+			assert.Zero(t, provider.groupLists)
+			assert.Zero(t, provider.assetLists)
+			wantGets := 2
+			if tc.queryError {
+				wantGets++
+			}
+			assert.Equal(t, wantGets, provider.assetGets)
+			if tc.stillWrong {
+				assert.Equal(t, "failed", material.Status)
+				assert.True(t, material.CanRetry)
+			} else {
+				assert.Equal(t, tc.wantState, material.Status)
+				assert.Empty(t, material.FailReason)
+				assert.Empty(t, binding.FailReason)
+				assert.Equal(t, tc.nextStatus, binding.UpstreamStatus)
+			}
+			if tc.wantState == "processing" {
+				provider.assetResponse.Status = "ACTIVE"
+				require.NoError(t, service.PrepareMaterial(t.Context(), &material, binding.Scope, provider))
+				require.NoError(t, db.First(&material, material.Id).Error)
+				assert.Equal(t, "ready", material.Status)
+				assert.Zero(t, provider.assets)
+			}
+		})
+	}
+}
+
+func TestAIGCMaterialResponseMismatchRecheckIsolation(t *testing.T) {
+	db, users := setupAdminMaterialPostgres(t)
+	for _, tc := range []struct {
+		name       string
+		reason     string
+		otherState string
+		canRetry   bool
+	}{
+		{"legacy mismatch does not retry another failure", "Material response does not match the requested material", "failed", false},
+		{"new mismatch does not upload another pending binding", "Material response does not match the requested material: group ID", "pending", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			group := model.MaterialGroup{UserId: users[1].Id, Name: tc.name}
+			require.NoError(t, model.SaveMaterialGroup(&group))
+			material := model.Material{MaterialID: model.NewPlatformMaterialID(), UserId: users[1].Id, GroupId: &group.Id, Name: tc.name, LibraryType: "AIGC", FileType: "Image", SourceURL: publicMaterialURL, Status: "failed", CanRetry: tc.canRetry}
+			require.NoError(t, db.Create(&material).Error)
+			other := model.MaterialBinding{MaterialId: material.Id, Scope: material.MaterialID + "-other", Version: model.MaterialSourceVersion(&material), ChannelID: 5, Provider: "mobile_cloud", GroupID: "upstream-group", State: tc.otherState, CanRetry: true, FailReason: "An unrelated channel failure"}
+			if tc.otherState == "failed" {
+				other.AssetID = "failed-asset"
+			}
+			require.NoError(t, db.Create(&other).Error)
+			binding := model.MaterialBinding{MaterialId: material.Id, Scope: material.MaterialID, Version: other.Version, ChannelID: 16, Provider: "topenrouter", GroupID: "upstream-group", AssetID: "upstream-asset", State: "uncertain", CanRetry: tc.canRetry, FailReason: tc.reason, StartedAt: common.GetTimestamp()}
+			require.NoError(t, db.Create(&binding).Error)
+			provider, otherProvider := &materialPreparationProvider{status: "ACTIVE"}, &materialPreparationProvider{status: "ACTIVE"}
+			retried, err := model.RetryUserMaterial(material.UserId, material.Id)
+			require.NoError(t, err)
+			channels := []service.MaterialChannel{{ChannelID: 5, Scope: other.Scope, Provider: other.Provider, Client: otherProvider}, {ChannelID: 16, Scope: binding.Scope, Provider: binding.Provider, Client: provider}}
+
+			require.NoError(t, service.SyncMaterial(t.Context(), retried, channels))
+
+			require.NoError(t, db.First(&binding, binding.Id).Error)
+			assert.Equal(t, "ready", binding.State)
+			assert.Equal(t, "upstream-asset", binding.AssetID)
+			require.NoError(t, db.First(&other, other.Id).Error)
+			assert.Equal(t, tc.otherState, other.State)
+			assert.Equal(t, "An unrelated channel failure", other.FailReason)
+			if tc.otherState == "failed" {
+				assert.Equal(t, "failed-asset", other.AssetID)
+			} else {
+				assert.Empty(t, other.AssetID)
+			}
+			assert.Equal(t, 1, provider.assetGets)
+			assert.Zero(t, otherProvider.assetGets)
+			assert.Zero(t, provider.groups)
+			assert.Zero(t, provider.assets)
+			assert.Zero(t, otherProvider.groups)
+			assert.Zero(t, otherProvider.assets)
+			assert.Zero(t, provider.updates)
+			assert.Zero(t, otherProvider.updates)
+		})
+	}
+}
+
+func TestAIGCMaterialResponseMismatchLegacyRetry(t *testing.T) {
+	db, users := setupAdminMaterialPostgres(t)
+	for _, tc := range []struct {
+		name      string
+		state     string
+		assetID   string
+		groupID   string
+		reason    string
+		stale     bool
+		deleting  bool
+		wantRetry bool
+	}{
+		{"known asset can be rechecked", "uncertain", "upstream-asset", "upstream-group", "Material response does not match the requested material", false, false, true},
+		{"unknown upload cannot be retried", "uncertain", "", "upstream-group", "Material response does not match the requested material", false, false, false},
+		{"unknown group cannot be retried", "uncertain", "upstream-asset", "", "Material response does not match the requested material", false, false, false},
+		{"other uncertainty remains blocked", "uncertain", "upstream-asset", "upstream-group", "Multiple matching materials require administrator review", false, false, false},
+		{"stale binding remains blocked", "uncertain", "upstream-asset", "upstream-group", "Material response does not match the requested material", true, false, false},
+		{"failed upload remains blocked", "failed", "upstream-asset", "upstream-group", "Material response does not match the requested material", false, false, false},
+		{"deleting material remains blocked", "uncertain", "upstream-asset", "upstream-group", "Material response does not match the requested material", false, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			material := model.Material{MaterialID: model.NewPlatformMaterialID(), UserId: users[1].Id, Name: tc.name, LibraryType: "AIGC", FileType: "Image", SourceURL: publicMaterialURL, Status: "failed", CanRetry: false, Deleting: tc.deleting, FailReason: tc.reason}
+			require.NoError(t, db.Create(&material).Error)
+			binding := model.MaterialBinding{MaterialId: material.Id, Scope: material.MaterialID, Version: model.MaterialSourceVersion(&material), ChannelID: 16, Provider: "topenrouter", GroupID: tc.groupID, AssetID: tc.assetID, State: tc.state, FailReason: tc.reason, StartedAt: common.GetTimestamp()}
+			if tc.stale {
+				binding.Version = "previous-source"
+			}
+			require.NoError(t, db.Create(&binding).Error)
+
+			recorder := httptest.NewRecorder()
+			c := newMaterialContext(recorder, http.MethodGet, "/api/material/list?keyword="+material.MaterialID, "", material.UserId)
+			ListMaterials(c)
+			var listed materialListEnvelope
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &listed))
+			require.True(t, listed.Success)
+			require.Len(t, listed.Data, 1)
+			assert.Equal(t, tc.wantRetry, listed.Data[0].CanRetry)
+			var stored model.Material
+			require.NoError(t, db.First(&stored, material.Id).Error)
+			assert.False(t, stored.CanRetry, "listing must not modify persisted material state")
+
+			recorder = httptest.NewRecorder()
+			c = newMaterialContext(recorder, http.MethodPost, "/api/material/"+strconv.Itoa(material.Id)+"/retry", "", users[2].Id)
+			c.Params = gin.Params{{Key: "id", Value: strconv.Itoa(material.Id)}}
+			RetryMaterial(c)
+			var denied materialEnvelope
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &denied))
+			assert.False(t, denied.Success)
+
+			recorder = httptest.NewRecorder()
+			c = newMaterialContext(recorder, http.MethodPost, "/api/material/"+strconv.Itoa(material.Id)+"/retry", "", material.UserId)
+			c.Params = gin.Params{{Key: "id", Value: strconv.Itoa(material.Id)}}
+			RetryMaterial(c)
+			var retried materialEnvelope
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &retried))
+			require.Equal(t, tc.wantRetry, retried.Success, recorder.Body.String())
+			if !tc.wantRetry {
+				return
+			}
+			assert.Equal(t, "pending", retried.Data.Status)
+			require.Len(t, retried.Data.Bindings, 1)
+			assert.Equal(t, binding.AssetID, retried.Data.Bindings[0].AssetID)
+			assert.Equal(t, binding.GroupID, retried.Data.Bindings[0].GroupID)
+			provider := &materialPreparationProvider{status: "ACTIVE"}
+			require.NoError(t, service.PrepareMaterial(t.Context(), &retried.Data, binding.Scope, provider))
+			require.NoError(t, db.First(&material, material.Id).Error)
+			assert.Equal(t, "ready", material.Status)
+			assert.Zero(t, provider.groups)
+			assert.Zero(t, provider.assets)
+			assert.Equal(t, 1, provider.assetGets)
+		})
+	}
+}
+
 func TestAIGCMaterialUnresolvedAndTimeout(t *testing.T) {
 	db, users := setupAdminMaterialPostgres(t)
 	require.NoError(t, model.MigrateMaterialPreparation(db))
@@ -4036,6 +4338,8 @@ type materialPreparationProvider struct {
 	assetPages                          [][]service.MobileCloudAsset
 	assetQuery                          service.MobileCloudAssetQuery
 	groupPages                          [][]service.MobileCloudAssetGroup
+	assetResponse                       *service.MobileCloudAsset
+	assetGets                           int
 }
 
 func (p *materialPreparationProvider) GetAssetGroup(context.Context, string) (*service.MobileCloudAssetGroup, error) {
@@ -4130,8 +4434,12 @@ func (p *materialPreparationProvider) ListAssets(_ context.Context, query servic
 	return page, p.lookupErr
 }
 func (p *materialPreparationProvider) GetAsset(context.Context, string) (*service.MobileCloudAsset, error) {
+	p.assetGets++
 	if p.onAssetGet != nil {
 		p.onAssetGet()
+	}
+	if p.assetResponse != nil {
+		return p.assetResponse, p.getErr
 	}
 	groupID := p.groupID
 	if groupID == "" {

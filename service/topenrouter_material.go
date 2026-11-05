@@ -79,8 +79,12 @@ type topenRouterMaterialAsset struct {
 	URL          string `json:"URL"`
 	Status       string `json:"Status"`
 	ErrorMessage string `json:"ErrorMessage"`
-	CreateTime   string `json:"CreateTime"`
-	UpdateTime   string `json:"UpdateTime"`
+	Error        *struct {
+		Code    string `json:"Code"`
+		Message string `json:"Message"`
+	} `json:"Error"`
+	CreateTime string `json:"CreateTime"`
+	UpdateTime string `json:"UpdateTime"`
 }
 
 func (c *TopenRouterMaterialClient) materialAsset(a topenRouterMaterialAsset) MobileCloudAsset {
@@ -88,8 +92,20 @@ func (c *TopenRouterMaterialClient) materialAsset(a topenRouterMaterialAsset) Mo
 		ID: a.ID, GroupID: a.GroupID, Name: a.Name, Type: a.Type, URL: a.URL,
 		Status: strings.ToUpper(a.Status), CreatedTime: a.CreateTime, UpdatedTime: a.UpdateTime,
 	}
-	if a.ErrorMessage != "" {
-		asset.ErrorMessage = c.safeReason(a.ErrorMessage)
+	reason := a.ErrorMessage
+	if a.Error != nil {
+		code, message := strings.TrimSpace(a.Error.Code), strings.TrimSpace(a.Error.Message)
+		switch {
+		case code != "" && message != "":
+			reason = code + ": " + message
+		case code != "":
+			reason = code
+		case message != "":
+			reason = message
+		}
+	}
+	if reason != "" {
+		asset.ErrorMessage = c.safeReason(reason)
 	}
 	return asset
 }

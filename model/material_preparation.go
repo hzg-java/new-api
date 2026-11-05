@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -85,6 +86,11 @@ type MaterialBinding struct {
 	StartedAt      int64  `json:"-"`
 	LockedBy       string `json:"-" gorm:"type:varchar(64)"`
 	LockedUntil    int64  `json:"-"`
+}
+
+func (binding MaterialBinding) CanRecheckResponse() bool {
+	return binding.State == "uncertain" && binding.AssetID != "" && binding.GroupID != "" &&
+		(binding.FailReason == "Material response does not match the requested material" || strings.HasPrefix(binding.FailReason, "Material response does not match the requested material: "))
 }
 
 type MaterialGroupBinding struct {
@@ -322,8 +328,17 @@ func RetryUserMaterial(userID, id int) (*Material, error) {
 		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", id, userID).First(&material).Error; err != nil {
 			return err
 		}
-		if material.Deleting || material.Status != MaterialStatusFailed || !material.CanRetry {
+		if material.Deleting || material.Status != MaterialStatusFailed {
 			return errors.New("material cannot be retried in its current state")
+		}
+		if !material.CanRetry {
+			var bindings []MaterialBinding
+			if err := tx.Where("material_id = ? AND version = ?", material.Id, MaterialSourceVersion(&material)).Find(&bindings).Error; err != nil {
+				return err
+			}
+			if !slices.ContainsFunc(bindings, MaterialBinding.CanRecheckResponse) {
+				return errors.New("material cannot be retried in its current state")
+			}
 		}
 		return tx.Model(&material).Updates(map[string]any{"status": MaterialStatusPending, "fail_reason": "", "can_retry": false, "updated_time": common.GetTimestamp()}).Error
 	})

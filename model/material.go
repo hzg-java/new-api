@@ -300,6 +300,9 @@ func PopulateMaterialBindings(materials []*Material) error {
 	for _, binding := range bindings {
 		material := byID[binding.MaterialId]
 		material.Bindings = append(material.Bindings, binding)
+		if !material.Deleting && material.Status == MaterialStatusFailed && binding.Version == MaterialSourceVersion(material) && binding.CanRecheckResponse() {
+			material.CanRetry = true
+		}
 		if material.GroupId == nil && binding.GroupID != "" && binding.Version == MaterialSourceVersion(material) {
 			userIDs = append(userIDs, material.UserId)
 			scopes = append(scopes, binding.Scope)
