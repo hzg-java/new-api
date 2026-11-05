@@ -15,8 +15,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -491,6 +493,531 @@ func setupAdminMaterialPostgres(t *testing.T) (*gorm.DB, []model.User) {
 		require.NoError(t, tx.Create(&users[i]).Error)
 	}
 	return tx, users
+}
+
+func setupMaterialConcurrentPostgres(t *testing.T) *gorm.DB {
+	t.Helper()
+	if os.Getenv("MATERIAL_TEST_POSTGRES") != "1" {
+		t.Skip("set MATERIAL_TEST_POSTGRES=1 to use new-api-test")
+	}
+	_, filename, _, ok := runtime.Caller(0)
+	require.True(t, ok)
+	config, err := godotenv.Read(filepath.Join(filepath.Dir(filename), "..", ".env"))
+	require.NoError(t, err)
+	pgConfig, err := pgx.ParseConfig(config["SQL_DSN"])
+	require.True(t, err == nil, "invalid PostgreSQL test configuration")
+	require.Equal(t, "new-api-test", pgConfig.Database)
+	pgConfig.ConnectTimeout = 10 * time.Second
+	admin := stdlib.OpenDB(*pgConfig)
+	t.Cleanup(func() { assert.NoError(t, admin.Close()) })
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	var database, version string
+	err = admin.QueryRowContext(ctx, "SELECT current_database(), current_setting('server_version')").Scan(&database, &version)
+	require.True(t, err == nil, "cannot verify PostgreSQL test database")
+	require.Equal(t, "new-api-test", database)
+	t.Logf("database: PostgreSQL %s; database name verified as new-api-test", version)
+	schema := "material_concurrent_" + strings.ReplaceAll(common.GetUUID(), "-", "")
+	quotedSchema := pgx.Identifier{schema}.Sanitize()
+	_, err = admin.ExecContext(ctx, "CREATE SCHEMA "+quotedSchema)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		_, err := admin.ExecContext(cleanupCtx, "DROP SCHEMA "+quotedSchema+" CASCADE")
+		assert.NoError(t, err)
+	})
+	pgConfig.RuntimeParams["search_path"] = schema
+	pgConfig.RuntimeParams["statement_timeout"] = "15000"
+	pgConfig.RuntimeParams["lock_timeout"] = "10000"
+	sqlDB := stdlib.OpenDB(*pgConfig, stdlib.OptionAfterConnect(func(ctx context.Context, conn *pgx.Conn) error {
+		var database, currentSchema string
+		if err := conn.QueryRow(ctx, "SELECT current_database(), current_schema()").Scan(&database, &currentSchema); err != nil {
+			return errors.New("cannot verify isolated material test connection")
+		}
+		if database != "new-api-test" || currentSchema != schema {
+			return errors.New("refusing material test writes outside the isolated test schema")
+		}
+		return nil
+	}))
+	sqlDB.SetMaxOpenConns(8)
+	t.Cleanup(func() { assert.NoError(t, sqlDB.Close()) })
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	previousDB, previousRedis := model.DB, common.RedisEnabled
+	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	model.DB, common.RedisEnabled = db, false
+	common.SetDatabaseTypes(common.DatabaseTypePostgreSQL, previousLog)
+	t.Cleanup(func() {
+		model.DB, common.RedisEnabled = previousDB, previousRedis
+		common.SetDatabaseTypes(previousMain, previousLog)
+	})
+	require.NoError(t, db.AutoMigrate(&model.User{}))
+	require.NoError(t, model.MigrateMaterialPreparation(db))
+	return db
+}
+
+func TestVideoMaterialConcurrentReservations(t *testing.T) {
+	db := setupMaterialConcurrentPostgres(t)
+	user := model.User{Username: "concurrent-owner", AffCode: common.GetUUID()}
+	require.NoError(t, db.Create(&user).Error)
+	material := model.Material{MaterialID: model.NewPlatformMaterialID(), UserId: user.Id, LibraryType: "AIGC", FileType: "Image", SourceURL: publicMaterialURL, Status: "ready"}
+	require.NoError(t, db.Create(&material).Error)
+	binding := model.MaterialBinding{MaterialId: material.Id, Scope: "concurrent-scope", Version: model.MaterialSourceVersion(&material), AssetID: "shared-asset", GroupID: "shared-group", State: "ready", UpstreamStatus: "ACTIVE"}
+	require.NoError(t, db.Create(&binding).Error)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	start, connected := make(chan struct{}), make(chan int, 2)
+	results := make(chan error, 2)
+	var workers sync.WaitGroup
+	defer func() {
+		cancel()
+		workers.Wait()
+	}()
+	for _, owner := range []string{"video-a", "video-b"} {
+		workers.Go(func() {
+			reported := false
+			err := db.WithContext(ctx).Connection(func(conn *gorm.DB) error {
+				reported = true
+				var pid int
+				if err := conn.Raw("SELECT pg_backend_pid()").Scan(&pid).Error; err != nil {
+					connected <- 0
+					return err
+				}
+				connected <- pid
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-start:
+				}
+				_, err := model.ReserveVideoMaterials(conn, user.Id, binding.Scope, owner, []string{binding.AssetID, binding.AssetID})
+				return err
+			})
+			if !reported {
+				connected <- 0
+			}
+			results <- err
+		})
+	}
+	var pids []int
+	for range 2 {
+		select {
+		case pid := <-connected:
+			pids = append(pids, pid)
+		case <-ctx.Done():
+			t.Fatal("reservation connections did not become ready")
+		}
+	}
+	close(start)
+	firstErr, secondErr := <-results, <-results
+	require.NotZero(t, pids[0])
+	require.NotEqual(t, pids[0], pids[1], "reservations must use independent physical connections")
+	assert.NoError(t, firstErr)
+	assert.NoError(t, secondErr, "ready materials must support concurrent video submissions")
+	var leases []model.MaterialUseLease
+	require.NoError(t, db.Order("owner").Find(&leases).Error)
+	require.Len(t, leases, 2, "duplicate references reserve once per submitting owner")
+	assert.Equal(t, leases[0].BindingId, leases[1].BindingId)
+	_, err := model.QueueMaterialDeletion(user.Id, material.Id)
+	require.Error(t, err)
+	require.NoError(t, model.ReleaseVideoMaterials(db, "video-a"))
+	_, err = model.QueueMaterialDeletion(user.Id, material.Id)
+	require.Error(t, err, "one video's release must not remove another video's protection")
+	require.NoError(t, model.ReleaseVideoMaterials(db, "video-a"))
+	var count int64
+	require.NoError(t, db.Model(&model.MaterialUseLease{}).Count(&count).Error)
+	assert.EqualValues(t, 1, count)
+	require.NoError(t, db.Model(&model.MaterialUseLease{}).Where("owner = ?", "video-b").Update("expires_at", common.GetTimestamp()-1).Error)
+	_, err = model.ReserveVideoMaterials(db, user.Id, binding.Scope, "video-c", []string{binding.AssetID})
+	require.NoError(t, err)
+	require.NoError(t, db.Model(&model.MaterialUseLease{}).Count(&count).Error)
+	assert.EqualValues(t, 1, count, "expired leases are cleaned without removing active owners")
+	t.Run("deletion workers respect an existing shared lease", func(t *testing.T) {
+		require.NoError(t, db.Model(&material).Update("deleting", true).Error)
+		claimed, err := model.ClaimMaterialDeletionBinding(db, &binding, "delete-worker")
+		require.NoError(t, err)
+		assert.False(t, claimed, "an active video must prevent upstream deletion")
+		require.NoError(t, db.Model(&binding).Update("state", "deleted").Error)
+		require.NoError(t, model.FinalizeMaterialDeletion(db, &material))
+		var preserved int64
+		require.NoError(t, db.Model(&model.Material{}).Where("id = ?", material.Id).Count(&preserved).Error)
+		assert.EqualValues(t, 1, preserved, "finalization must not erase an active video's material")
+		require.NoError(t, db.Model(&material).Update("deleting", false).Error)
+		require.NoError(t, db.Model(&binding).Update("state", "ready").Error)
+	})
+	require.NoError(t, model.ReleaseVideoMaterials(db, "video-c"))
+	_, err = model.QueueMaterialDeletion(user.Id, material.Id)
+	require.NoError(t, err)
+	_, err = model.ReserveVideoMaterials(db, user.Id, binding.Scope, "too-late", []string{binding.AssetID})
+	assert.Error(t, err, "queued deletion must block new reservations")
+}
+
+func TestVideoMaterialReservationRenewal(t *testing.T) {
+	db := setupMaterialConcurrentPostgres(t)
+	user := model.User{Username: "renewal-owner", AffCode: common.GetUUID()}
+	require.NoError(t, db.Create(&user).Error)
+	material := model.Material{MaterialID: model.NewPlatformMaterialID(), UserId: user.Id, LibraryType: "AIGC", FileType: "Image", SourceURL: publicMaterialURL, Status: "ready"}
+	require.NoError(t, db.Create(&material).Error)
+	binding := model.MaterialBinding{MaterialId: material.Id, Scope: "renewal", Version: model.MaterialSourceVersion(&material), AssetID: "renewed-asset", GroupID: "renewed-group", State: "ready", UpstreamStatus: "ACTIVE"}
+	require.NoError(t, db.Create(&binding).Error)
+	_, err := model.ReserveVideoMaterials(db, user.Id, binding.Scope, "same-submission", []string{binding.AssetID})
+	require.NoError(t, err)
+	require.NoError(t, db.Model(&model.MaterialUseLease{}).Where("owner = ?", "same-submission").Update("expires_at", common.GetTimestamp()+10).Error)
+	deadline, err := model.ReserveVideoMaterials(db, user.Id, binding.Scope, "same-submission", []string{binding.AssetID})
+	require.NoError(t, err)
+	var leases []model.MaterialUseLease
+	require.NoError(t, db.Find(&leases).Error)
+	require.Len(t, leases, 1)
+	assert.GreaterOrEqual(t, leases[0].ExpiresAt, deadline.Unix()+30, "a repeated reservation must protect its full submission deadline")
+}
+
+func TestVideoMaterialReadyLeaseHandoff(t *testing.T) {
+	db := setupMaterialConcurrentPostgres(t)
+	user := model.User{Username: "handoff-owner", AffCode: common.GetUUID()}
+	require.NoError(t, db.Create(&user).Error)
+	material := model.Material{MaterialID: model.NewPlatformMaterialID(), UserId: user.Id, LibraryType: "AIGC", FileType: "Image", SourceURL: publicMaterialURL, Status: "processing"}
+	require.NoError(t, db.Create(&material).Error)
+	binding, claimed, err := model.ClaimMaterialBinding(db, &material, "handoff", "uploader")
+	require.NoError(t, err)
+	require.True(t, claimed)
+	binding.State, binding.AssetID, binding.GroupID, binding.UpstreamStatus = "ready", "handoff-asset", "handoff-group", "ACTIVE"
+	require.NoError(t, model.SaveMaterialBinding(db, binding, "uploader"))
+	_, err = model.ReserveVideoMaterials(db, user.Id, binding.Scope, "waiting-video", []string{binding.AssetID})
+	require.NoError(t, err, "ready must release upload exclusivity in the same database update")
+	binding.State = "processing"
+	assert.Error(t, model.SaveMaterialBinding(db, binding, "uploader"), "the uploader must not modify a binding after releasing ownership")
+	stored := model.MaterialBinding{}
+	require.NoError(t, db.First(&stored, binding.Id).Error)
+	assert.Equal(t, "ready", stored.State)
+	assert.Empty(t, stored.LockedBy)
+	assert.Zero(t, stored.LockedUntil)
+}
+
+func TestVideoMaterialConcurrentDeletion(t *testing.T) {
+	db := setupMaterialConcurrentPostgres(t)
+	user := model.User{Username: "deletion-owner", AffCode: common.GetUUID()}
+	require.NoError(t, db.Create(&user).Error)
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	var connections []*gorm.DB
+	var pids []int
+	for range 2 {
+		conn, err := sqlDB.Conn(ctx)
+		require.NoError(t, err)
+		t.Cleanup(func() { assert.NoError(t, conn.Close()) })
+		session := db.Session(&gorm.Session{NewDB: true, Context: ctx})
+		session.Statement.ConnPool = conn
+		var pid int
+		require.NoError(t, session.Raw("SELECT pg_backend_pid()").Scan(&pid).Error)
+		connections, pids = append(connections, session), append(pids, pid)
+	}
+	require.NotEqual(t, pids[0], pids[1])
+	previousDB := model.DB
+	model.DB = connections[1]
+	defer func() { model.DB = previousDB }()
+	for _, winner := range []string{"reservation", "deletion"} {
+		t.Run(winner+" holds the material lock first", func(t *testing.T) {
+			material := model.Material{MaterialID: model.NewPlatformMaterialID(), UserId: user.Id, LibraryType: "AIGC", FileType: "Image", SourceURL: publicMaterialURL + "?" + winner, Status: "ready"}
+			require.NoError(t, db.Create(&material).Error)
+			binding := model.MaterialBinding{MaterialId: material.Id, Scope: "delete-race", Version: model.MaterialSourceVersion(&material), AssetID: "asset-" + winner, GroupID: "race-group", State: "ready", UpstreamStatus: "ACTIVE"}
+			require.NoError(t, db.Create(&binding).Error)
+			held, release, attempting := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(release) }) }
+			var workers sync.WaitGroup
+			defer func() {
+				unblock()
+				workers.Wait()
+			}()
+			first, second := make(chan error, 1), make(chan error, 1)
+			workers.Go(func() {
+				first <- connections[0].Transaction(func(tx *gorm.DB) error {
+					if err := tx.Exec("SELECT id FROM materials WHERE id = ? FOR UPDATE", material.Id).Error; err != nil {
+						close(held)
+						return err
+					}
+					if winner == "reservation" {
+						if _, err := model.ReserveVideoMaterials(tx, user.Id, binding.Scope, winner, []string{binding.AssetID}); err != nil {
+							close(held)
+							return err
+						}
+					} else if err := tx.Model(&material).Update("deleting", true).Error; err != nil {
+						close(held)
+						return err
+					}
+					close(held)
+					select {
+					case <-release:
+						return nil
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				})
+			})
+			<-held
+			workers.Go(func() {
+				close(attempting)
+				if winner == "reservation" {
+					_, err := model.QueueMaterialDeletion(user.Id, material.Id)
+					second <- err
+				} else {
+					_, err := model.ReserveVideoMaterials(connections[1], user.Id, binding.Scope, "late-video", []string{binding.AssetID})
+					second <- err
+				}
+			})
+			<-attempting
+			unblock()
+			require.NoError(t, <-first)
+			require.Error(t, <-second, "deletion and a new reservation must never both succeed")
+			require.NoError(t, db.First(&material, material.Id).Error)
+			var count int64
+			require.NoError(t, db.Model(&model.MaterialUseLease{}).Where("material_id = ?", material.Id).Count(&count).Error)
+			if winner == "reservation" {
+				assert.False(t, material.Deleting)
+				assert.EqualValues(t, 1, count)
+			} else {
+				assert.True(t, material.Deleting)
+				assert.Zero(t, count)
+			}
+		})
+	}
+}
+
+func TestMaterialConcurrentDailyGroupCreation(t *testing.T) {
+	db := setupMaterialConcurrentPostgres(t)
+	user := model.User{Username: "group-owner", AffCode: common.GetUUID()}
+	require.NoError(t, db.Create(&user).Error)
+	materials := []model.Material{
+		{MaterialID: model.NewPlatformMaterialID(), UserId: user.Id, LibraryType: "AIGC", FileType: "Image", SourceURL: publicMaterialURL + "?first", Status: "pending"},
+		{MaterialID: model.NewPlatformMaterialID(), UserId: user.Id, LibraryType: "AIGC", FileType: "Image", SourceURL: publicMaterialURL + "?second", Status: "pending"},
+	}
+	require.NoError(t, db.Create(&materials).Error)
+	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+	defer cancel()
+	creating, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	var workers sync.WaitGroup
+	defer func() {
+		unblock()
+		cancel()
+		workers.Wait()
+	}()
+	first := &materialPreparationProvider{status: "ACTIVE", onGroupCreate: func() {
+		close(creating)
+		select {
+		case <-ctx.Done():
+		case <-release:
+		}
+	}}
+	second := &materialPreparationProvider{status: "ACTIVE"}
+	result := make(chan error, 1)
+	workers.Go(func() { result <- service.PrepareMaterial(ctx, &materials[0], "shared-daily", first) })
+	select {
+	case <-creating:
+	case <-ctx.Done():
+		t.Fatal("group creator did not reach the upstream boundary")
+	}
+	require.NoError(t, service.PrepareMaterial(ctx, &materials[1], "shared-daily", second))
+	var waiting model.MaterialBinding
+	require.NoError(t, db.Where("material_id = ? AND scope = ?", materials[1].Id, "shared-daily").First(&waiting).Error)
+	assert.Equal(t, "pending", waiting.State, "an active creator is not an unknown group result")
+	assert.Empty(t, waiting.FailReason)
+	assert.Zero(t, second.groups)
+	assert.Zero(t, second.groupLists, "do not query ownership while another creator is active")
+	waitingForGroup := make(chan struct{}, 1)
+	require.NoError(t, db.Callback().Query().After("gorm:query").Register("material_test_waiting_daily_group", func(tx *gorm.DB) {
+		group, ok := tx.Statement.Dest.(*model.MaterialUpstreamGroup)
+		if ok && group.Scope == "shared-daily" && group.State == "creating" && group.LockedBy != "" {
+			select {
+			case waitingForGroup <- struct{}{}:
+			default:
+			}
+		}
+	}))
+	t.Cleanup(func() { assert.NoError(t, db.Callback().Query().Remove("material_test_waiting_daily_group")) })
+	type videoResult struct {
+		resolved []string
+		issues   []service.MaterialPreparationIssue
+		err      error
+	}
+	video := make(chan videoResult, 1)
+	workers.Go(func() {
+		resolved, issues, err := service.PrepareVideoMaterials(ctx, user.Id, service.MaterialChannel{Scope: "shared-daily", Client: second}, []service.MaterialImageInput{{Source: materials[1].SourceURL}})
+		video <- videoResult{resolved, issues, err}
+	})
+	select {
+	case <-waitingForGroup:
+	case <-ctx.Done():
+		t.Fatal("video request did not observe the active group creator")
+	}
+	unblock()
+	require.NoError(t, <-result)
+	prepared := <-video
+	require.NoError(t, prepared.err)
+	require.Empty(t, prepared.issues, "the same video request must wait for group creation instead of requiring a retry")
+	assert.Equal(t, []string{"asset://upstream-asset"}, prepared.resolved)
+	require.NoError(t, db.First(&waiting, waiting.Id).Error)
+	assert.Equal(t, "ready", waiting.State)
+	assert.Equal(t, "upstream-group", waiting.GroupID)
+	assert.Equal(t, 1, first.groups)
+	assert.Zero(t, second.groups)
+	assert.Equal(t, 1, second.assets)
+}
+
+func TestMaterialConcurrentSourceUpload(t *testing.T) {
+	db := setupMaterialConcurrentPostgres(t)
+	user := model.User{Username: "upload-owner", AffCode: common.GetUUID()}
+	require.NoError(t, db.Create(&user).Error)
+	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
+	defer cancel()
+	var lookupWorkers sync.WaitGroup
+	defer func() {
+		cancel()
+		lookupWorkers.Wait()
+	}()
+	connected, start := make(chan int, 2), make(chan struct{})
+	type lookupResult struct {
+		material *model.Material
+		err      error
+	}
+	found := make(chan lookupResult, 2)
+	for range 2 {
+		lookupWorkers.Go(func() {
+			var material *model.Material
+			reported := false
+			err := db.WithContext(ctx).Connection(func(conn *gorm.DB) error {
+				reported = true
+				var pid int
+				if err := conn.Raw("SELECT pg_backend_pid()").Scan(&pid).Error; err != nil {
+					connected <- 0
+					return err
+				}
+				connected <- pid
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-start:
+				}
+				var err error
+				material, err = model.FindOrCreateVideoMaterial(conn, user.Id, publicMaterialURL, "single-upload")
+				return err
+			})
+			if !reported {
+				connected <- 0
+			}
+			found <- lookupResult{material, err}
+		})
+	}
+	var pids []int
+	for range 2 {
+		select {
+		case pid := <-connected:
+			pids = append(pids, pid)
+		case <-ctx.Done():
+			t.Fatal("source lookup connections did not become ready")
+		}
+	}
+	close(start)
+	first, second := <-found, <-found
+	require.NotZero(t, pids[0])
+	require.NotEqual(t, pids[0], pids[1])
+	require.NoError(t, first.err)
+	require.NoError(t, second.err)
+	require.Equal(t, first.material.Id, second.material.Id)
+	var count int64
+	require.NoError(t, db.Model(&model.Material{}).Where("user_id = ?", user.Id).Count(&count).Error)
+	require.EqualValues(t, 1, count)
+	creating, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	var workers sync.WaitGroup
+	defer func() {
+		unblock()
+		cancel()
+		workers.Wait()
+	}()
+	provider := &materialPreparationProvider{status: "ACTIVE", onAssetCreate: func() {
+		close(creating)
+		select {
+		case <-ctx.Done():
+		case <-release:
+		}
+	}}
+	result := make(chan error, 1)
+	workers.Go(func() { result <- service.PrepareMaterial(ctx, first.material, "single-upload", provider) })
+	select {
+	case <-creating:
+	case <-ctx.Done():
+		t.Fatal("uploader did not reach the upstream boundary")
+	}
+	other := &materialPreparationProvider{status: "ACTIVE"}
+	require.NoError(t, service.PrepareMaterial(ctx, second.material, "single-upload", other))
+	assert.Zero(t, other.groups)
+	assert.Zero(t, other.assets)
+	unblock()
+	require.NoError(t, <-result)
+	require.NoError(t, service.PrepareMaterial(ctx, second.material, "single-upload", other))
+	assert.Equal(t, 1, provider.groups)
+	assert.Equal(t, 1, provider.assets)
+	assert.Zero(t, other.assets, "concurrent and subsequent requests must reuse the upload")
+}
+
+func TestMaterialGroupCreationLeaseTakeover(t *testing.T) {
+	db := setupMaterialConcurrentPostgres(t)
+	group := model.MaterialUpstreamGroup{UserId: 1, Scope: "lease-scope", Name: "group-20261105", State: "pending"}
+	require.NoError(t, db.Create(&group).Error)
+	claimed, create, err := model.ClaimMaterialUpstreamGroup(db, &group, "old-owner")
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.True(t, create)
+	require.NoError(t, db.Model(&group).Update("locked_until", common.GetTimestamp()-1).Error)
+	current := model.MaterialUpstreamGroup{Id: group.Id}
+	claimed, create, err = model.ClaimMaterialUpstreamGroup(db, &current, "new-owner")
+	require.NoError(t, err)
+	require.True(t, claimed)
+	assert.False(t, create, "an expired creator must only query, never create again")
+	group.State, group.UpstreamID = "ready", "stale-result"
+	assert.Error(t, model.SaveMaterialUpstreamGroup(db, &group, "old-owner"))
+	require.NoError(t, db.Model(&group).Where("locked_by = ?", "old-owner").Updates(map[string]any{"locked_by": "", "locked_until": 0}).Error)
+	current.State, current.UpstreamID = "ready", "confirmed-result"
+	require.NoError(t, model.SaveMaterialUpstreamGroup(db, &current, "new-owner"))
+	require.NoError(t, db.First(&current, current.Id).Error)
+	assert.Equal(t, "confirmed-result", current.UpstreamID)
+	assert.Equal(t, "new-owner", current.LockedBy)
+}
+
+func TestMaterialLeaseMigration(t *testing.T) {
+	db := setupMaterialConcurrentPostgres(t)
+	group := model.MaterialUpstreamGroup{UserId: 1, Scope: "migration", Name: "group-20261105", UpstreamID: "existing-group", State: "ready"}
+	require.NoError(t, db.Create(&group).Error)
+	material := model.Material{MaterialID: model.NewPlatformMaterialID(), UserId: 1, LibraryType: "AIGC", FileType: "Image", SourceURL: publicMaterialURL, Status: "ready"}
+	require.NoError(t, db.Create(&material).Error)
+	binding := model.MaterialBinding{MaterialId: material.Id, Scope: group.Scope, Version: model.MaterialSourceVersion(&material), AssetID: "existing-asset", GroupID: group.UpstreamID, State: "ready", UpstreamStatus: "ACTIVE", LockedBy: "legacy-submit", LockedUntil: common.GetTimestamp() + 120}
+	require.NoError(t, db.Create(&binding).Error)
+	require.NoError(t, db.Migrator().DropTable(&model.MaterialUseLease{}))
+	require.NoError(t, db.Migrator().DropColumn(&model.MaterialUpstreamGroup{}, "LockedBy"))
+	require.NoError(t, db.Migrator().DropColumn(&model.MaterialUpstreamGroup{}, "LockedUntil"))
+	for range 2 {
+		require.NoError(t, model.MigrateMaterialPreparation(db))
+	}
+	var stored model.MaterialBinding
+	require.NoError(t, db.First(&stored, binding.Id).Error)
+	assert.Equal(t, binding, stored, "upgrade must preserve IDs, readiness and existing exclusive leases")
+	require.NoError(t, db.First(&group, group.Id).Error)
+	assert.Equal(t, "existing-group", group.UpstreamID)
+	assert.Equal(t, "ready", group.State)
+	lease := model.MaterialUseLease{MaterialId: material.Id, BindingId: binding.Id, Owner: "migration-submit", ExpiresAt: common.GetTimestamp() + 120}
+	require.NoError(t, db.Create(&lease).Error)
+	duplicate := lease
+	duplicate.Id = 0
+	assert.Error(t, db.Create(&duplicate).Error, "each owner reserves a binding only once")
+	require.NoError(t, model.MigrateMaterialPreparation(db))
+	var count int64
+	require.NoError(t, db.Model(&model.MaterialUseLease{}).Count(&count).Error)
+	assert.EqualValues(t, 1, count, "repeated migration preserves live reservations")
 }
 
 func TestAdminMaterialUserFilter(t *testing.T) {
@@ -1087,6 +1614,11 @@ func TestMobileCloudVideoSubmitMaterialGate(t *testing.T) {
 		{"foreign asset rejected", channel.Id, "asset://foreign-asset", "", true, http.StatusOK, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Cleanup(func() {
+				var active int64
+				require.NoError(t, db.Model(&model.MaterialUseLease{}).Where("material_id = ?", material.Id).Count(&active).Error)
+				assert.Zero(t, active, "successful, rejected and interrupted submissions must release shared reservations")
+			})
 			if tc.disabled {
 				config.Enabled = common.GetPointer(false)
 				require.NoError(t, service.SaveMobileCloudMaterialConfiguration(config))
@@ -1198,6 +1730,34 @@ func TestMobileCloudVideoSubmitMaterialGate(t *testing.T) {
 		assert.Empty(t, raw.UpstreamRequest)
 		assert.NotContains(t, raw.Payload, "asset://existing-asset")
 	})
+	t.Run("shared reservations release independently after cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		body := map[string]any{"content": []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": publicMaterialURL}}}}
+		_, issues, first, err := service.PrepareMobileCloudVideoBody(ctx, users[1].Id, &channel, body)
+		require.NoError(t, err)
+		require.Empty(t, issues)
+		require.NotNil(t, first)
+		defer first.Release()
+		_, issues, second, err := service.PrepareMobileCloudVideoBody(t.Context(), users[1].Id, &channel, body)
+		require.NoError(t, err)
+		require.Empty(t, issues)
+		require.NotNil(t, second)
+		defer second.Release()
+		var active int64
+		require.NoError(t, db.Model(&model.MaterialUseLease{}).Where("binding_id = ?", binding.Id).Count(&active).Error)
+		assert.EqualValues(t, 2, active)
+		cancel()
+		first.Release()
+		first.Release()
+		require.NoError(t, db.Model(&model.MaterialUseLease{}).Where("binding_id = ?", binding.Id).Count(&active).Error)
+		assert.EqualValues(t, 1, active, "cancellation must not stop cleanup or remove the other submission's lease")
+		_, err = model.QueueMaterialDeletion(users[1].Id, material.Id)
+		assert.Error(t, err)
+		second.Release()
+		require.NoError(t, db.Model(&model.MaterialUseLease{}).Where("binding_id = ?", binding.Id).Count(&active).Error)
+		assert.Zero(t, active)
+	})
 	t.Run("reservation conflict identifies the material", func(t *testing.T) {
 		require.NoError(t, db.Model(&binding).Updates(map[string]any{"locked_by": "concurrent-video", "locked_until": common.GetTimestamp() + 120}).Error)
 		t.Cleanup(func() {
@@ -1219,9 +1779,9 @@ func TestMobileCloudVideoSubmitMaterialGate(t *testing.T) {
 		require.NotNil(t, prepared)
 		require.NotNil(t, reservation)
 		defer reservation.Release()
-		var stored model.MaterialBinding
-		require.NoError(t, db.First(&stored, binding.Id).Error)
-		assert.Equal(t, time.Unix(stored.LockedUntil, 0).Add(-30*time.Second), reservation.Deadline)
+		var stored model.MaterialUseLease
+		require.NoError(t, db.Where("binding_id = ?", binding.Id).First(&stored).Error)
+		assert.Equal(t, time.Unix(stored.ExpiresAt, 0).Add(-30*time.Second), reservation.Deadline)
 	})
 	t.Run("account changes during preparation block submission", func(t *testing.T) {
 		changed := false
@@ -1336,6 +1896,22 @@ func TestMobileCloudVideoUploadBeforeSubmit(t *testing.T) {
 	require.NoError(t, db.Where("key = ? AND active = ? AND enabled = ?", "buluai-seedance", true, true).First(&storedPlugin).Error)
 	plugin, err := pluginruntime.CompilePlugin(string(storedPlugin.Source), pluginruntime.Options{Key: storedPlugin.Key, Version: storedPlugin.Version})
 	require.NoError(t, err)
+	t.Run("native create returns only the public task ID", func(t *testing.T) {
+		task := &model.Task{TaskID: "task_public", Status: model.TaskStatusSubmitted, PrivateData: model.TaskPrivateData{UpstreamTaskID: "provider-task"}}
+		task.SetData(map[string]any{"id": "provider-task", "upstream_id": "vendor-task", "model": "upstream-model", "status": "queued", "extra": "provider-metadata"})
+		original := string(task.Data)
+		view, err := service.BuildTaskPluginView(task)
+		require.NoError(t, err)
+		value, err := taskPluginProtocolJSONValue(view)
+		require.NoError(t, err)
+		response, err := plugin.Engine.CallPath(t.Context(), "native", []string{"taskCreated"}, map[string]any{}, value)
+		require.NoError(t, err)
+		encoded, err := common.Marshal(response)
+		require.NoError(t, err)
+		assert.JSONEq(t, `{"id":"task_public"}`, string(encoded))
+		assert.Equal(t, original, string(task.Data), "public presentation must preserve the internal upstream snapshot")
+		assert.Equal(t, "provider-task", task.GetUpstreamTaskID())
+	})
 	prices := ratio_setting.ModelPrice2JSONString()
 	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(prices)) })
 	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"AICC-Doubao-Seedance-2.0":0.01}`))
@@ -1389,13 +1965,13 @@ func TestMobileCloudVideoUploadBeforeSubmit(t *testing.T) {
 	require.NoError(t, db.Create(&otherChannel).Error)
 	assetContent := expectedContent
 	for _, tc := range []struct {
-		name            string
-		channel         *model.Channel
-		lastSource      string
-		failed          bool
-		blocked         bool
-		status          int
-		identityFailure bool
+		name          string
+		channel       *model.Channel
+		lastSource    string
+		failed        bool
+		blocked       bool
+		status        int
+		lookupFailure bool
 	}{
 		{"upload seven images", &channel, imageURLs[6], false, false, http.StatusOK, false},
 		{"reuse all seven images", &channel, imageURLs[6], false, false, http.StatusOK, false},
@@ -1404,20 +1980,21 @@ func TestMobileCloudVideoUploadBeforeSubmit(t *testing.T) {
 		{"upstream rejection releases reservations", &channel, imageURLs[6], false, false, http.StatusBadRequest, false},
 		{"lost response is not replayed", &channel, imageURLs[6], false, false, 0, false},
 		{"other BuluAI channel keeps original URLs", &otherChannel, imageURLs[6], false, false, http.StatusOK, false},
-		{"database identity failure blocks submission", &channel, imageURLs[6], false, true, http.StatusOK, true},
+		{"material lookup failure blocks submission", &channel, imageURLs[6], false, true, http.StatusOK, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.identityFailure {
+			if tc.lookupFailure {
 				intercepted := false
-				require.NoError(t, db.Callback().Row().Before("gorm:row").Register("material_test_identity_failure", func(tx *gorm.DB) {
-					if tx.Statement.SQL.String() == "SELECT current_database()" {
+				require.NoError(t, db.Callback().Query().After("gorm:query").Register("material_test_lookup_failure", func(tx *gorm.DB) {
+					materials, ok := tx.Statement.Dest.(*[]model.Material)
+					if ok && slices.ContainsFunc(*materials, func(material model.Material) bool { return material.SourceURL == tc.lastSource }) {
 						intercepted = true
 						tx.AddError(context.DeadlineExceeded)
 					}
 				}))
 				t.Cleanup(func() {
-					require.NoError(t, db.Callback().Row().Remove("material_test_identity_failure"))
-					assert.True(t, intercepted)
+					require.NoError(t, db.Callback().Query().Remove("material_test_lookup_failure"))
+					assert.True(t, intercepted, "the material lookup failure must be injected")
 				})
 			}
 			upstreamStatus = tc.status
@@ -1471,19 +2048,19 @@ func TestMobileCloudVideoUploadBeforeSubmit(t *testing.T) {
 				if tc.blocked {
 					assert.Equal(t, before, videoCalls)
 					assert.Equal(t, "material_preparation_failed", taskErr.Code)
-					if tc.identityFailure {
-						assert.Empty(t, taskErr.Data)
-					} else {
-						issues, ok := taskErr.Data.([]service.MaterialPreparationIssue)
-						require.True(t, ok)
-						require.Len(t, issues, 1)
-						assert.Equal(t, 7, issues[0].Index)
-						assert.Equal(t, "content[7].image_url.url", issues[0].Field)
-						assert.Equal(t, "reference_image", issues[0].Usage)
-						if tc.failed {
-							assert.NotEmpty(t, issues[0].MaterialID)
-							assert.Equal(t, "Unsupported image format", issues[0].Reason)
-						}
+					issues, ok := taskErr.Data.([]service.MaterialPreparationIssue)
+					require.True(t, ok)
+					require.Len(t, issues, 1)
+					assert.Equal(t, 7, issues[0].Index)
+					assert.Equal(t, "content[7].image_url.url", issues[0].Field)
+					assert.Equal(t, "reference_image", issues[0].Usage)
+					if tc.lookupFailure {
+						assert.Equal(t, "unavailable", issues[0].Status)
+						assert.Equal(t, "Video material lookup failed; retry to check the existing material", issues[0].Reason)
+					}
+					if tc.failed {
+						assert.NotEmpty(t, issues[0].MaterialID)
+						assert.Equal(t, "Unsupported image format", issues[0].Reason)
 					}
 				} else {
 					assert.Equal(t, before+1, videoCalls)
@@ -1788,8 +2365,11 @@ func TestTopenRouterVideoUploadBeforeSubmit(t *testing.T) {
 			for _, binding := range bindings {
 				assert.Equal(t, "topenrouter", binding.Provider)
 				assert.Empty(t, binding.LockedBy)
-				assert.Zero(t, binding.LockedUntil, "all success/failure exits must release reservations")
+				assert.Zero(t, binding.LockedUntil)
 			}
+			var active int64
+			require.NoError(t, db.Model(&model.MaterialUseLease{}).Where("binding_id IN (?)", db.Model(&model.MaterialBinding{}).Select("id").Where("channel_id = ?", channel.Id)).Count(&active).Error)
+			assert.Zero(t, active, "all success/failure exits must release shared reservations")
 			assert.Equal(t, 1, operations["CreateAssetGroup"])
 			assert.Equal(t, 2, operations["CreateAsset"], "retry must not duplicate successful uploads")
 		})
@@ -1947,7 +2527,7 @@ func TestVideoMaterialSourceReuse(t *testing.T) {
 		require.NoError(t, err)
 		_, err = model.QueueMaterialDeletion(users[1].Id, materials[0].Id)
 		assert.Error(t, err)
-		require.NoError(t, db.Model(&model.MaterialBinding{}).Where("locked_by = ?", "test-submission").Updates(map[string]any{"locked_by": "", "locked_until": 0}).Error)
+		require.NoError(t, model.ReleaseVideoMaterials(db, "test-submission"))
 	})
 
 	resolved, issues, err := service.PrepareVideoMaterials(context.Background(), users[1].Id, channel, []service.MaterialImageInput{{Source: "asset://upstream-asset", Field: "content[0].image_url.url"}})
@@ -2026,10 +2606,10 @@ func TestVideoMaterialChannelIsolation(t *testing.T) {
 		assert.Equal(t, []string{"asset://" + mapping.AssetID}, resolved)
 		_, err = model.ReserveVideoMaterials(db, users[1].Id, channel.Scope, "channel-b-submit", []string{mapping.AssetID})
 		require.NoError(t, err)
-		var reserved []model.MaterialBinding
-		require.NoError(t, db.Where("locked_by = ?", "channel-b-submit").Find(&reserved).Error)
+		var reserved []model.MaterialUseLease
+		require.NoError(t, db.Where("owner = ?", "channel-b-submit").Find(&reserved).Error)
 		require.Len(t, reserved, 1)
-		assert.Equal(t, mapping.Id, reserved[0].Id)
+		assert.Equal(t, mapping.Id, reserved[0].BindingId)
 		require.NoError(t, db.First(&unchanged, originalBinding.Id).Error)
 		assert.Empty(t, unchanged.LockedBy)
 		assert.Equal(t, 1, provider.assets)
@@ -2266,10 +2846,10 @@ func TestVideoMaterialRecoveryStaysInSelectedChannel(t *testing.T) {
 	assert.Equal(t, otherBinding, unchanged)
 	_, err = model.ReserveVideoMaterials(db, users[1].Id, channel.Scope, "current-video", []string{"upstream-asset"})
 	require.NoError(t, err)
-	var reserved []model.MaterialBinding
-	require.NoError(t, db.Where("locked_by = ?", "current-video").Find(&reserved).Error)
+	var reserved []model.MaterialUseLease
+	require.NoError(t, db.Where("owner = ?", "current-video").Find(&reserved).Error)
 	require.Len(t, reserved, 1)
-	assert.Equal(t, binding.Id, reserved[0].Id)
+	assert.Equal(t, binding.Id, reserved[0].BindingId)
 }
 
 func TestVideoMaterialRecoversHistoricalChannelBinding(t *testing.T) {
@@ -2369,7 +2949,11 @@ func TestVideoMaterialRecoversHistoricalChannelBinding(t *testing.T) {
 				}
 				require.NoError(t, db.First(&ready, ready.Id).Error)
 				assert.Equal(t, "ready", ready.State)
-				assert.Equal(t, "selected-video", ready.LockedBy)
+				assert.Empty(t, ready.LockedBy)
+				assert.Zero(t, ready.LockedUntil)
+				var lease model.MaterialUseLease
+				require.NoError(t, db.Where("owner = ? AND binding_id = ?", "selected-video", ready.Id).First(&lease).Error)
+				assert.GreaterOrEqual(t, lease.ExpiresAt, common.GetTimestamp())
 				assert.Equal(t, 1, provider.assets)
 				assert.Zero(t, provider.assetDeletes)
 			}
@@ -2662,7 +3246,7 @@ func TestAIGCMaterialRetryRecovery(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			material := model.Material{MaterialID: model.NewPlatformMaterialID(), UserId: users[1].Id, Name: tc.name, LibraryType: "AIGC", FileType: "Image", SourceURL: publicMaterialURL, Status: "pending"}
 			require.NoError(t, db.Create(&material).Error)
-			provider := &materialPreparationProvider{status: tc.status, createErr: tc.createErr, reason: "Unsupported image format https://private.example/image?token=private-token"}
+			provider := &materialPreparationProvider{status: tc.status, createErr: tc.createErr, omitLookup: errors.Is(tc.createErr, context.DeadlineExceeded), reason: "Unsupported image format https://private.example/image?token=private-token"}
 			scope := material.MaterialID
 			require.NoError(t, service.PrepareMaterial(context.Background(), &material, scope, provider))
 			require.NoError(t, db.First(&material, material.Id).Error)
@@ -2685,7 +3269,7 @@ func TestAIGCMaterialRetryRecovery(t *testing.T) {
 			require.Error(t, err)
 			retried, err := model.RetryUserMaterial(users[1].Id, material.Id)
 			require.NoError(t, err)
-			provider.createErr, provider.status = nil, "ACTIVE"
+			provider.createErr, provider.status, provider.omitLookup = nil, "ACTIVE", false
 			require.NoError(t, service.PrepareMaterial(context.Background(), retried, scope, provider))
 			require.NoError(t, db.First(&material, material.Id).Error)
 			assert.Equal(t, "ready", material.Status)
@@ -2782,6 +3366,71 @@ func TestAIGCMaterialReadinessGate(t *testing.T) {
 	}
 	config := &service.MobileCloudMaterialConfiguration{Endpoint: "https://ecloud.10086.cn/api/openapi-maas", AccessKey: "account", PoolID: "pool"}
 	assert.NotEqual(t, service.MobileCloudMaterialScope(config, 1), service.MobileCloudMaterialScope(config, 2))
+}
+
+func TestAIGCMaterialRecoversAssetAfterUnknownCreateResult(t *testing.T) {
+	db, users := setupAdminMaterialPostgres(t)
+	for _, tc := range []struct {
+		name, status, wantState, wantReason string
+		createErr, lookupErr                error
+		matches, wantLists                  int
+		wantRetry                           bool
+	}{
+		{name: "unique active asset", status: "ACTIVE", createErr: context.DeadlineExceeded, matches: 1, wantLists: 2, wantState: "ready"},
+		{name: "unique processing asset is not ready", status: "PROCESSING", createErr: context.DeadlineExceeded, matches: 1, wantLists: 2, wantState: "processing"},
+		{name: "no matching asset", createErr: context.DeadlineExceeded, wantLists: 1, wantState: "uncertain", wantReason: "Material upload result is unknown; retry to check without uploading again", wantRetry: true},
+		{name: "multiple matching assets", createErr: context.DeadlineExceeded, matches: 2, wantLists: 2, wantState: "uncertain", wantReason: "Multiple matching materials require administrator review"},
+		{name: "lookup fails", createErr: context.DeadlineExceeded, lookupErr: errors.New("lookup unavailable"), wantLists: 1, wantState: "uncertain", wantReason: "Material upload result could not be confirmed; retry to check without uploading again", wantRetry: true},
+		{name: "mobile cloud rejection", createErr: &service.MobileCloudMaterialRejection{Message: "Unsupported image format"}, wantState: "failed", wantReason: "Material preparation rejected: Unsupported image format", wantRetry: true},
+		{name: "TopenRouter rejection", createErr: &service.TopenRouterMaterialRejection{Message: "Unsupported image format"}, wantState: "failed", wantReason: "Material preparation rejected: Unsupported image format", wantRetry: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			material := model.Material{MaterialID: model.NewPlatformMaterialID(), UserId: users[1].Id, Name: tc.name, LibraryType: "AIGC", FileType: "Image", SourceURL: publicMaterialURL, Status: "pending"}
+			require.NoError(t, db.Create(&material).Error)
+			binding := model.MaterialBinding{MaterialId: material.Id, Scope: material.MaterialID, Version: model.MaterialSourceVersion(&material), Name: "aigc-" + material.MaterialID, GroupID: "upstream-group", State: "pending", StartedAt: common.GetTimestamp()}
+			require.NoError(t, db.Create(&binding).Error)
+			pages := [][]service.MobileCloudAsset{{
+				{ID: "wrong-name", GroupID: binding.GroupID, Name: "another-material", Type: "Image"},
+				{ID: "wrong-group", GroupID: "another-group", Name: binding.Name, Type: "Image"},
+				{ID: "wrong-type", GroupID: binding.GroupID, Name: binding.Name, Type: "Video"},
+			}}
+			if tc.matches > 0 {
+				matches := []service.MobileCloudAsset{{ID: "upstream-asset", GroupID: binding.GroupID, Name: binding.Name, Type: "Image"}}
+				if tc.matches > 1 {
+					matches = append(matches, service.MobileCloudAsset{ID: "duplicate-asset", GroupID: binding.GroupID, Name: binding.Name, Type: "Image"})
+				}
+				pages = append(pages, matches)
+			}
+			gets := 0
+			provider := &materialPreparationProvider{status: tc.status, createErr: tc.createErr, lookupErr: tc.lookupErr, assetPages: pages, onAssetGet: func() { gets++ }}
+			require.NoError(t, service.PrepareMaterial(t.Context(), &material, binding.Scope, provider))
+			require.NoError(t, db.First(&binding, binding.Id).Error)
+			require.NoError(t, db.First(&material, material.Id).Error)
+			assert.Equal(t, tc.wantState, binding.State)
+			assert.Equal(t, tc.wantReason, binding.FailReason)
+			assert.Equal(t, tc.wantRetry, binding.CanRetry)
+			assert.Empty(t, binding.LockedBy)
+			assert.Zero(t, binding.LockedUntil)
+			assert.Equal(t, 1, provider.assets, "upload errors must never trigger another create")
+			assert.Zero(t, provider.groups, "recovery must use the original group")
+			assert.Equal(t, tc.wantLists, provider.assetLists)
+			if tc.wantLists > 0 {
+				assert.Equal(t, []string{binding.GroupID}, provider.assetQuery.GroupIDs)
+				require.NotNil(t, provider.assetQuery.Name)
+				assert.Equal(t, binding.Name, *provider.assetQuery.Name)
+			}
+			if tc.matches == 1 {
+				assert.Equal(t, "upstream-asset", binding.AssetID)
+				assert.Equal(t, tc.status, binding.UpstreamStatus)
+				assert.Equal(t, tc.wantState, material.Status)
+				assert.Equal(t, 1, gets)
+				return
+			}
+			assert.Empty(t, binding.AssetID)
+			assert.Equal(t, model.MaterialStatusFailed, material.Status)
+			assert.Zero(t, gets, "unconfirmed assets must never reach the readiness check")
+		})
+	}
 }
 
 func TestAIGCMaterialGroupRecovery(t *testing.T) {
@@ -3376,6 +4025,7 @@ type materialPreparationProvider struct {
 	groupDescription                    string
 	groupDescriptionProvided            bool
 	onGroupCreate                       func()
+	onAssetCreate                       func()
 	onAssetGet                          func()
 	updates, groupDeletes, assetDeletes int
 	groupLists, assetLists              int
@@ -3454,6 +4104,9 @@ func (p *materialPreparationProvider) ListAssetGroups(_ context.Context, query s
 func (p *materialPreparationProvider) CreateAsset(_ context.Context, input service.MobileCloudCreateAssetInput) (string, error) {
 	p.assets++
 	p.input = input
+	if p.onAssetCreate != nil {
+		p.onAssetCreate()
+	}
 	return "upstream-asset", p.createErr
 }
 func (p *materialPreparationProvider) ListAssets(_ context.Context, query service.MobileCloudAssetQuery) (*service.MobileCloudMaterialPage[service.MobileCloudAsset], error) {

@@ -405,6 +405,12 @@ func QueueMaterialDeletion(userID, id int) (*Material, error) {
 		if active != 0 {
 			return errors.New("material synchronization is in progress; try again after it finishes")
 		}
+		if err := tx.Model(&MaterialUseLease{}).Where("material_id = ? AND expires_at >= ?", id, common.GetTimestamp()).Count(&active).Error; err != nil {
+			return err
+		}
+		if active != 0 {
+			return errors.New("material is in use; try again after video submission finishes")
+		}
 		return tx.Model(&material).Updates(map[string]any{"deleting": true, "status": MaterialStatusProcessing, "fail_reason": "", "can_retry": false, "updated_time": common.GetTimestamp()}).Error
 	})
 	return &material, err

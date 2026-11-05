@@ -21,6 +21,48 @@ type MaterialUpstreamGroup struct {
 	CreationToken string `gorm:"type:varchar(64)"`
 	UpstreamID    string `gorm:"type:varchar(255)"`
 	State         string `gorm:"type:varchar(32)"`
+	LockedBy      string `gorm:"type:varchar(64)"`
+	LockedUntil   int64
+}
+
+func ClaimMaterialUpstreamGroup(db *gorm.DB, group *MaterialUpstreamGroup, owner string) (bool, bool, error) {
+	claimed, create := false, false
+	err := db.Transaction(func(tx *gorm.DB) error {
+		if err := lockForUpdate(tx).First(group, group.Id).Error; err != nil {
+			return err
+		}
+		now := common.GetTimestamp()
+		if group.State == "ready" || group.LockedUntil >= now {
+			return nil
+		}
+		create = group.State == "pending"
+		if create && group.CreationToken == "" {
+			group.CreationToken = "new-api-material-group:" + common.GetUUID()
+		}
+		result := tx.Model(group).Where("locked_until IS NULL OR locked_until < ?", now).
+			Updates(map[string]any{"state": "creating", "creation_token": group.CreationToken, "locked_by": owner, "locked_until": now + 120})
+		claimed = result.RowsAffected == 1
+		return result.Error
+	})
+	return claimed, create, err
+}
+
+func SaveMaterialUpstreamGroup(db *gorm.DB, group *MaterialUpstreamGroup, owner string) error {
+	result := db.Model(group).Where("locked_by = ? AND locked_until >= ?", owner, common.GetTimestamp()).
+		Updates(map[string]any{"upstream_id": group.UpstreamID, "state": group.State})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		var count int64
+		if err := db.Model(&MaterialUpstreamGroup{}).Where("id = ? AND locked_by = ? AND locked_until >= ?", group.Id, owner, common.GetTimestamp()).Count(&count).Error; err != nil {
+			return err
+		}
+		if count != 1 {
+			return errors.New("material group creation lease lost")
+		}
+	}
+	return nil
 }
 
 type MaterialBinding struct {
@@ -90,7 +132,7 @@ func ClaimMaterialBinding(ctxDB *gorm.DB, material *Material, scope, owner strin
 		if err := tx.Where("material_id = ? AND scope = ? AND version = ?", material.Id, scope, binding.Version).First(binding).Error; err != nil {
 			return err
 		}
-		if binding.State == "deleted" || binding.State == "retired" {
+		if binding.State == "deleted" || binding.State == "retired" || binding.State == "ready" {
 			return nil
 		}
 		if binding.AssetID == "" && binding.State == "pending" {
@@ -110,6 +152,18 @@ func ClaimMaterialBinding(ctxDB *gorm.DB, material *Material, scope, owner strin
 		return result.Error
 	})
 	return binding, claimed, err
+}
+
+type MaterialUseLease struct {
+	Id         int    `gorm:"primaryKey"`
+	MaterialId int    `gorm:"index"`
+	BindingId  int    `gorm:"uniqueIndex:idx_material_use_owner_binding"`
+	Owner      string `gorm:"type:varchar(64);uniqueIndex:idx_material_use_owner_binding"`
+	ExpiresAt  int64  `gorm:"index"`
+}
+
+func ReleaseVideoMaterials(db *gorm.DB, owner string) error {
+	return db.Where("owner = ?", owner).Delete(&MaterialUseLease{}).Error
 }
 
 func ReserveVideoMaterials(db *gorm.DB, userID int, scope, owner string, assetIDs []string) (time.Time, error) {
@@ -138,13 +192,18 @@ func ReserveVideoMaterials(db *gorm.DB, userID int, scope, owner string, assetID
 		now := common.GetTimestamp()
 		deadline = time.Unix(now+90, 0)
 		for _, binding := range bindings {
-			result := tx.Model(&MaterialBinding{}).Where("id = ? AND (locked_until IS NULL OR locked_until < ? OR locked_by = ?)", binding.Id, now, owner).
-				Updates(map[string]any{"locked_by": owner, "locked_until": now + 120})
-			if result.Error != nil {
-				return result.Error
-			}
-			if result.RowsAffected != 1 {
+			if binding.LockedUntil >= now {
 				return errors.New("material is unavailable or in use; retry after the current operation finishes")
+			}
+			if err := tx.Where("binding_id = ? AND expires_at < ?", binding.Id, now).Delete(&MaterialUseLease{}).Error; err != nil {
+				return err
+			}
+			lease := MaterialUseLease{MaterialId: binding.MaterialId, BindingId: binding.Id, Owner: owner, ExpiresAt: now + 120}
+			if err := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "binding_id"}, {Name: "owner"}},
+				DoUpdates: clause.Assignments(map[string]any{"expires_at": lease.ExpiresAt}),
+			}).Create(&lease).Error; err != nil {
+				return err
 			}
 		}
 		return nil
@@ -166,6 +225,13 @@ func ClaimMaterialDeletionBinding(db *gorm.DB, binding *MaterialBinding, owner s
 			return errors.New("material is not marked for deletion")
 		}
 		now := common.GetTimestamp()
+		var active int64
+		if err := tx.Model(&MaterialUseLease{}).Where("material_id = ? AND expires_at >= ?", material.Id, now).Count(&active).Error; err != nil {
+			return err
+		}
+		if active != 0 {
+			return nil
+		}
 		result := tx.Model(&MaterialBinding{}).Where("id = ? AND (locked_until IS NULL OR locked_until < ?)", binding.Id, now).
 			Updates(map[string]any{"locked_by": owner, "locked_until": now + 120})
 		claimed = result.RowsAffected == 1
@@ -211,8 +277,11 @@ func SaveMaterialGroupBinding(db *gorm.DB, binding *MaterialGroupBinding, owner 
 
 func SaveMaterialBinding(db *gorm.DB, binding *MaterialBinding, owner string) error {
 	now := common.GetTimestamp()
-	result := db.Model(&MaterialBinding{}).Where("id = ? AND locked_by = ? AND locked_until >= ?", binding.Id, owner, now).
-		Updates(map[string]any{"name": binding.Name, "group_name": binding.GroupName, "group_id": binding.GroupID, "asset_id": binding.AssetID, "state": binding.State, "fail_reason": binding.FailReason, "can_retry": binding.CanRetry, "started_at": binding.StartedAt, "upstream_status": binding.UpstreamStatus, "updated_time": now})
+	updates := map[string]any{"name": binding.Name, "group_name": binding.GroupName, "group_id": binding.GroupID, "asset_id": binding.AssetID, "state": binding.State, "fail_reason": binding.FailReason, "can_retry": binding.CanRetry, "started_at": binding.StartedAt, "upstream_status": binding.UpstreamStatus, "updated_time": now}
+	if binding.State == "ready" {
+		updates["locked_by"], updates["locked_until"] = "", int64(0)
+	}
+	result := db.Model(&MaterialBinding{}).Where("id = ? AND locked_by = ? AND locked_until >= ?", binding.Id, owner, now).Updates(updates)
 	if result.Error != nil {
 		return result.Error
 	}
@@ -354,6 +423,15 @@ func FinalizeMaterialDeletion(db *gorm.DB, material *Material) error {
 		if !current.Deleting || count != 0 {
 			return nil
 		}
+		if err := tx.Model(&MaterialUseLease{}).Where("material_id = ? AND expires_at >= ?", material.Id, common.GetTimestamp()).Count(&count).Error; err != nil {
+			return err
+		}
+		if count != 0 {
+			return nil
+		}
+		if err := tx.Where("material_id = ?", material.Id).Delete(&MaterialUseLease{}).Error; err != nil {
+			return err
+		}
 		if err := tx.Where("material_id = ?", material.Id).Delete(&MaterialBinding{}).Error; err != nil {
 			return err
 		}
@@ -388,7 +466,7 @@ func FinalizeMaterialGroupDeletion(db *gorm.DB, group *MaterialGroup) error {
 }
 
 func MigrateMaterialPreparation(db *gorm.DB) error {
-	if err := db.AutoMigrate(&Material{}, &MaterialGroup{}, &MaterialUpstreamGroup{}, &MaterialBinding{}, &MaterialGroupBinding{}); err != nil {
+	if err := db.AutoMigrate(&Material{}, &MaterialGroup{}, &MaterialUpstreamGroup{}, &MaterialBinding{}, &MaterialGroupBinding{}, &MaterialUseLease{}); err != nil {
 		return err
 	}
 	if db.Migrator().HasIndex(&MaterialUpstreamGroup{}, "idx_material_group_scope") {

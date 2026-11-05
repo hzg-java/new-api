@@ -362,7 +362,7 @@ func prepareVideoMaterialBody(ctx context.Context, userID int, channel MaterialC
 	release := func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
-		db.WithContext(cleanupCtx).Model(&model.MaterialBinding{}).Where("locked_by = ?", owner).Updates(map[string]any{"locked_by": "", "locked_until": 0})
+		_ = model.ReleaseVideoMaterials(db.WithContext(cleanupCtx), owner)
 	}
 	return object, nil, &MaterialReservation{Deadline: deadline, Release: release}, nil
 }

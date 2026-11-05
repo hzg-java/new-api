@@ -110,8 +110,14 @@ func PrepareMaterial(ctx context.Context, material *model.Material, scope string
 	db := model.DB.WithContext(persistCtx)
 	owner := common.GetUUID()
 	binding, claimed, err := model.ClaimMaterialBinding(db, material, scope, owner)
-	if err != nil || !claimed {
+	if err != nil {
 		return err
+	}
+	if !claimed {
+		if binding.State == "ready" {
+			return aggregateMaterialPreparation(db, material)
+		}
+		return nil
 	}
 	defer func() {
 		releaseCtx, releaseCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -194,32 +200,38 @@ func PrepareMaterial(ctx context.Context, material *model.Material, scope string
 		if err := db.Where("user_id = ? AND scope = ? AND name = ?", material.UserId, scope, binding.GroupName).First(&group).Error; err != nil {
 			return err
 		}
-		if group.State == "pending" {
-			if group.CreationToken == "" {
-				group.CreationToken = "new-api-material-group:" + common.GetUUID()
-			}
-			result := db.Model(&model.MaterialUpstreamGroup{}).Where("id = ? AND state = ?", group.Id, "pending").Updates(map[string]any{"state": "creating", "creation_token": group.CreationToken})
-			if result.Error != nil {
-				return result.Error
-			}
-			if result.RowsAffected == 1 {
-				created, createErr := provider.CreateAssetGroup(ctx, group.Name, nil)
-				if createErr != nil {
-					if _, rejected := materialRejectionMessage(createErr); rejected {
-						if err := db.Model(&group).Update("state", "pending").Error; err != nil {
-							return err
-						}
-						return finishMaterialPreparation(db, material, binding, owner, "failed", materialOperationFailure("Material preparation rejected", createErr), true)
+		claimed, create, err := model.ClaimMaterialUpstreamGroup(db, &group, owner)
+		if err != nil {
+			return err
+		}
+		if !claimed && group.State != "ready" {
+			return nil
+		}
+		if claimed {
+			defer func() {
+				releaseCtx, releaseCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				defer releaseCancel()
+				model.DB.WithContext(releaseCtx).Model(&model.MaterialUpstreamGroup{}).Where("id = ? AND locked_by = ?", group.Id, owner).Updates(map[string]any{"locked_by": "", "locked_until": 0})
+			}()
+		}
+		if create {
+			created, createErr := provider.CreateAssetGroup(ctx, group.Name, nil)
+			if createErr != nil {
+				if _, rejected := materialRejectionMessage(createErr); rejected {
+					group.State = "pending"
+					if err := model.SaveMaterialUpstreamGroup(db, &group, owner); err != nil {
+						return err
 					}
-					return finishMaterialPreparation(db, material, binding, owner, "uncertain", "Material group creation result is unknown; retry to check the existing result", true)
+					return finishMaterialPreparation(db, material, binding, owner, "failed", materialOperationFailure("Material preparation rejected", createErr), true)
 				}
-				group.UpstreamID, group.State = created.ID, "ready"
-				if err := db.Model(&group).Updates(map[string]any{"upstream_id": group.UpstreamID, "state": group.State}).Error; err != nil {
-					return err
-				}
+				return finishMaterialPreparation(db, material, binding, owner, "uncertain", "Material group creation result is unknown; retry to check the existing result", true)
+			}
+			group.UpstreamID, group.State = created.ID, "ready"
+			if err := model.SaveMaterialUpstreamGroup(db, &group, owner); err != nil {
+				return err
 			}
 		}
-		if group.State == "creating" {
+		if claimed && !create {
 			items, queryErr := listMaterialGroups(ctx, provider, MobileCloudGroupQuery{GroupType: common.GetPointer("AIGC"), Name: &group.Name})
 			if queryErr != nil {
 				return finishMaterialPreparation(db, material, binding, owner, "uncertain", "Material group result could not be confirmed; retry to check without creating again", true)
@@ -235,7 +247,8 @@ func PrepareMaterial(ctx context.Context, material *model.Material, scope string
 			if group.UpstreamID == "" {
 				return finishMaterialPreparation(db, material, binding, owner, "uncertain", "Material group creation result is unknown; retry to check the existing result", true)
 			}
-			if err := db.Model(&group).Updates(map[string]any{"upstream_id": group.UpstreamID, "state": "ready"}).Error; err != nil {
+			group.State = "ready"
+			if err := model.SaveMaterialUpstreamGroup(db, &group, owner); err != nil {
 				return err
 			}
 		}
@@ -260,11 +273,11 @@ func PrepareMaterial(ctx context.Context, material *model.Material, scope string
 			if _, rejected := materialRejectionMessage(createErr); rejected {
 				return finishMaterialPreparation(db, material, binding, owner, "failed", materialOperationFailure("Material preparation rejected", createErr), true)
 			}
-			return finishMaterialPreparation(db, material, binding, owner, "uncertain", "Material upload result is unknown; retry to check without uploading again", true)
-		}
-		binding.AssetID, binding.State = id, "processing"
-		if err := model.SaveMaterialBinding(db, binding, owner); err != nil {
-			return err
+		} else {
+			binding.AssetID, binding.State = id, "processing"
+			if err := model.SaveMaterialBinding(db, binding, owner); err != nil {
+				return err
+			}
 		}
 	}
 	if binding.AssetID == "" {
