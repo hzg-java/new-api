@@ -6,14 +6,20 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
+	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -29,6 +35,58 @@ var mobileCloudMaterialTimeZone = time.FixedZone("Asia/Shanghai", 8*60*60)
 type MobileCloudMaterialRejection struct{ Message string }
 
 func (e *MobileCloudMaterialRejection) Error() string { return e.Message }
+
+type mobileCloudMaterialProxyError struct{ statusCode int }
+
+func (e *mobileCloudMaterialProxyError) Error() string {
+	return fmt.Sprintf("proxy connection failed (HTTP %d)", e.statusCode)
+}
+
+func mobileCloudMaterialConnectionError(err error, tlsHandshakeFailed bool) error {
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("mobile cloud material request canceled: %w", context.Canceled)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("mobile cloud material request timed out: %w", context.DeadlineExceeded)
+	}
+	var proxyErr *mobileCloudMaterialProxyError
+	var opErr *net.OpError
+	prefix := "mobile cloud material upstream connection failed"
+	if errors.As(err, &proxyErr) {
+		return errors.New(prefix + ": " + proxyErr.Error())
+	}
+	if errors.As(err, &opErr) && opErr.Op == "proxyconnect" {
+		prefix += ": proxy connection failed"
+	}
+	var dnsErr *net.DNSError
+	var certificateErr *tls.CertificateVerificationError
+	var authorityErr x509.UnknownAuthorityError
+	var hostnameErr x509.HostnameError
+	var invalidCertificateErr x509.CertificateInvalidError
+	var recordErr tls.RecordHeaderError
+	var alertErr tls.AlertError
+	switch {
+	case errors.As(err, &dnsErr):
+		return errors.New(prefix + ": DNS resolution failed")
+	case errors.As(err, &certificateErr), errors.As(err, &authorityErr), errors.As(err, &hostnameErr), errors.As(err, &invalidCertificateErr):
+		return errors.New(prefix + ": TLS certificate verification failed")
+	case errors.As(err, &recordErr), errors.As(err, &alertErr):
+		return errors.New(prefix + ": TLS handshake failed")
+	case errors.Is(err, syscall.ECONNRESET), runtime.GOOS == "windows" && errors.Is(err, syscall.Errno(10054)):
+		return errors.New(prefix + ": connection reset by peer")
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return errors.New(prefix + ": connection closed before an HTTP response (EOF)")
+	}
+	for cause := err; cause != nil; cause = errors.Unwrap(cause) {
+		if timeoutErr, ok := cause.(net.Error); ok && timeoutErr.Timeout() {
+			return errors.New(prefix + ": connection timed out")
+		}
+	}
+	if tlsHandshakeFailed {
+		return errors.New(prefix + ": TLS handshake failed")
+	}
+	return errors.New(prefix)
+}
 
 type MobileCloudMaterialClient struct {
 	endpoint   url.URL
@@ -122,6 +180,12 @@ func NewMobileCloudMaterialClient(endpoint, accessKey, secretKey, poolID string)
 	transport.DisableKeepAlives = true
 	transport.Protocols = new(http.Protocols)
 	transport.Protocols.SetHTTP1(true)
+	transport.OnProxyConnectResponse = func(ctx context.Context, proxyURL *url.URL, req *http.Request, resp *http.Response) error {
+		if resp.StatusCode != http.StatusOK {
+			return &mobileCloudMaterialProxyError{statusCode: resp.StatusCode}
+		}
+		return nil
+	}
 	return &MobileCloudMaterialClient{
 		endpoint:  *base,
 		accessKey: accessKey,
@@ -170,15 +234,17 @@ func (c *MobileCloudMaterialClient) request(ctx context.Context, method, path st
 	if input != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	var tlsHandshakeFailed atomic.Bool
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+			if err != nil {
+				tlsHandshakeFailed.Store(true)
+			}
+		},
+	}))
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return fmt.Errorf("mobile cloud material request canceled: %w", context.Canceled)
-		}
-		if errors.Is(err, context.DeadlineExceeded) {
-			return fmt.Errorf("mobile cloud material request timed out: %w", context.DeadlineExceeded)
-		}
-		return errors.New("mobile cloud material upstream connection failed")
+		return mobileCloudMaterialConnectionError(err, tlsHandshakeFailed.Load())
 	}
 	defer resp.Body.Close()
 	const maxResponseBytes = 4 << 20
