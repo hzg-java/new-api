@@ -190,10 +190,10 @@ func LoadTopenRouterMaterialConfiguration() (*TopenRouterMaterialConfiguration, 
 	return decodeTopenRouterMaterialConfig(raw)
 }
 
-func topenRouterMaterialChannel(config *TopenRouterMaterialConfiguration) (MaterialChannel, error) {
+func topenRouterMaterialChannel(db *gorm.DB, config *TopenRouterMaterialConfiguration) (MaterialChannel, error) {
 	target := MaterialChannel{ChannelID: config.ChannelID, Provider: "topenrouter", Scope: TopenRouterMaterialScope(config)}
 	var channel model.Channel
-	if err := model.DB.Where("id = ? AND status = ?", config.ChannelID, common.ChannelStatusEnabled).First(&channel).Error; err != nil {
+	if err := db.Where("id = ? AND status = ?", config.ChannelID, common.ChannelStatusEnabled).First(&channel).Error; err != nil {
 		return target, ErrTopenRouterMaterialConfig
 	}
 	target.ChannelName = channel.Name

@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { SectionPageLayout } from '@/components/layout'
@@ -8,6 +9,8 @@ import { TopenRouterConfigSettings } from './topenrouter-config'
 
 export function MaterialCapabilities() {
   const { t } = useTranslation()
+  const [activeProvider, setActiveProvider] = useState('mobile-cloud')
+  const [isTesting, setIsTesting] = useState(false)
 
   return (
     <SectionPageLayout>
@@ -15,16 +18,30 @@ export function MaterialCapabilities() {
         {t('Material integrations')}
       </SectionPageLayout.Title>
       <SectionPageLayout.Content>
-        <Tabs defaultValue='mobile-cloud' className='mx-auto max-w-3xl gap-4'>
+        <Tabs
+          // Keep the active panel mounted when both provider tabs are disabled.
+          value={activeProvider}
+          onValueChange={(value) => {
+            if (isTesting) return
+            if (value === 'mobile-cloud' || value === 'topenrouter') {
+              setActiveProvider(value)
+            }
+          }}
+          className='mx-auto max-w-3xl gap-4'
+        >
           <TabsList aria-label={t('Material integrations')}>
-            <TabsTrigger value='mobile-cloud'>{t('Mobile Cloud')}</TabsTrigger>
-            <TabsTrigger value='topenrouter'>{t('TopenRouter')}</TabsTrigger>
+            <TabsTrigger value='mobile-cloud' disabled={isTesting}>
+              {t('Mobile Cloud')}
+            </TabsTrigger>
+            <TabsTrigger value='topenrouter' disabled={isTesting}>
+              {t('TopenRouter')}
+            </TabsTrigger>
           </TabsList>
           <TabsContent value='mobile-cloud'>
-            <MobileCloudConfigSettings />
+            <MobileCloudConfigSettings onTestingChange={setIsTesting} />
           </TabsContent>
           <TabsContent value='topenrouter'>
-            <TopenRouterConfigSettings />
+            <TopenRouterConfigSettings onTestingChange={setIsTesting} />
           </TabsContent>
         </Tabs>
       </SectionPageLayout.Content>

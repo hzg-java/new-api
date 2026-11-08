@@ -29,13 +29,15 @@ import (
 )
 
 type TaskSubmitResult struct {
-	UpstreamTaskID string
-	TaskData       []byte
-	ClientResponse any
-	Platform       constant.TaskPlatform
-	Quota          int
-	Immediate      *relaycommon.TaskInfo
-	PluginState    []byte
+	UpstreamTaskID         string
+	TaskData               []byte
+	ClientResponse         any
+	Platform               constant.TaskPlatform
+	Quota                  int
+	Immediate              *relaycommon.TaskInfo
+	PluginState            []byte
+	Deferred               bool
+	IntegrationFingerprint string
 	//PerCallPrice   types.PriceData
 }
 
@@ -338,14 +340,55 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (_ *TaskSubmit
 		noteTaskQuotaClamp(info, clamp)
 	}
 
-	// 7. 预扣费（仅首次 — 重试时 info.Billing 已存在，跳过）
+	fingerprint := ""
+	if c.GetBool("defer_video_submission") {
+		switch constant.NormalizeTaskAction(info.Action) {
+		case constant.TaskActionImageToVideo, constant.TaskActionTextToVideo, constant.TaskActionFirstTailToVideo, constant.TaskActionReferenceToVideo:
+			fingerprint, err = service.VideoMaterialIntegrationFingerprint(info.ChannelId)
+			if err != nil {
+				return nil, service.TaskErrorWrapperLocal(err, "material_configuration_failed", http.StatusBadRequest)
+			}
+			if fingerprint != "" {
+				validator, ok := adaptor.(interface {
+					ValidateDeferredMaterialRequest(*gin.Context, *relaycommon.RelayInfo) error
+				})
+				if !ok {
+					return nil, service.TaskErrorWrapperLocal(errors.New("video channel does not support material preparation"), "material_configuration_failed", http.StatusBadRequest)
+				}
+				if err := validator.ValidateDeferredMaterialRequest(c, info); err != nil {
+					return nil, service.TaskErrorWrapperLocal(err, "video_material_invalid", http.StatusBadRequest)
+				}
+			}
+		}
+	}
+	if fingerprint != "" && info.Billing != nil {
+		return nil, &dto.TaskError{Code: "video_submission_channel_changed", Message: "The retry selected a material-managed video channel; submit a new request", StatusCode: http.StatusConflict, LocalError: true, NoRetry: true}
+	}
+	if fingerprint != "" {
+		if info.QuotaClamp != nil {
+			return nil, service.TaskErrorWrapperLocal(errors.New("video task cost exceeds the supported quota limit"), "model_price_error", http.StatusBadRequest)
+		}
+		return &TaskSubmitResult{Platform: platform, Quota: info.PriceData.Quota, Deferred: true, IntegrationFingerprint: fingerprint}, nil
+	}
 	if info.Billing == nil && !info.PriceData.FreeModel {
 		info.ForcePreConsume = true
 		if apiErr := service.PreConsumeBilling(c, info.PriceData.Quota, info); apiErr != nil {
 			return nil, service.TaskErrorFromAPIError(apiErr)
 		}
 	}
+	return submitPreparedTask(c, info, platform, adaptor, nil)
+}
 
+func RelayPreparedTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo, platform constant.TaskPlatform, beforeSend func() error) (*TaskSubmitResult, *dto.TaskError) {
+	_, adaptor := getTaskAdaptorForRequest(c, platform)
+	if adaptor == nil {
+		return nil, service.TaskErrorWrapperLocal(errors.New("task plugin is unavailable"), "task_plugin_unavailable", http.StatusBadRequest)
+	}
+	adaptor.Init(info)
+	return submitPreparedTask(c, info, platform, adaptor, beforeSend)
+}
+
+func submitPreparedTask(c *gin.Context, info *relaycommon.RelayInfo, platform constant.TaskPlatform, adaptor channel.TaskAdaptor, beforeSend func() error) (_ *TaskSubmitResult, finalTaskErr *dto.TaskError) {
 	materialReserved := false
 	if preparer, ok := adaptor.(channel.TaskMaterialPreparationProvider); ok {
 		release, taskErr := preparer.PrepareMaterialRequest(c, info)
@@ -371,6 +414,11 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (_ *TaskSubmit
 				finalTaskErr.NoRetry = true
 			}
 		}()
+	}
+	if beforeSend != nil {
+		if err := beforeSend(); err != nil {
+			return nil, service.TaskErrorWrapperLocal(err, "task_submission_lease_lost", http.StatusConflict)
+		}
 	}
 	// 9. 发送请求
 	resp, err := adaptor.DoRequest(c, info, requestBody)
@@ -670,26 +718,31 @@ func mapTaskStatusToSimple(status model.TaskStatus) string {
 }
 
 func TaskModel2Dto(task *model.Task) *dto.TaskDto {
+	stage := task.SubmissionStage
+	if stage == "failed_final" {
+		stage = "failed"
+	}
 	return &dto.TaskDto{
-		ID:         task.ID,
-		CreatedAt:  task.CreatedAt,
-		UpdatedAt:  task.UpdatedAt,
-		TaskID:     task.TaskID,
-		Platform:   string(task.Platform),
-		UserId:     task.UserId,
-		Group:      task.Group,
-		ChannelId:  task.ChannelId,
-		Quota:      task.Quota,
-		Action:     constant.NormalizeTaskAction(task.Action),
-		Status:     string(task.Status),
-		FailReason: task.FailReason,
-		ResultURL:  task.GetResultURL(),
-		SubmitTime: task.SubmitTime,
-		StartTime:  task.StartTime,
-		FinishTime: task.FinishTime,
-		Progress:   task.Progress,
-		Properties: task.Properties,
-		Username:   task.Username,
-		Data:       task.Data,
+		ID:              task.ID,
+		CreatedAt:       task.CreatedAt,
+		UpdatedAt:       task.UpdatedAt,
+		TaskID:          task.TaskID,
+		Platform:        string(task.Platform),
+		UserId:          task.UserId,
+		Group:           task.Group,
+		ChannelId:       task.ChannelId,
+		Quota:           task.Quota,
+		Action:          constant.NormalizeTaskAction(task.Action),
+		Status:          string(task.Status),
+		SubmissionStage: stage,
+		FailReason:      task.FailReason,
+		ResultURL:       task.GetResultURL(),
+		SubmitTime:      task.SubmitTime,
+		StartTime:       task.StartTime,
+		FinishTime:      task.FinishTime,
+		Progress:        task.Progress,
+		Properties:      task.Properties,
+		Username:        task.Username,
+		Data:            task.Data,
 	}
 }

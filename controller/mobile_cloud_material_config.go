@@ -11,6 +11,40 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func TestMobileCloudMaterialIntegration(c *gin.Context) {
+	testMaterialIntegration(c, "mobile-cloud")
+}
+
+func TestTopenRouterMaterialIntegration(c *gin.Context) {
+	testMaterialIntegration(c, "topenrouter")
+}
+
+func testMaterialIntegration(c *gin.Context, provider string) {
+	c.Header("Cache-Control", "no-store")
+	contentType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
+	if err != nil || contentType != "application/json" {
+		c.JSON(http.StatusUnsupportedMediaType, gin.H{"success": false, "message": "application/json is required"})
+		return
+	}
+	const maxBody = 16 << 10
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxBody+1))
+	if err != nil || len(body) > maxBody {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "invalid material test request"})
+		return
+	}
+	input, err := service.ParseMaterialIntegrationTestRequest(provider, body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	result, err := service.TestMaterialIntegration(c.Request.Context(), provider, *input)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	common.ApiSuccess(c, result)
+}
+
 func GetMobileCloudMaterialConfig(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
 	view, err := service.GetMobileCloudMaterialConfigView()

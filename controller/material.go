@@ -33,8 +33,10 @@ func RegisterMaterialLibraryRoutes(apiRouter *gin.RouterGroup) {
 	materialAdminRoute.Use(middleware.DisableCache(), middleware.AdminAuth())
 	materialAdminRoute.GET("/mobile-cloud/config", GetMobileCloudMaterialConfig)
 	materialAdminRoute.PUT("/mobile-cloud/config", UpdateMobileCloudMaterialConfig)
+	materialAdminRoute.POST("/mobile-cloud/test", TestMobileCloudMaterialIntegration)
 	materialAdminRoute.GET("/topenrouter/config", GetTopenRouterMaterialConfig)
 	materialAdminRoute.PUT("/topenrouter/config", UpdateTopenRouterMaterialConfig)
+	materialAdminRoute.POST("/topenrouter/test", TestTopenRouterMaterialIntegration)
 	materialAdminRoute.GET("/all", ListAllMaterials)
 	ownerRoute := materialAdminRoute.Group("/admin/users/:user_id")
 	{

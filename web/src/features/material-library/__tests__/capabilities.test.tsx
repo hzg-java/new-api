@@ -7,6 +7,27 @@ import { api } from '@/lib/api'
 
 import { MaterialCapabilities } from '../capabilities'
 
+const mobileCloudConfig = {
+  available: true,
+  enabled: true,
+  configured: false,
+  encryption_ready: true,
+  channel_id: 3,
+  channel_name: 'Mobile Cloud channel',
+  endpoint: 'https://materials.example.test',
+  access_key_masked: '',
+  secret_key_configured: false,
+  pool_id: '',
+}
+const topenRouterConfig = {
+  available: true,
+  enabled: false,
+  configured: false,
+  endpoint: 'https://tp-api.chinadatapay.com:8000',
+  token_configured: false,
+  channel_id: 0,
+  channel_name: '',
+}
 const clients: QueryClient[] = []
 
 function renderIntegration() {
@@ -31,15 +52,7 @@ beforeEach(() => {
       return {
         data: {
           success: true,
-          data: {
-            available: true,
-            enabled: false,
-            configured: false,
-            endpoint: 'https://tp-api.chinadatapay.com:8000',
-            token_configured: false,
-            channel_id: 0,
-            channel_name: '',
-          },
+          data: topenRouterConfig,
         },
       }
     }
@@ -49,18 +62,7 @@ beforeEach(() => {
     return {
       data: {
         success: true,
-        data: {
-          available: true,
-          enabled: true,
-          configured: false,
-          encryption_ready: true,
-          channel_id: 3,
-          channel_name: 'Mobile Cloud channel',
-          endpoint: 'https://materials.example.test',
-          access_key_masked: '',
-          secret_key_configured: false,
-          pool_id: '',
-        },
+        data: mobileCloudConfig,
       },
     }
   })
@@ -74,6 +76,156 @@ afterEach(() => {
 })
 
 describe('Material integrations page', () => {
+  it.each([
+    {
+      provider: 'mobile_cloud',
+      tab: 'Mobile Cloud',
+      otherTab: 'TopenRouter',
+      outcome: 'success',
+    },
+    {
+      provider: 'mobile_cloud',
+      tab: 'Mobile Cloud',
+      otherTab: 'TopenRouter',
+      outcome: 'failure',
+    },
+    {
+      provider: 'topenrouter',
+      tab: 'TopenRouter',
+      otherTab: 'Mobile Cloud',
+      outcome: 'success',
+    },
+    {
+      provider: 'topenrouter',
+      tab: 'TopenRouter',
+      otherTab: 'Mobile Cloud',
+      outcome: 'failure',
+    },
+  ] as const)(
+    'blocks click and keyboard provider switching during a pending $tab test and restores it after $outcome',
+    async ({ provider, tab, otherTab, outcome }) => {
+      vi.mocked(api.get).mockImplementation(async (url) => {
+        if (url === '/api/material/mobile-cloud/config') {
+          return {
+            data: {
+              success: true,
+              data: {
+                ...mobileCloudConfig,
+                configured: true,
+                access_key_masked: 'AK****saved',
+                secret_key_configured: true,
+                pool_id: 'test-pool',
+              },
+            },
+          }
+        }
+        if (url === '/api/material/topenrouter/config') {
+          return {
+            data: {
+              success: true,
+              data: {
+                ...topenRouterConfig,
+                configured: true,
+                token_configured: true,
+                channel_id: 7,
+                channel_name: 'TopenRouter channel',
+              },
+            },
+          }
+        }
+        throw new Error(`Unexpected GET: ${url}`)
+      })
+      const result = {
+        provider,
+        channel_id: provider === 'mobile_cloud' ? 3 : 7,
+        channel_name:
+          provider === 'mobile_cloud'
+            ? 'Mobile Cloud channel'
+            : 'TopenRouter channel',
+        operation: 'list_groups',
+        success: true,
+        elapsed_ms: 1,
+      }
+      let finishTest!: (response: {
+        data: { success: boolean; data: typeof result }
+      }) => void
+      let failTest!: (error: Error) => void
+      const post = vi.spyOn(api, 'post').mockReturnValueOnce(
+        new Promise((resolve, reject) => {
+          finishTest = resolve
+          failTest = reject
+        })
+      )
+      const put = vi
+        .spyOn(api, 'put')
+        .mockRejectedValue(new Error('Unexpected save'))
+      const user = userEvent.setup()
+      renderIntegration()
+      if (provider === 'topenrouter') {
+        await user.click(screen.getByRole('tab', { name: tab }))
+      }
+      const execute = await screen.findByRole('button', { name: 'Execute' })
+      const active = screen.getByRole('tab', { name: tab })
+      const inactive = screen.getByRole('tab', { name: otherTab })
+      await user.click(execute)
+      expect(screen.getByText('Testing material API...')).toBeVisible()
+
+      await user.click(inactive)
+      expect(active).toHaveAttribute('aria-selected', 'true')
+      expect(inactive).toHaveAttribute('aria-selected', 'false')
+      inactive.focus()
+      await user.keyboard('{Enter} ')
+      expect(active).toHaveAttribute('aria-selected', 'true')
+      active.focus()
+      await user.keyboard('{ArrowRight}{Enter} ')
+      expect(active).toHaveAttribute('aria-selected', 'true')
+      for (const trigger of [active, inactive]) {
+        expect(trigger).toHaveAttribute('aria-disabled', 'true')
+      }
+      expect(execute).toBeDisabled()
+      const save = screen.getByRole('button', { name: 'Save configuration' })
+      expect(save).toBeDisabled()
+      await user.click(execute)
+      await user.click(save)
+      expect(post).toHaveBeenCalledTimes(1)
+      expect(put).not.toHaveBeenCalled()
+
+      await act(async () => {
+        if (outcome === 'success') {
+          finishTest({ data: { success: true, data: result } })
+        } else {
+          failTest(new Error('Test unavailable'))
+        }
+      })
+      expect(
+        await screen.findByText(
+          outcome === 'success'
+            ? 'Material API test succeeded'
+            : 'Material API test failed'
+        )
+      ).toBeVisible()
+      for (const trigger of [active, inactive]) {
+        expect(trigger).not.toHaveAttribute('aria-disabled', 'true')
+      }
+      expect(execute).toBeEnabled()
+      expect(save).toBeEnabled()
+      await user.click(inactive)
+      expect(
+        await screen.findByRole('tabpanel', { name: otherTab })
+      ).toBeVisible()
+      expect(
+        screen.queryByRole('tabpanel', { name: tab })
+      ).not.toBeInTheDocument()
+      inactive.focus()
+      await user.keyboard('{ArrowRight}{Enter}')
+      expect(await screen.findByRole('tabpanel', { name: tab })).toBeVisible()
+      expect(
+        screen.queryByRole('tabpanel', { name: otherTab })
+      ).not.toBeInTheDocument()
+      expect(post).toHaveBeenCalledTimes(1)
+    }
+  )
+
   it('loads only Mobile Cloud by default under the shared integrations title', async () => {
     renderIntegration()
     expect(

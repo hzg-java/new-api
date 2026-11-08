@@ -171,6 +171,61 @@ func MobileCloudVideoChannelFingerprint(channel *model.Channel) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func VideoSubmissionChannelFingerprint(channel *model.Channel) string {
+	encoded, _ := common.Marshal([]any{MobileCloudVideoChannelFingerprint(channel), channel.GetSetting(), channel.GetOtherSettings(), channel.GetParamOverride(), channel.GetModelMapping()})
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
+}
+
+func VideoMaterialIntegrationFingerprint(channelID int) (string, error) {
+	for _, key := range []string{model.TopenRouterMaterialConfigOption, model.MobileCloudMaterialConfigOption} {
+		raw, err := model.ReadMaterialIntegrationConfig(key)
+		if err != nil {
+			return "", err
+		}
+		if raw == "" {
+			continue
+		}
+		var boundID int
+		var enabled *bool
+		if key == model.TopenRouterMaterialConfigOption {
+			boundID, _, err = topenRouterMaterialConfigBinding(raw)
+			if err == nil && (boundID == 0 || boundID == channelID) {
+				var config *TopenRouterMaterialConfiguration
+				config, err = decodeTopenRouterMaterialConfig(raw)
+				if err == nil {
+					boundID, enabled = config.ChannelID, config.Enabled
+				}
+			}
+		} else {
+			boundID, _, err = mobileCloudMaterialConfigBinding(raw)
+			if err == nil && (boundID == 0 || boundID == channelID) {
+				var config *MobileCloudMaterialConfiguration
+				aead, cipherErr := mobileCloudMaterialCipher(false)
+				err = cipherErr
+				if err == nil {
+					config, err = decodeMobileCloudMaterialConfig(raw, aead)
+				}
+				if err == nil {
+					boundID, enabled = config.ChannelID, config.Enabled
+				}
+			}
+		}
+		if err != nil {
+			return "", err
+		}
+		if boundID != channelID {
+			continue
+		}
+		if enabled != nil && !*enabled {
+			return "", nil
+		}
+		sum := sha256.Sum256([]byte(key + "\x00" + raw))
+		return hex.EncodeToString(sum[:]), nil
+	}
+	return "", nil
+}
+
 type MaterialReservation struct {
 	Deadline time.Time
 	Release  func()
@@ -210,7 +265,7 @@ func PrepareMobileCloudVideoBody(ctx context.Context, userID int, target *model.
 	if err := model.DB.WithContext(ctx).Where("id = ? AND status = ?", target.Id, common.ChannelStatusEnabled).First(&channel).Error; err != nil || channel.ChannelInfo.IsMultiKey || config.ChannelFingerprint != MobileCloudVideoChannelFingerprint(&channel) {
 		return nil, nil, nil, ErrMobileCloudMaterialConfig
 	}
-	channels, err := materialChannelsForConfig(config)
+	channels, err := materialChannelsForConfig(model.DB.WithContext(ctx), config)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -219,7 +274,7 @@ func PrepareMobileCloudVideoBody(ctx context.Context, userID int, target *model.
 		return prepared, issues, reservation, err
 	}
 	current, err := model.ReadMobileCloudMaterialConfig()
-	_, channelErr := materialChannelsForConfig(config)
+	_, channelErr := materialChannelsForConfig(model.DB.WithContext(ctx), config)
 	if err != nil || current != raw || channelErr != nil {
 		reservation.Release()
 		return nil, nil, nil, ErrMobileCloudMaterialConfig
@@ -280,7 +335,7 @@ func prepareTopenRouterVideoBody(ctx context.Context, userID int, target *model.
 	if target.ChannelInfo.IsMultiKey || config.ChannelFingerprint == "" || config.ChannelFingerprint != MobileCloudVideoChannelFingerprint(target) {
 		return nil, nil, nil, ErrTopenRouterMaterialConfig
 	}
-	channel, err := topenRouterMaterialChannel(config)
+	channel, err := topenRouterMaterialChannel(model.DB.WithContext(ctx), config)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -289,7 +344,7 @@ func prepareTopenRouterVideoBody(ctx context.Context, userID int, target *model.
 		return prepared, issues, reservation, err
 	}
 	current, err := model.ReadMaterialIntegrationConfig(model.TopenRouterMaterialConfigOption)
-	_, channelErr := topenRouterMaterialChannel(config)
+	_, channelErr := topenRouterMaterialChannel(model.DB.WithContext(ctx), config)
 	if err != nil || current != raw || channelErr != nil {
 		reservation.Release()
 		return nil, nil, nil, ErrTopenRouterMaterialConfig
@@ -297,42 +352,71 @@ func prepareTopenRouterVideoBody(ctx context.Context, userID int, target *model.
 	return prepared, nil, reservation, nil
 }
 
-func prepareVideoMaterialBody(ctx context.Context, userID int, channel MaterialChannel, body any) (any, []MaterialPreparationIssue, *MaterialReservation, error) {
+func videoMaterialInputs(body any) (map[string]any, []MaterialImageInput, error) {
 	data, err := common.Marshal(body)
 	if err != nil {
-		return nil, nil, nil, errors.New("video request must be a JSON object")
+		return nil, nil, errors.New("video request must be a JSON object")
 	}
 	var object map[string]any
 	if common.Unmarshal(data, &object) != nil || object == nil {
-		return nil, nil, nil, errors.New("video request must be a JSON object")
+		return nil, nil, errors.New("video request must be a JSON object")
 	}
 	content, ok := object["content"].([]any)
 	if !ok {
-		return nil, nil, nil, errors.New("configured material channel requires a video content array")
+		return nil, nil, errors.New("configured material channel requires a video content array")
 	}
 	inputs := make([]MaterialImageInput, 0)
 	for i, value := range content {
 		item, ok := value.(map[string]any)
 		if !ok {
-			return nil, nil, nil, errors.New("invalid video content item")
+			return nil, nil, errors.New("invalid video content item")
 		}
 		if item["type"] != "image_url" {
 			continue
 		}
 		image, ok := item["image_url"].(map[string]any)
 		if !ok {
-			return nil, nil, nil, fmt.Errorf("content[%d].image_url must contain a URL", i)
+			return nil, nil, fmt.Errorf("content[%d].image_url must contain a URL", i)
 		}
 		source, ok := image["url"].(string)
 		if !ok || strings.TrimSpace(source) == "" {
-			return nil, nil, nil, fmt.Errorf("content[%d].image_url.url is required", i)
+			return nil, nil, fmt.Errorf("content[%d].image_url.url is required", i)
 		}
 		usage, _ := item["role"].(string)
 		inputs = append(inputs, MaterialImageInput{Index: i, Source: source, Field: fmt.Sprintf("content[%d].image_url.url", i), Usage: usage})
 	}
+	return object, inputs, nil
+}
+
+func ValidateVideoMaterialBody(body any) error {
+	_, inputs, err := videoMaterialInputs(body)
+	if err != nil {
+		return err
+	}
+	for _, input := range inputs {
+		source := strings.TrimSpace(input.Source)
+		if id, asset := strings.CutPrefix(source, "asset://"); asset {
+			if validateMobileCloudMaterialID(id) != nil {
+				return fmt.Errorf("%s contains an invalid material reference", input.Field)
+			}
+			continue
+		}
+		if ValidateMaterialPreparationSource(source) != nil {
+			return fmt.Errorf("%s must be a public HTTPS image URL", input.Field)
+		}
+	}
+	return nil
+}
+
+func prepareVideoMaterialBody(ctx context.Context, userID int, channel MaterialChannel, body any) (any, []MaterialPreparationIssue, *MaterialReservation, error) {
+	object, inputs, err := videoMaterialInputs(body)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	if len(inputs) == 0 {
 		return body, nil, nil, nil
 	}
+	content := object["content"].([]any)
 	resolved, issues, err := PrepareVideoMaterials(ctx, userID, channel, inputs)
 	if err != nil || len(issues) > 0 {
 		return nil, issues, nil, err

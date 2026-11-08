@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"net/http"
@@ -541,6 +542,315 @@ func TestMobileCloudMaterialConfig(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, request)
 	assert.Contains(t, recorder.Header().Get("Cache-Control"), "no-store")
+}
+
+func TestMaterialIntegrationQueryTests(t *testing.T) {
+	db, users := setupAdminMaterialPostgres(t)
+	t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
+	require.NoError(t, db.Where("key IN ?", []string{model.MobileCloudMaterialConfigOption, model.TopenRouterMaterialConfigOption}).Delete(&model.Option{}).Error)
+	mode, calls := "success", 0
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		assert.Equal(t, http.MethodPost, r.Method)
+		w.Header().Set("Content-Type", "application/json")
+		if mode == "failure" {
+			w.WriteHeader(http.StatusForbidden)
+			if r.URL.Path == "/v1/api/assets/" {
+				_, _ = w.Write([]byte(`{"ResponseMetadata":{"Error":{"Code":"Unauthorized","Message":"Access denied test-token https://private.example/query?Signature=private-signature"}}}`))
+			} else {
+				_, _ = w.Write([]byte(`{"state":"ERROR","errorMessage":"Invalid signature https://private.example/query?Signature=private-signature Authorization: Bearer private-token"}`))
+			}
+			return
+		}
+		if mode == "secret" {
+			_, _ = w.Write([]byte(`{"state":"ERROR","errorMessage":"test-ak test-sk test-pool private-signature"}`))
+			return
+		}
+		if mode == "malformed-url" {
+			_, _ = w.Write([]byte(`{"state":"ERROR","errorMessage":"Invalid signature https://[bad/p?Signature=private-signature"}`))
+			return
+		}
+		var input map[string]any
+		require.NoError(t, common.DecodeJson(r.Body, &input))
+		if strings.HasPrefix(r.URL.Path, "/api/openapi-maas/") {
+			assert.Equal(t, "test-ak", r.URL.Query().Get("AccessKey"))
+			assert.NotEmpty(t, r.URL.Query().Get("Signature"))
+			assert.Equal(t, "test-pool", r.Header.Get("Pool-Id"))
+			assert.EqualValues(t, 1, input["pageNo"])
+			assert.EqualValues(t, 1, input["pageSize"])
+			assert.Equal(t, "AIGC", input["groupType"])
+			assert.Contains(t, []string{"/api/openapi-maas/exp/aicc/v2/asset-group/query", "/api/openapi-maas/exp/aicc/v2/asset/query"}, r.URL.Path)
+			_, _ = w.Write([]byte(`{"state":"OK","body":{"data":[],"total":0}}`))
+			return
+		}
+		assert.Equal(t, "/v1/api/assets/", r.URL.Path)
+		assert.Equal(t, "Bearer test-token", r.Header.Get("Authorization"))
+		assert.Contains(t, []string{"ListAssetGroups", "ListAssets"}, r.URL.Query().Get("Action"))
+		assert.EqualValues(t, 1, input["Page"])
+		assert.EqualValues(t, 1, input["PageSize"])
+		_, _ = w.Write([]byte(`{"Result":{"Items":[],"TotalCount":0}}`))
+	}))
+	defer server.Close()
+	previousTransport := http.DefaultTransport
+	transport := previousTransport.(*http.Transport).Clone()
+	transport.DialTLSContext = (&tls.Dialer{Config: &tls.Config{RootCAs: server.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs}}).DialContext
+	http.DefaultTransport = transport
+	t.Cleanup(func() { http.DefaultTransport = previousTransport; transport.CloseIdleConnections() })
+	channels := []model.Channel{{Name: "Mobile test", Key: "model-only", Status: 1}, {Name: "Topen test", Key: "other-model", Status: 1}}
+	require.NoError(t, db.Create(&channels).Error)
+	router := newAdminMaterialRouter(t)
+	for _, provider := range []string{"mobile-cloud", "topenrouter"} {
+		path := "/api/material/" + provider + "/test"
+		requestAdminMaterial(t, router, nil, http.MethodPost, path, `{"operation":"list_groups","parameters":{"pageNo":1,"pageSize":1}}`, http.StatusUnauthorized, false)
+		requestAdminMaterial(t, router, &users[1], http.MethodPost, path, `{"operation":"list_groups","parameters":{"pageNo":1,"pageSize":1}}`, http.StatusForbidden, false)
+		requestAdminMaterial(t, router, &users[0], http.MethodPost, path, `{"operation":"list_groups","parameters":{"pageNo":1,"pageSize":1}}`, http.StatusServiceUnavailable, false)
+	}
+	assert.Zero(t, calls)
+	require.NoError(t, service.SaveMobileCloudMaterialConfiguration(service.MobileCloudMaterialConfiguration{ChannelID: channels[0].Id, Endpoint: server.URL, AccessKey: "test-ak", SecretKey: "test-sk", PoolID: "test-pool"}))
+	require.NoError(t, service.SaveTopenRouterMaterialConfiguration(service.TopenRouterMaterialConfiguration{ChannelID: channels[1].Id, Endpoint: server.URL, Token: "test-token"}))
+	var before []model.Option
+	require.NoError(t, db.Where("key IN ?", []string{model.MobileCloudMaterialConfigOption, model.TopenRouterMaterialConfigOption}).Order("key").Find(&before).Error)
+	for index, provider := range []string{"mobile-cloud", "topenrouter"} {
+		path := "/api/material/" + provider + "/test"
+		for _, operation := range []string{"list_groups", "list_assets"} {
+			previousCalls := calls
+			response := requestAdminMaterial(t, router, &users[0], http.MethodPost, path, fmt.Sprintf(`{"operation":%q,"parameters":{"pageNo":1,"pageSize":1%s}}`, operation, map[string]string{"mobile-cloud": `,"groupType":"AIGC"`}[provider]), http.StatusOK, true)
+			var result struct {
+				ChannelID int    `json:"channel_id"`
+				Success   bool   `json:"success"`
+				Operation string `json:"operation"`
+				Total     *int64 `json:"total"`
+			}
+			require.NoError(t, common.Unmarshal(response.Data, &result))
+			assert.True(t, result.Success)
+			assert.Equal(t, channels[index].Id, result.ChannelID)
+			assert.Equal(t, operation, result.Operation)
+			require.NotNil(t, result.Total)
+			assert.Zero(t, *result.Total)
+			assert.Equal(t, previousCalls+1, calls)
+			for _, secret := range []string{"test-ak", "test-sk", "test-pool", "test-token", "model-only", "Signature="} {
+				assert.NotContains(t, string(response.Data), secret)
+			}
+		}
+		previousCalls := calls
+		for _, body := range []string{`{}`, `{"operation":"create_group"}`, `{"operation":"delete_asset"}`, `{"operation":"list_groups"} {}`, `{"operation":"list_groups","endpoint":"https://other.example","token":"injected"}`} {
+			requestAdminMaterial(t, router, &users[0], http.MethodPost, path, body, http.StatusBadRequest, false)
+		}
+		assert.Equal(t, previousCalls, calls)
+	}
+	mode = "failure"
+	response := requestAdminMaterial(t, router, &users[0], http.MethodPost, "/api/material/mobile-cloud/test", `{"operation":"list_groups","parameters":{"pageNo":1,"pageSize":1}}`, http.StatusOK, true)
+	assert.Contains(t, string(response.Data), "Invalid signature")
+	assert.Contains(t, string(response.Data), `"success":false`)
+	for _, secret := range []string{"private.example", "private-signature", "private-token", "test-ak", "test-sk"} {
+		assert.NotContains(t, string(response.Data), secret)
+	}
+	response = requestAdminMaterial(t, router, &users[0], http.MethodPost, "/api/material/topenrouter/test", `{"operation":"list_assets","parameters":{"pageNo":1,"pageSize":1}}`, http.StatusOK, true)
+	assert.Contains(t, string(response.Data), "Access denied")
+	assert.Contains(t, string(response.Data), `"success":false`)
+	for _, secret := range []string{"test-token", "private.example", "private-signature"} {
+		assert.NotContains(t, string(response.Data), secret)
+	}
+	mode = "secret"
+	response = requestAdminMaterial(t, router, &users[0], http.MethodPost, "/api/material/mobile-cloud/test", `{"operation":"list_assets","parameters":{"pageNo":1,"pageSize":1,"groupType":"AIGC"}}`, http.StatusOK, true)
+	for _, secret := range []string{"private-signature", "test-ak", "test-sk", "test-pool"} {
+		assert.NotContains(t, string(response.Data), secret)
+	}
+	mode = "malformed-url"
+	response = requestAdminMaterial(t, router, &users[0], http.MethodPost, "/api/material/mobile-cloud/test", `{"operation":"list_groups","parameters":{"pageNo":1,"pageSize":1}}`, http.StatusOK, true)
+	assert.Contains(t, string(response.Data), "Invalid signature")
+	assert.NotContains(t, string(response.Data), "private-signature")
+	assert.NotContains(t, string(response.Data), "https://[bad")
+	previousCalls := calls
+	for _, provider := range []string{"mobile-cloud", "topenrouter"} {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		result, err := service.TestMaterialIntegration(ctx, provider, service.MaterialIntegrationTestRequest{Operation: "list_groups", Parameters: service.MaterialIntegrationTestParameters{PageNo: common.GetPointer(int32(1)), PageSize: common.GetPointer(int32(1))}})
+		require.Error(t, err)
+		assert.Nil(t, result)
+		assert.Equal(t, previousCalls, calls, "canceled tests must not reach the upstream")
+	}
+	t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	requestAdminMaterial(t, router, &users[0], http.MethodPost, "/api/material/mobile-cloud/test", `{"operation":"list_groups","parameters":{"pageNo":1,"pageSize":1}}`, http.StatusServiceUnavailable, false)
+	assert.Equal(t, previousCalls, calls)
+	t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
+	require.NoError(t, db.Model(&channels[0]).Update("key", "changed-video-key").Error)
+	requestAdminMaterial(t, router, &users[0], http.MethodPost, "/api/material/mobile-cloud/test", `{"operation":"list_groups","parameters":{"pageNo":1,"pageSize":1}}`, http.StatusServiceUnavailable, false)
+	assert.Equal(t, previousCalls, calls)
+	var after []model.Option
+	require.NoError(t, db.Where("key IN ?", []string{model.MobileCloudMaterialConfigOption, model.TopenRouterMaterialConfigOption}).Order("key").Find(&after).Error)
+	assert.Equal(t, before, after, "testing must never save credentials or capability state")
+}
+
+func TestMaterialIntegrationManualOperations(t *testing.T) {
+	db, users := setupAdminMaterialPostgres(t)
+	t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
+	require.NoError(t, db.Where("key IN ?", []string{model.MobileCloudMaterialConfigOption, model.TopenRouterMaterialConfigOption}).Delete(&model.Option{}).Error)
+	var requests []string
+	mode := "success"
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if r.Body != nil && r.ContentLength != 0 {
+			require.NoError(t, common.DecodeJson(r.Body, &body))
+		}
+		requests = append(requests, r.Method+" "+r.URL.Path+" "+r.URL.Query().Get("Action"))
+		w.Header().Set("Content-Type", "application/json")
+		if mode == "unknown" {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`not-json`))
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/openapi-maas/") {
+			assert.Equal(t, "test-ak", r.URL.Query().Get("AccessKey"))
+			assert.NotEmpty(t, r.URL.Query().Get("Signature"))
+			switch r.Method + " " + strings.TrimPrefix(r.URL.Path, "/api/openapi-maas/exp/aicc/v2") {
+			case "POST /asset-group":
+				assert.Equal(t, map[string]any{"groupName": "manual group", "groupType": "AIGC", "description": ""}, body)
+				_, _ = w.Write([]byte(`{"state":"OK","body":{"groupId":"group-1","groupType":"AIGC","groupName":"manual group"}}`))
+			case "POST /asset":
+				assert.Equal(t, "group-1", body["groupId"])
+				assert.Equal(t, "https://public.example/input.png", body["assetUrl"])
+				_, _ = w.Write([]byte(`{"state":"OK","body":"asset-1"}`))
+			case "GET /asset/asset-1", "PUT /asset/asset-1":
+				_, _ = w.Write([]byte(`{"state":"OK","body":{"assetId":"asset-1","groupId":"group-1","assetName":"test-sk","assetType":"Image","assetUrl":"https://private.example/secret?token=private-token","status":"ACTIVE"}}`))
+			case "DELETE /asset/asset-1", "DELETE /asset-group/group-1":
+				_, _ = w.Write([]byte(`{"state":"OK","body":true}`))
+			case "GET /asset-group/group-1", "PUT /asset-group/group-1":
+				_, _ = w.Write([]byte(`{"state":"OK","body":{"groupId":"group-1","groupType":"AIGC","groupName":"manual group","description":"test-ak test-sk"}}`))
+			case "POST /asset-group/query":
+				assert.EqualValues(t, 2, body["pageNo"])
+				assert.EqualValues(t, 7, body["pageSize"])
+				assert.Equal(t, "manual", body["groupName"])
+				_, _ = w.Write([]byte(`{"state":"OK","body":{"data":[],"total":0}}`))
+			case "POST /asset/query":
+				assert.EqualValues(t, 3, body["pageNo"])
+				assert.EqualValues(t, 9, body["pageSize"])
+				assert.Equal(t, []any{"group-1"}, body["groupIds"])
+				_, _ = w.Write([]byte(`{"state":"OK","body":{"data":[],"total":0}}`))
+			default:
+				assert.Fail(t, "unexpected mutation or extra request", "%s %s", r.Method, r.URL.Path)
+			}
+			return
+		}
+		assert.Equal(t, "Bearer test-token", r.Header.Get("Authorization"))
+		switch r.URL.Query().Get("Action") {
+		case "CreateAssetGroup":
+			assert.Equal(t, map[string]any{"Name": "manual group", "GroupType": "AIGC", "Description": ""}, body)
+			_, _ = w.Write([]byte(`{"Result":{"Id":"group-1","GroupType":"AIGC","Name":"manual group"}}`))
+		case "CreateAsset":
+			assert.Equal(t, "https://public.example/input.png", body["URL"])
+			assert.NotContains(t, body, "GroupId")
+			assert.NotContains(t, body, "Name")
+			_, _ = w.Write([]byte(`{"Result":{"Id":"asset-1","Status":"Active"}}`))
+		case "ListAssetGroups", "ListAssets":
+			assert.Positive(t, body["Page"])
+			assert.Positive(t, body["PageSize"])
+			_, _ = w.Write([]byte(`{"Result":{"Items":[],"TotalCount":0}}`))
+		case "GetAssetGroup":
+			_, _ = w.Write([]byte(`{"Result":{"Id":"group-1","GroupType":"AIGC","Name":"manual group"}}`))
+		case "GetAsset":
+			_, _ = w.Write([]byte(`{"Result":{"Id":"asset-1","GroupId":"group-1","AssetType":"Image","Status":"Active","URL":"https://private.example/secret?token=private-token"}}`))
+		case "UpdateAssetGroup", "UpdateAsset", "DeleteAssetGroup", "DeleteAsset":
+			_, _ = w.Write([]byte(`{"Result":{}}`))
+		default:
+			assert.Fail(t, "unexpected action", "%s", r.URL.Query().Get("Action"))
+		}
+	}))
+	defer server.Close()
+	previousTransport := http.DefaultTransport
+	transport := previousTransport.(*http.Transport).Clone()
+	transport.DialTLSContext = (&tls.Dialer{Config: &tls.Config{RootCAs: server.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs}}).DialContext
+	http.DefaultTransport = transport
+	t.Cleanup(func() { http.DefaultTransport = previousTransport; transport.CloseIdleConnections() })
+	channels := []model.Channel{{Name: "Mobile manual", Key: "model-key", Status: 1}, {Name: "Topen manual", Key: "other-model-key", Status: 1}}
+	require.NoError(t, db.Create(&channels).Error)
+	require.NoError(t, service.SaveMobileCloudMaterialConfiguration(service.MobileCloudMaterialConfiguration{ChannelID: channels[0].Id, Endpoint: server.URL, AccessKey: "test-ak", SecretKey: "test-sk", PoolID: "test-pool"}))
+	require.NoError(t, service.SaveTopenRouterMaterialConfiguration(service.TopenRouterMaterialConfiguration{ChannelID: channels[1].Id, Endpoint: server.URL, Token: "test-token"}))
+	router := newAdminMaterialRouter(t)
+	for _, provider := range []string{"mobile-cloud", "topenrouter"} {
+		for _, tc := range []struct{ operation, parameters string }{
+			{"create_group", `{"groupName":"manual group","description":""}`},
+			{"list_groups", `{"pageNo":2,"pageSize":7}`},
+			{"get_group", `{"groupId":"group-1"}`},
+			{"update_group", `{"groupId":"group-1","description":""}`},
+			{"create_asset", `{"assetUrl":"https://public.example/input.png","assetType":"Image"}`},
+			{"list_assets", `{"pageNo":3,"pageSize":9,"groupIds":["group-1"]}`},
+			{"get_asset", `{"assetId":"asset-1"}`},
+			{"update_asset", `{"assetId":"asset-1","assetName":"renamed"}`},
+			{"delete_asset", `{"assetId":"asset-1"}`},
+			{"delete_group", `{"groupId":"group-1"}`},
+		} {
+			t.Run(provider+"/"+tc.operation, func(t *testing.T) {
+				parameters := tc.parameters
+				if provider == "mobile-cloud" {
+					switch tc.operation {
+					case "list_groups":
+						parameters = `{"pageNo":2,"pageSize":7,"groupType":"AIGC","groupName":"manual"}`
+					case "list_assets":
+						parameters = `{"pageNo":3,"pageSize":9,"groupType":"AIGC","groupIds":["group-1"]}`
+					case "create_asset":
+						parameters = `{"groupId":"group-1","assetName":"image","assetUrl":"https://public.example/input.png","assetType":"Image"}`
+					}
+				}
+				count := len(requests)
+				body := fmt.Sprintf(`{"operation":%q,"parameters":%s,"confirmed":true}`, tc.operation, parameters)
+				response := requestAdminMaterial(t, router, &users[0], http.MethodPost, "/api/material/"+provider+"/test", body, http.StatusOK, true)
+				var result struct {
+					Success  bool `json:"success"`
+					Response any  `json:"response"`
+				}
+				require.NoError(t, common.Unmarshal(response.Data, &result))
+				assert.True(t, result.Success)
+				assert.NotNil(t, result.Response)
+				expectedCalls := 1
+				if provider == "topenrouter" && (tc.operation == "update_group" || tc.operation == "update_asset") {
+					expectedCalls = 2
+				}
+				assert.Len(t, requests, count+expectedCalls)
+				for _, secret := range []string{"test-ak", "test-sk", "test-token", "test-pool", "private.example", "private-token"} {
+					assert.NotContains(t, string(response.Data), secret)
+				}
+			})
+		}
+	}
+	count := len(requests)
+	for _, body := range []string{
+		`{"operation":"delete_asset","parameters":{"assetId":"asset-1"}}`,
+		`{"operation":"delete_group","parameters":{"groupId":"group-1"},"confirmed":false}`,
+		`{"operation":"create_group","parameters":{"groupName":""}}`,
+		`{"operation":"create_asset","parameters":{"assetUrl":"https://public.example/input.png","assetType":"Image"}}`,
+		`{"operation":"get_asset","parameters":{"assetId":"../escape"}}`,
+		`{"operation":"get_group","parameters":{"groupId":"group-1","endpoint":"https://other.example"}}`,
+		`{"operation":"list_groups","parameters":{"pageNo":0,"pageSize":1}}`,
+		`{"operation":"list_groups","parameters":{"pageNo":1,"pageSize":1,"token":"injected"}}`,
+	} {
+		requestAdminMaterial(t, router, &users[0], http.MethodPost, "/api/material/mobile-cloud/test", body, http.StatusBadRequest, false)
+	}
+	assert.Len(t, requests, count)
+	for _, provider := range []string{"mobile-cloud", "topenrouter"} {
+		for _, operation := range []string{"create_group", "update_asset", "delete_asset", "delete_group"} {
+			t.Run(provider+"/reject-invalid-direct-"+operation, func(t *testing.T) {
+				assert.NotPanics(t, func() {
+					result, err := service.TestMaterialIntegration(t.Context(), provider, service.MaterialIntegrationTestRequest{
+						Operation:  operation,
+						Parameters: service.MaterialIntegrationTestParameters{GroupID: "group-1", AssetID: "asset-1"},
+					})
+					require.Error(t, err)
+					assert.Nil(t, result)
+				})
+			})
+		}
+	}
+	assert.Len(t, requests, count, "invalid direct calls must not execute upstream mutations")
+	for _, operation := range []string{"list_groups", "list_assets"} {
+		requestAdminMaterial(t, router, &users[0], http.MethodPost, "/api/material/topenrouter/test", fmt.Sprintf(`{"operation":%q,"parameters":{}}`, operation), http.StatusOK, true)
+	}
+	count = len(requests)
+	mode = "unknown"
+	response := requestAdminMaterial(t, router, &users[0], http.MethodPost, "/api/material/mobile-cloud/test", `{"operation":"create_group","parameters":{"groupName":"manual group"}}`, http.StatusOK, true)
+	assert.Contains(t, string(response.Data), `"success":false`)
+	assert.Contains(t, string(response.Data), "check")
+	assert.Len(t, requests, count+1, "unknown writes must never be replayed")
 }
 
 func TestMobileCloudMaterialConfigAutomaticEncryption(t *testing.T) {

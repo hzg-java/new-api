@@ -23,6 +23,7 @@ func RegisterScheduledSystemTasks() {
 	service.RegisterSystemTaskHandler(midjourneyPollHandler{})
 	service.RegisterSystemTaskHandler(asyncTaskPollHandler{})
 	service.RegisterSystemTaskHandler(service.MaterialPreparationHandler{})
+	service.RegisterSystemTaskHandler(videoSubmissionHandler{})
 }
 
 // channelTestHandler runs the scheduled "test all channels" job. Enablement and

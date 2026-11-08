@@ -224,3 +224,56 @@ export type TopenRouterConfigResponse = {
   message?: string
   data: TopenRouterConfig
 }
+
+export type MaterialIntegrationProvider = 'mobile_cloud' | 'topenrouter'
+
+export type MaterialTestOperation =
+  | 'list_groups'
+  | 'create_group'
+  | 'get_group'
+  | 'update_group'
+  | 'delete_group'
+  | 'list_assets'
+  | 'create_asset'
+  | 'get_asset'
+  | 'update_asset'
+  | 'delete_asset'
+
+export type MaterialTestParameters = {
+  pageNo?: number
+  pageSize?: number
+  groupType?: 'AIGC'
+  groupName?: string
+  description?: string
+  groupId?: string
+  groupIds?: string[]
+  assetName?: string
+  assetId?: string
+  assetUrl?: string
+  assetType?: MaterialFileType
+  statuses?: ('ACTIVE' | 'PROCESSING' | 'FAILED')[]
+}
+
+export type MaterialTestRequest = {
+  operation: MaterialTestOperation
+  parameters: MaterialTestParameters
+  confirmed?: boolean
+}
+
+export type MaterialTestResult = {
+  provider: MaterialIntegrationProvider
+  channel_id: number
+  channel_name: string
+  operation: MaterialTestOperation
+  success: boolean
+  elapsed_ms: number
+  total?: number
+  message?: string
+  response?: unknown
+}
+
+export type MaterialTestResponse = {
+  success: boolean
+  message?: string
+  data?: MaterialTestResult
+}

@@ -1,6 +1,6 @@
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useEffect } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -46,11 +46,14 @@ import {
   mobileCloudConfigSchema,
   type MobileCloudConfigFormValues,
 } from './lib/mobile-cloud-config-schema'
+import { MaterialIntegrationTest } from './material-integration-test'
 import type { MobileCloudConfig } from './types'
 
 const CONFIG_QUERY_KEY = ['material-library', 'mobile-cloud-config']
 
-export function MobileCloudConfigSettings() {
+export function MobileCloudConfigSettings(props: {
+  onTestingChange?: (testing: boolean) => void
+}) {
   const { t } = useTranslation()
   const query = useQuery({
     queryKey: CONFIG_QUERY_KEY,
@@ -70,14 +73,28 @@ export function MobileCloudConfigSettings() {
           onRetry={() => void query.refetch()}
         />
       )}
-      {query.data && <MobileCloudConfigForm config={query.data} />}
+      {query.data && (
+        <MobileCloudConfigForm
+          config={query.data}
+          onTestingChange={props.onTestingChange}
+        />
+      )}
     </>
   )
 }
 
-function MobileCloudConfigForm(props: { config: MobileCloudConfig }) {
+function MobileCloudConfigForm(props: {
+  config: MobileCloudConfig
+  onTestingChange?: (testing: boolean) => void
+}) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
+  const [isTesting, setIsTesting] = useState(false)
+  const [draftRevision, setDraftRevision] = useState(0)
+  const testConfiguration = useMemo(
+    () => ({ saved: props.config, draftRevision }),
+    [props.config, draftRevision]
+  )
   const form = useForm<MobileCloudConfigFormValues>({
     resolver: zodResolver(mobileCloudConfigSchema(props.config)),
     defaultValues: {
@@ -132,6 +149,8 @@ function MobileCloudConfigForm(props: { config: MobileCloudConfig }) {
         access_key: '',
         secret_key: '',
       })
+      // Credential-only saves can leave all server metadata unchanged.
+      setDraftRevision((revision) => revision + 1)
       queryClient.setQueryData(CONFIG_QUERY_KEY, config)
       toast.success(t('Configuration saved'))
       void queryClient.invalidateQueries({ queryKey: CONFIG_QUERY_KEY })
@@ -143,7 +162,7 @@ function MobileCloudConfigForm(props: { config: MobileCloudConfig }) {
   const isSaving = mutation.isPending || form.formState.isSubmitting
   const encryptionUnavailable =
     props.config.configured && !props.config.encryption_ready
-  const disabled = isSaving || !props.config.available
+  const disabled = isSaving || isTesting || !props.config.available
 
   return (
     <Card>
@@ -195,8 +214,9 @@ function MobileCloudConfigForm(props: { config: MobileCloudConfig }) {
         <Form {...form}>
           <form
             noValidate
-            aria-busy={isSaving}
+            aria-busy={isSaving || isTesting}
             className='space-y-4'
+            onChange={() => setDraftRevision((revision) => revision + 1)}
             onSubmit={(event) => {
               if (disabled) {
                 event.preventDefault()
@@ -232,7 +252,10 @@ function MobileCloudConfigForm(props: { config: MobileCloudConfig }) {
                       ref={field.ref}
                       name={field.name}
                       checked={field.value}
-                      onCheckedChange={field.onChange}
+                      onCheckedChange={(checked) => {
+                        field.onChange(checked)
+                        setDraftRevision((revision) => revision + 1)
+                      }}
                       onBlur={field.onBlur}
                       disabled={disabled}
                     />
@@ -357,6 +380,22 @@ function MobileCloudConfigForm(props: { config: MobileCloudConfig }) {
             </Button>
           </form>
         </Form>
+        <MaterialIntegrationTest
+          provider='mobile_cloud'
+          ready={
+            props.config.configured &&
+            props.config.available &&
+            props.config.encryption_ready &&
+            props.config.channel_id > 0
+          }
+          disabled={isSaving}
+          testing={isTesting}
+          configuration={testConfiguration}
+          onTestingChange={(testing) => {
+            setIsTesting(testing)
+            props.onTestingChange?.(testing)
+          }}
+        />
       </CardContent>
     </Card>
   )

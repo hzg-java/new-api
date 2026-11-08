@@ -1,6 +1,6 @@
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useEffect } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -43,11 +43,14 @@ import {
   topenRouterConfigSchema,
   type TopenRouterConfigFormValues,
 } from './lib/topenrouter-config-schema'
+import { MaterialIntegrationTest } from './material-integration-test'
 import type { TopenRouterConfig } from './types'
 
 const CONFIG_QUERY_KEY = ['material-library', 'topenrouter-config']
 
-export function TopenRouterConfigSettings() {
+export function TopenRouterConfigSettings(props: {
+  onTestingChange?: (testing: boolean) => void
+}) {
   const { t } = useTranslation()
   const query = useQuery({
     queryKey: CONFIG_QUERY_KEY,
@@ -67,15 +70,29 @@ export function TopenRouterConfigSettings() {
           onRetry={() => void query.refetch()}
         />
       )}
-      {query.data && <TopenRouterConfigForm config={query.data} />}
+      {query.data && (
+        <TopenRouterConfigForm
+          config={query.data}
+          onTestingChange={props.onTestingChange}
+        />
+      )}
     </>
   )
 }
 
-function TopenRouterConfigForm(props: { config: TopenRouterConfig }) {
+function TopenRouterConfigForm(props: {
+  config: TopenRouterConfig
+  onTestingChange?: (testing: boolean) => void
+}) {
   const { t, i18n } = useTranslation()
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   const queryClient = useQueryClient()
+  const [isTesting, setIsTesting] = useState(false)
+  const [draftRevision, setDraftRevision] = useState(0)
+  const testConfiguration = useMemo(
+    () => ({ saved: props.config, draftRevision }),
+    [props.config, draftRevision]
+  )
   const form = useForm<TopenRouterConfigFormValues>({
     resolver: zodResolver(topenRouterConfigSchema(props.config)),
     defaultValues: {
@@ -131,6 +148,8 @@ function TopenRouterConfigForm(props: { config: TopenRouterConfig }) {
         endpoint: config.endpoint || TOPENROUTER_DEFAULT_ENDPOINT,
         token: '',
       })
+      // Credential-only saves can leave all server metadata unchanged.
+      setDraftRevision((revision) => revision + 1)
       queryClient.setQueryData(CONFIG_QUERY_KEY, config)
       toast.success(t('Configuration saved'))
       void queryClient.invalidateQueries({ queryKey: CONFIG_QUERY_KEY })
@@ -140,7 +159,7 @@ function TopenRouterConfigForm(props: { config: TopenRouterConfig }) {
     onSettled: (): void => mutation.reset(),
   })
   const isSaving = mutation.isPending || form.formState.isSubmitting
-  const disabled = isSaving || !props.config.available
+  const disabled = isSaving || isTesting || !props.config.available
 
   return (
     <Card>
@@ -180,8 +199,9 @@ function TopenRouterConfigForm(props: { config: TopenRouterConfig }) {
         <Form {...form}>
           <form
             noValidate
-            aria-busy={isSaving}
+            aria-busy={isSaving || isTesting}
             className='space-y-4'
+            onChange={() => setDraftRevision((revision) => revision + 1)}
             onSubmit={(event) => {
               if (disabled) {
                 event.preventDefault()
@@ -217,7 +237,10 @@ function TopenRouterConfigForm(props: { config: TopenRouterConfig }) {
                       ref={field.ref}
                       name={field.name}
                       checked={field.value}
-                      onCheckedChange={field.onChange}
+                      onCheckedChange={(checked) => {
+                        field.onChange(checked)
+                        setDraftRevision((revision) => revision + 1)
+                      }}
                       onBlur={field.onBlur}
                       disabled={disabled}
                     />
@@ -295,6 +318,22 @@ function TopenRouterConfigForm(props: { config: TopenRouterConfig }) {
             </Button>
           </form>
         </Form>
+        <MaterialIntegrationTest
+          provider='topenrouter'
+          ready={
+            props.config.configured &&
+            props.config.available &&
+            props.config.channel_id > 0 &&
+            props.config.token_configured
+          }
+          disabled={isSaving}
+          testing={isTesting}
+          configuration={testConfiguration}
+          onTestingChange={(testing) => {
+            setIsTesting(testing)
+            props.onTestingChange?.(testing)
+          }}
+        />
       </CardContent>
     </Card>
   )

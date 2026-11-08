@@ -33,8 +33,10 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/go-redis/redis/v8"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/stdlib"
@@ -482,6 +484,7 @@ func setupAdminMaterialPostgres(t *testing.T) (*gorm.DB, []model.User) {
 	// Serialize transactional migrations across targeted test processes.
 	require.NoError(t, tx.Exec("SELECT pg_advisory_xact_lock(74329186)").Error)
 	require.NoError(t, model.MigrateMaterialPreparation(tx))
+	require.NoError(t, tx.AutoMigrate(&model.Task{}))
 	users := make([]model.User, 3)
 	for i := range users {
 		key := common.GetUUID()
@@ -1835,6 +1838,389 @@ func TestMobileCloudVideoSubmitMaterialGate(t *testing.T) {
 		assert.Equal(t, []service.MaterialPreparationIssue{{Index: 2, MaterialID: failed.MaterialID, Field: "content[2].image_url.url", Usage: "last_frame", Status: "failed", Reason: "Unsupported image format"}}, issues)
 		assert.Equal(t, publicMaterialURL, request["content"].([]any)[0].(map[string]any)["image_url"].(map[string]any)["url"], "a partial batch must not rewrite the original request")
 	})
+}
+
+func TestDeferredVideoSubmissionReportsMaterialFailure(t *testing.T) {
+	db := setupMaterialConcurrentPostgres(t)
+	require.NoError(t, db.AutoMigrate(&model.Task{}, &model.TaskEvent{}, &model.Channel{}, &model.Token{}, &model.SystemTask{}, &model.Log{}, &model.Option{}))
+	previousLogDB := model.LOG_DB
+	model.LOG_DB = db
+	t.Cleanup(func() { model.LOG_DB = previousLogDB })
+	users := make([]model.User, 2)
+	for i := range users {
+		users[i] = model.User{Username: fmt.Sprintf("async-material-%d", i), AffCode: fmt.Sprintf("async-material-%d", i), Status: common.UserStatusEnabled}
+		require.NoError(t, db.Create(&users[i]).Error)
+	}
+	t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
+	videoCalls := 0
+	videoServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		videoCalls++
+		var body map[string]any
+		if assert.NoError(t, common.DecodeJson(r.Body, &body)) {
+			content := body["content"].([]any)
+			assert.Equal(t, "asset://async-asset", content[0].(map[string]any)["image_url"].(map[string]any)["url"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"async-upstream"}`))
+	}))
+	t.Cleanup(videoServer.Close)
+	uploads := 0
+	materialServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		path := strings.TrimPrefix(r.URL.Path, "/api/openapi-maas/exp/aicc/v2")
+		switch {
+		case r.Method == http.MethodPost && path == "/asset-group":
+			_, _ = w.Write([]byte(`{"state":"OK","body":{"groupId":"async-group","groupType":"AIGC"}}`))
+		case r.Method == http.MethodPost && path == "/asset":
+			uploads++
+			_, _ = w.Write([]byte(`{"state":"OK","body":"async-asset"}`))
+		case r.Method == http.MethodGet && path == "/asset/async-asset":
+			_, _ = w.Write([]byte(`{"state":"OK","body":{"assetId":"async-asset","groupId":"async-group","assetType":"Image","status":"ACTIVE"}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(materialServer.Close)
+	previousTransport := http.DefaultTransport
+	transport := previousTransport.(*http.Transport).Clone()
+	transport.DialTLSContext = (&tls.Dialer{Config: &tls.Config{RootCAs: materialServer.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs}}).DialContext
+	http.DefaultTransport = transport
+	t.Cleanup(func() { http.DefaultTransport = previousTransport; transport.CloseIdleConnections() })
+	service.InitHttpClient()
+	t.Setenv("MOBILE_CLOUD_MATERIAL_TEST_ENABLED", "true")
+	channel := model.Channel{Name: "async video mock", Type: constant.ChannelTypeTaskPlugin, Key: "test-key", BaseURL: &videoServer.URL, Status: 1, Setting: common.GetPointer(`{"task_plugin_key":"async-material"}`)}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, db.Where("key IN ?", []string{model.MobileCloudMaterialConfigOption, model.TopenRouterMaterialConfigOption}).Delete(&model.Option{}).Error)
+	require.NoError(t, service.SaveMobileCloudMaterialConfiguration(service.MobileCloudMaterialConfiguration{ChannelID: channel.Id, Endpoint: materialServer.URL, AccessKey: "test-access", SecretKey: "test-secret", PoolID: "test-pool"}))
+	plugin, err := pluginruntime.CompilePlugin(`
+		export const meta = {apiVersion:1,key:"async-material",name:"async-material",version:"1.0.0",fetchMode:"per_task",models:["async-video"],author:{name:"test"},usageSchema:{}};
+		export function buildSubmitRequest(ctx) {return {url:ctx.baseUrl+"/tasks",method:"POST",body:ctx.requestBody};}
+		export function parseSubmitResponse(ctx, response) {return {taskId:response.body.id,taskData:response.body};}
+		export function buildQueryRequest(ctx) {return {url:ctx.baseUrl+"/tasks/"+ctx.taskId};}
+		export function parseTaskResult() {return {status:"UNKNOWN"};}
+	`, pluginruntime.Options{Key: "async-material"})
+	require.NoError(t, err)
+	prices := ratio_setting.ModelPrice2JSONString()
+	t.Cleanup(func() { require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(prices)) })
+	require.NoError(t, ratio_setting.UpdateModelPriceByJSONString(`{"async-video":0.01}`))
+	c := newMaterialContext(httptest.NewRecorder(), http.MethodPost, "/tasks", `{}`, users[1].Id)
+	common.SetContextKey(c, constant.ContextKeyOriginalModel, "async-video")
+	common.SetContextKey(c, constant.ContextKeyChannelId, channel.Id)
+	common.SetContextKey(c, constant.ContextKeyChannelType, channel.Type)
+	common.SetContextKey(c, constant.ContextKeyChannelKey, channel.Key)
+	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, videoServer.URL)
+	c.Set("task_request", map[string]any{"model": "async-video", "content": []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": "asset://missing-image"}, "role": "reference_image"}}})
+	c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Plugin: plugin})
+	require.NoError(t, db.Model(&users[1]).Update("quota", 100000000).Error)
+	token := model.Token{UserId: users[1].Id, Key: common.GetUUID(), RemainQuota: 100000000}
+	require.NoError(t, db.Create(&token).Error)
+	info := &relaycommon.RelayInfo{UserId: users[1].Id, TokenId: token.Id, TokenKey: token.Key, UserQuota: 100000000, OriginModelName: "async-video", UserGroup: "default", UsingGroup: "default", TaskRelayInfo: &relaycommon.TaskRelayInfo{Action: constant.TaskActionImageToVideo, LockedChannel: &channel}}
+	info.UserSetting.BillingPreference = "wallet_only"
+	outcome, taskErr := executeTaskSubmission(c, info)
+	require.Nil(t, taskErr, "%+v", taskErr)
+	require.NotNil(t, outcome)
+	assert.Equal(t, "pending", outcome.Task.SubmissionStage)
+	assert.Empty(t, outcome.Task.PrivateData.UpstreamTaskID)
+	assert.NotEmpty(t, outcome.Task.TaskID)
+	presentTaskSubmission(c, outcome)
+	assert.Contains(t, c.Writer.Header().Get("Content-Type"), "application/json")
+	for _, polled := range model.GetAllUnFinishSyncTasks(100) {
+		assert.NotEqual(t, outcome.Task.ID, polled.ID)
+	}
+
+	err = runVideoSubmission(t.Context(), outcome.Task, plugin)
+	require.NoError(t, err)
+	var failed model.Task
+	require.NoError(t, db.First(&failed, outcome.Task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusFailure, failed.Status)
+	assert.Contains(t, failed.FailReason, "content[0].image_url.url")
+	assert.Contains(t, failed.FailReason, "unavailable")
+	view, err := service.BuildTaskPluginView(&failed)
+	require.NoError(t, err)
+	data, ok := view.Data.(map[string]any)
+	require.True(t, ok)
+	assert.Contains(t, data, "error")
+	publicVideo := failed.ToOpenAIVideo()
+	require.NotNil(t, publicVideo.Error)
+	assert.Contains(t, publicVideo.Error.Message, "content[0].image_url.url")
+	assert.Empty(t, failed.PrivateData.VideoSubmission.Request)
+	assert.Zero(t, videoCalls, "unready material must never reach the video provider")
+	assert.Zero(t, failed.Quota)
+	assert.Equal(t, "failed_final", failed.SubmissionStage)
+	var balanceAfterRefund int
+	require.NoError(t, db.Model(&model.User{}).Where("id = ?", users[1].Id).Select("quota").Scan(&balanceAfterRefund).Error)
+	require.NoError(t, runVideoSubmission(t.Context(), &failed, plugin))
+	var balanceAfterRetry int
+	require.NoError(t, db.Model(&model.User{}).Where("id = ?", users[1].Id).Select("quota").Scan(&balanceAfterRetry).Error)
+	assert.Equal(t, balanceAfterRefund, balanceAfterRetry)
+	assert.Equal(t, 100000000, balanceAfterRefund)
+	require.NoError(t, db.First(&token, token.Id).Error)
+	assert.Equal(t, 100000000, token.RemainQuota)
+	assert.Zero(t, token.UsedQuota)
+
+	c.Set("task_request", map[string]any{"model": "async-video", "content": []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": publicMaterialURL}, "role": "reference_image"}}})
+	info.TaskRelayInfo.PublicTaskID = ""
+	info.Billing = nil
+	accepted, taskErr := executeTaskSubmission(c, info)
+	require.Nil(t, taskErr, "%+v", taskErr)
+	assert.Zero(t, uploads, "HTTP acceptance must not upload material")
+	assert.Zero(t, videoCalls, "HTTP acceptance must not submit the provider request")
+	require.NoError(t, runVideoSubmission(t.Context(), accepted.Task, plugin))
+	var submitted model.Task
+	require.NoError(t, db.First(&submitted, accepted.Task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusSubmitted, submitted.Status)
+	assert.Equal(t, "async-upstream", submitted.GetUpstreamTaskID())
+	assert.Equal(t, accepted.Task.TaskID, submitted.TaskID)
+	assert.Empty(t, submitted.SubmissionStage)
+	assert.Equal(t, 1, uploads)
+	assert.Equal(t, 1, videoCalls)
+	require.NoError(t, runVideoSubmission(t.Context(), &submitted, plugin))
+	assert.Equal(t, 1, videoCalls, "a finished submission must not be replayed")
+	require.NoError(t, db.First(&token, token.Id).Error)
+	assert.Equal(t, 100000000-submitted.Quota, token.RemainQuota)
+	assert.Equal(t, submitted.Quota, token.UsedQuota)
+	var material model.Material
+	require.NoError(t, db.Where("user_id = ? AND source_url = ?", users[1].Id, publicMaterialURL).First(&material).Error)
+	require.NoError(t, db.Model(&material).Update("status", model.MaterialStatusFailed).Error)
+	require.NoError(t, db.Model(&model.MaterialBinding{}).Where("material_id = ?", material.Id).Updates(map[string]any{"state": "failed", "upstream_status": "FAILED", "fail_reason": "Image rejected by content review", "can_retry": false}).Error)
+	c.Set("task_request", map[string]any{"model": "async-video", "content": []any{map[string]any{"type": "text", "text": "reference image"}, map[string]any{"type": "image_url", "image_url": map[string]any{"url": "asset://async-asset"}, "role": "reference_image"}}})
+	info.TaskRelayInfo.PublicTaskID, info.Billing = "", nil
+	rejected, taskErr := executeTaskSubmission(c, info)
+	require.Nil(t, taskErr, "%+v", taskErr)
+	require.NoError(t, runVideoSubmission(t.Context(), rejected.Task, plugin))
+	var rejectedTask model.Task
+	require.NoError(t, db.First(&rejectedTask, rejected.Task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusFailure, rejectedTask.Status)
+	assert.Contains(t, rejectedTask.FailReason, "content[1].image_url.url")
+	assert.Contains(t, rejectedTask.FailReason, material.MaterialID)
+	assert.Contains(t, rejectedTask.FailReason, "Image rejected by content review")
+	assert.Contains(t, string(rejectedTask.Data), `"usage":"reference_image"`)
+	assert.Equal(t, 1, videoCalls)
+	assert.Equal(t, 1, uploads)
+}
+
+func TestDeferredVideoSubmissionLifecycle(t *testing.T) {
+	db := setupMaterialConcurrentPostgres(t)
+	require.NoError(t, db.AutoMigrate(&model.Task{}, &model.TaskEvent{}, &model.Channel{}, &model.Token{}))
+	require.NoError(t, db.AutoMigrate(&model.Task{}, &model.TaskEvent{}, &model.Channel{}, &model.Token{}))
+	user := model.User{Username: "async-worker", Quota: 9000, UsedQuota: 1000}
+	require.NoError(t, db.Create(&user).Error)
+	channel := model.Channel{Name: "async-worker", UsedQuota: 1000}
+	require.NoError(t, db.Create(&channel).Error)
+	token := model.Token{UserId: user.Id, Key: common.GetUUID(), RemainQuota: 9000, UsedQuota: 1000}
+	require.NoError(t, db.Create(&token).Error)
+	refund := model.Task{TaskID: model.GenerateTaskID(), UserId: user.Id, ChannelId: channel.Id, Quota: 1000, Status: model.TaskStatusFailure, SubmissionStage: "failed", SubmissionOwner: "refund-worker", SubmissionLeaseUntil: common.GetTimestamp() + 60, PrivateData: model.TaskPrivateData{TokenId: token.Id, VideoSubmission: &model.VideoSubmission{Accounted: true}}}
+	require.NoError(t, db.Create(&refund).Error)
+	previous, applied, err := model.AdjustVideoSubmissionQuota(t.Context(), refund.ID, "wrong-worker", 0)
+	require.NoError(t, err)
+	assert.False(t, applied)
+	assert.Equal(t, 1000, previous)
+	previous, applied, err = model.AdjustVideoSubmissionQuota(t.Context(), refund.ID, "refund-worker", 0)
+	require.NoError(t, err)
+	assert.True(t, applied)
+	assert.Equal(t, 1000, previous)
+	previous, applied, err = model.AdjustVideoSubmissionQuota(t.Context(), refund.ID, "refund-worker", 0)
+	require.NoError(t, err)
+	assert.True(t, applied)
+	assert.Zero(t, previous)
+	require.NoError(t, db.First(&user, user.Id).Error)
+	require.NoError(t, db.First(&channel, channel.Id).Error)
+	require.NoError(t, db.First(&token, token.Id).Error)
+	assert.Equal(t, 10000, user.Quota)
+	assert.Zero(t, user.UsedQuota)
+	assert.Zero(t, user.RequestCount)
+	assert.Zero(t, channel.UsedQuota)
+	assert.Equal(t, 10000, token.RemainQuota)
+	assert.Zero(t, token.UsedQuota)
+	refund.ID, refund.TaskID, refund.Quota = 0, model.GenerateTaskID(), 1000
+	require.NoError(t, db.Model(&user).Updates(map[string]any{"quota": 9000, "used_quota": 1000}).Error)
+	require.NoError(t, db.Model(&token).Updates(map[string]any{"remain_quota": 9000, "used_quota": 1000}).Error)
+	require.NoError(t, db.Delete(&channel).Error)
+	require.NoError(t, db.Create(&refund).Error)
+	_, applied, err = model.AdjustVideoSubmissionQuota(t.Context(), refund.ID, "refund-worker", 0)
+	require.NoError(t, err)
+	assert.True(t, applied, "a deleted channel cannot block wallet refunds")
+	require.NoError(t, db.First(&user, user.Id).Error)
+	assert.Equal(t, 10000, user.Quota)
+	reservation := model.Task{TaskID: model.GenerateTaskID(), UserId: user.Id, ChannelId: channel.Id, Quota: 100, Status: model.TaskStatusQueued, PrivateData: model.TaskPrivateData{TokenId: token.Id, VideoSubmission: &model.VideoSubmission{TargetQuota: 100}}}
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register("video_task_insert_failure", func(tx *gorm.DB) {
+		if task, ok := tx.Statement.Dest.(*model.Task); ok && task.TaskID == reservation.TaskID {
+			tx.AddError(fmt.Errorf("injected video task insert failure"))
+		}
+	}))
+	reserveErr := model.ReserveVideoSubmission(t.Context(), &reservation, "wallet_only", false, false)
+	require.ErrorContains(t, reserveErr, "injected video task insert failure")
+	require.NoError(t, db.Callback().Create().Remove("video_task_insert_failure"))
+	require.NoError(t, db.First(&user, user.Id).Error)
+	require.NoError(t, db.First(&token, token.Id).Error)
+	assert.Equal(t, 10000, user.Quota, "task persistence and wallet debit roll back together")
+	assert.Equal(t, 10000, token.RemainQuota)
+	var persisted int64
+	require.NoError(t, db.Model(&model.Task{}).Where("task_id = ?", reservation.TaskID).Count(&persisted).Error)
+	assert.Zero(t, persisted)
+	require.NoError(t, db.AutoMigrate(&model.UserSubscription{}, &model.SubscriptionPlan{}))
+	plan := model.SubscriptionPlan{Title: "async-test", TotalAmount: 5000, QuotaResetPeriod: "never"}
+	require.NoError(t, db.Create(&plan).Error)
+	subscription := model.UserSubscription{UserId: user.Id, PlanId: plan.Id, AmountTotal: 5000, EndTime: common.GetTimestamp() + 3600, Status: "active"}
+	require.NoError(t, db.Create(&subscription).Error)
+	reservation.ID, reservation.TaskID = 0, model.GenerateTaskID()
+	require.NoError(t, model.ReserveVideoSubmission(t.Context(), &reservation, "subscription_only", false, false))
+	require.NoError(t, db.First(&subscription, subscription.Id).Error)
+	assert.EqualValues(t, 100, subscription.AmountUsed)
+	assert.Equal(t, subscription.Id, reservation.PrivateData.SubscriptionId)
+	assert.Equal(t, "subscription", reservation.PrivateData.BillingSource)
+	require.NoError(t, db.First(&user, user.Id).Error)
+	assert.Equal(t, 10000, user.Quota, "subscription reservations must not debit the wallet")
+	require.NoError(t, db.Model(&reservation).Updates(map[string]any{"submission_stage": "failed", "submission_owner": "sub-worker", "submission_lease_until": common.GetTimestamp() + 60}).Error)
+	_, applied, err = model.AdjustVideoSubmissionQuota(t.Context(), reservation.ID, "sub-worker", 0)
+	require.NoError(t, err)
+	assert.True(t, applied)
+	require.NoError(t, db.First(&subscription, subscription.Id).Error)
+	assert.Zero(t, subscription.AmountUsed)
+	task := &model.Task{TaskID: model.GenerateTaskID(), Status: model.TaskStatusQueued, Progress: "0%", SubmissionStage: "pending"}
+	require.NoError(t, db.Create(task).Error)
+
+	claimed, err := model.ClaimVideoSubmission(t.Context(), task.ID, "worker-one")
+	require.NoError(t, err)
+	require.True(t, claimed)
+	claimed, err = model.ClaimVideoSubmission(t.Context(), task.ID, "worker-two")
+	require.NoError(t, err)
+	assert.False(t, claimed)
+	assert.Empty(t, model.GetAllUnFinishSyncTasks(100), "a local task must not be polled with its public ID")
+	require.NoError(t, db.First(task, task.ID).Error)
+	assert.Empty(t, task.GetUpstreamTaskID())
+	require.NoError(t, db.Model(task).Update("submission_lease_until", common.GetTimestamp()-1).Error)
+	claims := make(chan bool, 2)
+	errors := make(chan error, 2)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, worker := range []string{"worker-two", "worker-three"} {
+		wg.Go(func() {
+			<-start
+			won, claimErr := model.ClaimVideoSubmission(t.Context(), task.ID, worker)
+			claims <- won
+			errors <- claimErr
+		})
+	}
+	close(start)
+	wg.Wait()
+	wins := 0
+	for range 2 {
+		require.NoError(t, <-errors)
+		if <-claims {
+			wins++
+		}
+	}
+	assert.Equal(t, 1, wins, "only one connection may resume an expired material preparation")
+
+	require.NoError(t, db.Model(task).Updates(map[string]any{"submission_stage": "submitting", "submission_lease_until": common.GetTimestamp() - 1}).Error)
+	claimed, err = model.ClaimVideoSubmission(t.Context(), task.ID, "worker-three")
+	require.NoError(t, err)
+	assert.False(t, claimed, "a possibly accepted upstream request must not be replayed")
+	uncertain := model.Task{TaskID: model.GenerateTaskID(), UserId: user.Id, ChannelId: channel.Id, Status: model.TaskStatusQueued, SubmissionStage: "submitting", PrivateData: model.TaskPrivateData{VideoSubmission: &model.VideoSubmission{}}}
+	require.NoError(t, db.Create(&uncertain).Error)
+	require.NoError(t, runVideoSubmission(t.Context(), &uncertain, nil))
+	require.NoError(t, db.First(&uncertain, uncertain.ID).Error)
+	assert.EqualValues(t, model.TaskStatusFailure, uncertain.Status)
+	assert.Contains(t, uncertain.FailReason, "may have accepted")
+	assert.Equal(t, "failed_final", uncertain.SubmissionStage)
+	t.Run("Redis and batch accounting", func(t *testing.T) {
+		server := miniredis.RunT(t)
+		client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+		oldRedis, oldClient, oldBatch := common.RedisEnabled, common.RDB, common.BatchUpdateEnabled
+		common.RedisEnabled, common.RDB, common.BatchUpdateEnabled = true, client, true
+		t.Cleanup(func() {
+			common.RedisEnabled, common.RDB, common.BatchUpdateEnabled = oldRedis, oldClient, oldBatch
+			require.NoError(t, client.Close())
+		})
+		localChannel := model.Channel{Name: "cache-accounting"}
+		require.NoError(t, db.Create(&localChannel).Error)
+		queued := model.Task{TaskID: model.GenerateTaskID(), UserId: user.Id, ChannelId: localChannel.Id, Quota: 100, Status: model.TaskStatusQueued, PrivateData: model.TaskPrivateData{TokenId: token.Id, VideoSubmission: &model.VideoSubmission{TargetQuota: 100}}}
+		require.NoError(t, model.ReserveVideoSubmission(t.Context(), &queued, "wallet_only", false, false))
+		quota, err := model.GetUserQuota(user.Id, false)
+		require.NoError(t, err)
+		assert.Equal(t, 9900, quota)
+		cachedToken, err := model.GetTokenByKey(token.Key, false)
+		require.NoError(t, err)
+		assert.Equal(t, 9900, cachedToken.RemainQuota)
+		require.NoError(t, db.First(&user, user.Id).Error)
+		assert.Equal(t, 9900, user.Quota, "batch mode cannot delay a durable task debit")
+		require.NoError(t, db.Model(&queued).Updates(map[string]any{"submission_stage": "failed", "submission_owner": "cache-worker", "submission_lease_until": common.GetTimestamp() + 60}).Error)
+		_, applied, err := model.AdjustVideoSubmissionQuota(t.Context(), queued.ID, "cache-worker", 0)
+		require.NoError(t, err)
+		assert.True(t, applied)
+		quota, err = model.GetUserQuota(user.Id, false)
+		require.NoError(t, err)
+		assert.Equal(t, 10000, quota)
+		cachedToken, err = model.GetTokenByKey(token.Key, false)
+		require.NoError(t, err)
+		assert.Equal(t, 10000, cachedToken.RemainQuota)
+		require.NoError(t, db.First(&user, user.Id).Error)
+		assert.Equal(t, 10000, user.Quota)
+	})
+}
+
+func TestLocalVideoSubmissionIsolation(t *testing.T) {
+	db := setupMaterialConcurrentPostgres(t)
+	previousLimit := constant.TaskQueryLimit
+	constant.TaskQueryLimit = 100
+	t.Cleanup(func() { constant.TaskQueryLimit = previousLimit })
+	require.NoError(t, db.AutoMigrate(&model.Task{}, &model.TaskEvent{}, &model.Channel{}))
+	channel := model.Channel{Name: "local video isolation", Status: common.ChannelStatusEnabled}
+	require.NoError(t, db.Create(&channel).Error)
+	historical := model.Task{TaskID: model.GenerateTaskID(), ChannelId: channel.Id, Platform: "historical-video", Status: model.TaskStatusQueued, SubmissionStage: "pending", PrivateData: model.TaskPrivateData{VideoSubmission: &model.VideoSubmission{}}}
+	require.NoError(t, db.Create(&historical).Error)
+	historicalPoll := model.Task{TaskID: model.GenerateTaskID(), ChannelId: channel.Id, Platform: "historical-poll", Status: model.TaskStatusSubmitted, PrivateData: model.TaskPrivateData{UpstreamTaskID: "old-upstream", VideoSubmission: &model.VideoSubmission{}}}
+	require.NoError(t, db.Create(&historicalPoll).Error)
+	runner := localVideoSubmissionRunner{afterID: historicalPoll.ID}
+	queued := model.Task{TaskID: model.GenerateTaskID(), ChannelId: channel.Id, Platform: "new-local-video", Status: model.TaskStatusQueued, SubmissionStage: "pending", PrivateData: model.TaskPrivateData{VideoSubmission: &model.VideoSubmission{}}}
+	require.NoError(t, db.Create(&queued).Error)
+	count, err := runVideoSubmissionPass(t.Context(), runner.afterID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+	require.NoError(t, db.First(&historical, historical.ID).Error)
+	assert.Equal(t, "pending", historical.SubmissionStage)
+	assert.Empty(t, historical.SubmissionOwner)
+	require.NoError(t, db.First(&queued, queued.ID).Error)
+	assert.EqualValues(t, model.TaskStatusFailure, queued.Status)
+	assert.Contains(t, queued.FailReason, "submission data is unavailable")
+	synchronous := model.Task{TaskID: model.GenerateTaskID(), ChannelId: channel.Id, Platform: "synchronous-video", Status: model.TaskStatusSubmitted, PrivateData: model.TaskPrivateData{UpstreamTaskID: "synchronous-upstream"}}
+	require.NoError(t, db.Create(&synchronous).Error)
+	pollable := model.Task{TaskID: model.GenerateTaskID(), ChannelId: channel.Id, Platform: "new-local-poll", Status: model.TaskStatusNotStart, SubmitTime: common.GetTimestamp(), PrivateData: model.TaskPrivateData{UpstreamTaskID: "new-upstream", VideoSubmission: &model.VideoSubmission{}}}
+	require.NoError(t, db.Create(&pollable).Error)
+	constant.TaskQueryLimit = 1
+	previousFactory := service.GetTaskAdaptorFunc
+	t.Cleanup(func() { service.GetTaskAdaptorFunc = previousFactory })
+	var platforms []constant.TaskPlatform
+	service.GetTaskAdaptorFunc = func(platform constant.TaskPlatform) service.TaskPollingAdaptor {
+		platforms = append(platforms, platform)
+		return nil
+	}
+	require.NoError(t, runner.poll(t.Context()))
+	require.NotEmpty(t, platforms)
+	for _, platform := range platforms {
+		assert.EqualValues(t, "new-local-poll", platform)
+	}
+	previousTimeout := constant.TaskTimeoutMinutes
+	constant.TaskTimeoutMinutes = 1
+	t.Cleanup(func() { constant.TaskTimeoutMinutes = previousTimeout })
+	require.NoError(t, db.Model(&pollable).Update("submit_time", common.GetTimestamp()-120).Error)
+	platforms = nil
+	require.NoError(t, runner.poll(t.Context()))
+	assert.Empty(t, platforms, "expired videos must fail locally without another provider query")
+	require.NoError(t, db.First(&pollable, pollable.ID).Error)
+	assert.EqualValues(t, model.TaskStatusFailure, pollable.Status)
+	assert.Equal(t, "failed_final", pollable.SubmissionStage)
+	assert.Contains(t, pollable.FailReason, "任务超时")
+	require.NoError(t, db.First(&historicalPoll, historicalPoll.ID).Error)
+	assert.EqualValues(t, model.TaskStatusSubmitted, historicalPoll.Status)
+	t.Setenv("LOCAL_VIDEO_SUBMISSION_AFTER_ID", fmt.Sprint(runner.afterID))
+	previousMaster, previousUpdate := common.IsMasterNode, constant.UpdateTask
+	t.Cleanup(func() { common.IsMasterNode, constant.UpdateTask = previousMaster, previousUpdate })
+	common.IsMasterNode, constant.UpdateTask = true, false
+	require.ErrorContains(t, StartLocalVideoSubmissionRunner(), "NODE_TYPE=slave and UPDATE_TASK=false")
+	common.IsMasterNode, constant.UpdateTask = false, true
+	require.ErrorContains(t, StartLocalVideoSubmissionRunner(), "NODE_TYPE=slave and UPDATE_TASK=false")
 }
 
 func TestMobileCloudVideoUploadBeforeSubmit(t *testing.T) {

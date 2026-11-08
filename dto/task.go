@@ -44,6 +44,7 @@ type TaskDto struct {
 	BillingMode          string `json:"billing_mode,omitempty"`
 	Action               string `json:"action"`
 	Status               string `json:"status"`
+	SubmissionStage      string `json:"submission_stage,omitempty"`
 	FailReason           string `json:"fail_reason"`
 	ResultURL            string `json:"result_url,omitempty"` // 任务结果 URL（视频地址等）
 	LegacyVideoAvailable bool   `json:"legacy_video_available,omitempty"`

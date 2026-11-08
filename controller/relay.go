@@ -493,6 +493,7 @@ func RelayTask(c *gin.Context) {
 // come from c.Request.Context: native task endpoints use the client context,
 // while the Responses bridge supplies an independently bounded context.
 func executeTaskSubmission(c *gin.Context, relayInfo *relaycommon.RelayInfo) (*taskSubmissionOutcome, *taskdto.TaskError) {
+	c.Set("defer_video_submission", true)
 	return executeTaskSubmissionWith(c, relayInfo, relay.RelayTaskSubmit)
 }
 
@@ -948,6 +949,39 @@ func executeTaskSubmissionWith(
 		task.PrivateData.PluginState = result.PluginState
 	}
 	task.Action = relayInfo.Action
+	if result.Deferred {
+		request, encodeErr := common.Marshal(requestBody)
+		if encodeErr != nil || len(request) > model.TaskEventPayloadLimit {
+			return nil, service.TaskErrorWrapperLocal(errors.New("video request exceeds asynchronous submission storage limit"), "task_request_invalid", http.StatusBadRequest)
+		}
+		selected := relayInfo.LockedChannel
+		if selected == nil {
+			selected, _ = model.GetChannelById(relayInfo.ChannelId, true)
+		}
+		channel, ok := selected.(*model.Channel)
+		if !ok || channel == nil {
+			return nil, service.TaskErrorWrapperLocal(errors.New("video channel is unavailable"), "invalid_channel_id", http.StatusBadRequest)
+		}
+		task.Status = model.TaskStatusQueued
+		task.SubmissionStage = "pending"
+		task.PrivateData.VideoSubmission = &model.VideoSubmission{
+			Request: request, ChannelFingerprint: service.VideoSubmissionChannelFingerprint(channel),
+			IntegrationFingerprint: result.IntegrationFingerprint,
+			UsePrice:               relayInfo.PriceData.UsePrice, FreeModel: relayInfo.PriceData.FreeModel,
+			TargetQuota: result.Quota,
+		}
+		for _, origin := range relayInfo.OriginTasks {
+			task.PrivateData.VideoSubmission.OriginTaskIDs = append(task.PrivateData.VideoSubmission.OriginTaskIDs, origin.TaskID)
+		}
+		if task.PrivateData.Execution != nil && task.PrivateData.Execution.TaskPlugin != nil {
+			task.PrivateData.VideoSubmission.PluginVersion = task.PrivateData.Execution.TaskPlugin.Version
+		}
+		if value, exists := c.Get(pluginruntime.ContextKeyPinnedPlugin); exists {
+			if pinned, ok := value.(pluginruntime.PinnedPlugin); ok && pinned.Plugin != nil {
+				task.PrivateData.VideoSubmission.PluginHash = pinned.Plugin.SourceHash
+			}
+		}
+	}
 	if immediate := result.Immediate; immediate != nil {
 		task.Status = model.TaskStatus(immediate.Status)
 		task.Progress = immediate.Progress
@@ -991,7 +1025,16 @@ func executeTaskSubmissionWith(
 		}
 	}
 	diagnostics.insertStart(task)
-	if insertErr := task.InsertWithContext(c.Request.Context(), insertOmits...); insertErr != nil {
+	var insertErr error
+	if result.Deferred {
+		insertErr = model.ReserveVideoSubmission(c.Request.Context(), task, common.NormalizeBillingPreference(relayInfo.UserSetting.BillingPreference), relayInfo.PriceData.FreeModel, relayInfo.IsPlayground)
+	} else {
+		insertErr = task.InsertWithContext(c.Request.Context(), insertOmits...)
+	}
+	if insertErr != nil {
+		if errors.Is(insertErr, model.ErrVideoSubmissionQuota) {
+			return nil, service.TaskErrorWrapperLocal(insertErr, string(types.ErrorCodeInsufficientUserQuota), http.StatusForbidden)
+		}
 		common.SysError("insert task error: " + insertErr.Error())
 		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to persist task"), "task_insert_failed", http.StatusInternalServerError)
 		diagnostics.failed("insert", "database_error", taskErr, false)
@@ -1026,18 +1069,32 @@ func executeTaskSubmissionWith(
 	diagnostics.durable(task)
 	diagnostics.settleStart(task, result.Quota)
 
-	if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
-		common.SysError("settle task billing error: " + settleErr.Error())
-		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to settle task billing"), "task_billing_settlement_failed", http.StatusInternalServerError)
-		diagnostics.failed("settle", "billing_error", taskErr, true)
-		return nil, taskErr
+	if !result.Deferred {
+		if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
+			common.SysError("settle task billing error: " + settleErr.Error())
+			taskErr = service.TaskErrorWrapperLocal(errors.New("failed to settle task billing"), "task_billing_settlement_failed", http.StatusInternalServerError)
+			diagnostics.failed("settle", "billing_error", taskErr, true)
+			return nil, taskErr
+		}
 	}
 	if task.Status != model.TaskStatusFailure {
 		service.MarkRequestPolicySuccess(c, nil)
 	} else {
 		policy.AddEvent(service.PolicyEvent{Decision: service.PolicyDecision{Action: "stop", Reason: "task_failed", Source: "upstream"}})
 	}
-	service.LogTaskConsumption(c, relayInfo, task)
+	if result.Deferred {
+		if _, _, err := service.EnqueueSystemTask("video_submission", nil); err != nil {
+			logger.LogWarn(c, "notify video submission worker: "+err.Error())
+		}
+	}
+	if result.Deferred {
+		reservedQuota := relayInfo.PriceData.Quota
+		relayInfo.PriceData.Quota = task.Quota
+		service.LogTaskConsumption(c, relayInfo, task)
+		relayInfo.PriceData.Quota = reservedQuota
+	} else {
+		service.LogTaskConsumption(c, relayInfo, task)
+	}
 	diagnostics.complete(task, result.Quota)
 
 	return &taskSubmissionOutcome{Result: result, Task: task, RelayInfo: relayInfo}, nil

@@ -6,11 +6,20 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import i18next from 'i18next'
 import { Toaster } from 'sonner'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import en from '@/i18n/locales/en.json'
+import fr from '@/i18n/locales/fr.json'
+import ja from '@/i18n/locales/ja.json'
+import ru from '@/i18n/locales/ru.json'
+import viLocale from '@/i18n/locales/vi.json'
+import zhTW from '@/i18n/locales/zh-TW.json'
+import zh from '@/i18n/locales/zh.json'
 import { api } from '@/lib/api'
 
 import { MaterialCapabilities } from '../capabilities'
@@ -94,6 +103,290 @@ afterEach(() => {
 })
 
 describe('TopenRouter configuration', () => {
+  it('executes a manual query with saved configuration and preserves an unsaved token', async () => {
+    vi.mocked(api.get).mockResolvedValue({
+      data: { success: true, data: savedConfig },
+    })
+    const post = vi.spyOn(api, 'post').mockResolvedValue({
+      data: {
+        success: true,
+        data: {
+          provider: 'topenrouter',
+          channel_id: 42,
+          channel_name: savedConfig.channel_name,
+          operation: 'list_groups',
+          success: true,
+          elapsed_ms: 1250,
+          total: 1234,
+        },
+      },
+    })
+    const user = userEvent.setup()
+    await openSettings(user)
+    await user.type(await screen.findByLabelText('Token'), 'unsaved-token')
+    await user.click(screen.getByRole('button', { name: 'Execute' }))
+    expect(await screen.findByText('Material API test succeeded')).toBeVisible()
+    expect(screen.getByText('Elapsed: 1,250 ms')).toBeVisible()
+    expect(screen.getByText('Total: 1,234')).toBeVisible()
+    expect(post).toHaveBeenCalledExactlyOnceWith(
+      '/api/material/topenrouter/test',
+      { operation: 'list_groups', parameters: { pageNo: 1, pageSize: 1 } },
+      { skipAuthRefresh: true }
+    )
+    expect(api.put).not.toHaveBeenCalled()
+    expect(screen.getByLabelText('Token')).toHaveValue('unsaved-token')
+  })
+
+  it('clears a saved-credential test after replacing only the token even when saved metadata is identical', async () => {
+    vi.mocked(api.get).mockResolvedValue({
+      data: { success: true, data: { ...savedConfig } },
+    })
+    vi.mocked(api.put).mockResolvedValueOnce({
+      data: { success: true, data: { ...savedConfig } },
+    })
+    const post = vi.spyOn(api, 'post').mockResolvedValue({
+      data: {
+        success: true,
+        data: {
+          provider: 'topenrouter',
+          channel_id: savedConfig.channel_id,
+          channel_name: savedConfig.channel_name,
+          operation: 'list_groups',
+          success: true,
+          elapsed_ms: 4,
+        },
+      },
+    })
+    const user = userEvent.setup()
+    const client = await openSettings(user)
+    await user.type(await screen.findByLabelText('Token'), 'replacement-token')
+    await user.click(screen.getByRole('button', { name: 'Execute' }))
+    expect(await screen.findByText('Material API test succeeded')).toBeVisible()
+    expect(screen.getByLabelText('Token')).toHaveValue('replacement-token')
+    const savedMetadata = client.getQueryData(configKey)
+
+    await user.click(screen.getByRole('button', { name: 'Save configuration' }))
+    await waitFor(() => expect(screen.getByLabelText('Token')).toHaveValue(''))
+    expect(api.put).toHaveBeenCalledExactlyOnceWith(configPath, {
+      enabled: savedConfig.enabled,
+      channel_id: savedConfig.channel_id,
+      endpoint: savedConfig.endpoint,
+      token: 'replacement-token',
+    })
+    expect(client.getQueryData(configKey)).toBe(savedMetadata)
+    await waitFor(() =>
+      expect(
+        screen.queryByText('Material API test succeeded')
+      ).not.toBeInTheDocument()
+    )
+    expect(screen.queryByText('Elapsed: 4 ms')).not.toBeInTheDocument()
+    expect(post).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['upstream', 'business', 'http', 'network'] as const)(
+    'reports a %s test failure without retrying or retaining Axios details',
+    async (failure) => {
+      vi.mocked(api.get).mockResolvedValue({
+        data: { success: true, data: savedConfig },
+      })
+      const result = {
+        provider: 'topenrouter',
+        channel_id: 42,
+        channel_name: savedConfig.channel_name,
+        operation: 'list_groups',
+        success: false,
+        elapsed_ms: 9,
+        message: 'Saved integration unavailable',
+      }
+      const post = vi.spyOn(api, 'post')
+      if (failure === 'upstream') {
+        post.mockResolvedValue({ data: { success: true, data: result } })
+      } else if (failure === 'business') {
+        post.mockResolvedValue({
+          data: { success: false, message: result.message },
+        })
+      } else {
+        post.mockRejectedValue({
+          isAxiosError: true,
+          message:
+            failure === 'network' ? 'Network unavailable' : 'Request failed',
+          config: { data: 'private-error-payload' },
+          ...(failure === 'http'
+            ? {
+                response: {
+                  status: 503,
+                  data: { success: false, message: result.message },
+                },
+              }
+            : {}),
+        })
+      }
+      const user = userEvent.setup()
+      const client = await openSettings(user)
+      await user.click(await screen.findByRole('button', { name: 'Execute' }))
+      expect(await screen.findByText('Material API test failed')).toBeVisible()
+      const testSection = within(
+        screen.getByRole('region', { name: 'Material API test' })
+      )
+      expect(
+        testSection.getByText(
+          failure === 'network' ? 'Network unavailable' : result.message
+        )
+      ).toBeVisible()
+      expect(
+        screen.queryByText('Material API test succeeded')
+      ).not.toBeInTheDocument()
+      if (failure === 'upstream') {
+        expect(screen.getByText('Elapsed: 9 ms')).toBeVisible()
+      }
+      expect(post).toHaveBeenCalledTimes(1)
+      expect(
+        JSON.stringify(
+          client
+            .getMutationCache()
+            .getAll()
+            .map((mutation) => mutation.state)
+        )
+      ).not.toContain('private-error-payload')
+      post.mockReturnValueOnce(new Promise(() => {}))
+      await user.click(screen.getByRole('button', { name: 'Execute' }))
+      expect(
+        screen.queryByText('Material API test failed')
+      ).not.toBeInTheDocument()
+      expect(screen.getByText('Testing material API...')).toBeVisible()
+      expect(screen.getByLabelText('Token')).toBeDisabled()
+      expect(
+        screen.getByRole('button', { name: 'Save configuration' })
+      ).toBeDisabled()
+    }
+  )
+
+  it.each([{ configured: false }, { available: false }, { channel_id: 0 }])(
+    'disables tests for unusable TopenRouter configuration %j',
+    async (state) => {
+      vi.mocked(api.get).mockResolvedValue({
+        data: { success: true, data: { ...savedConfig, ...state } },
+      })
+      const post = vi
+        .spyOn(api, 'post')
+        .mockRejectedValue(new Error('No network permitted'))
+      const user = userEvent.setup()
+      await openSettings(user)
+      expect(
+        await screen.findByRole('button', { name: 'Execute' })
+      ).toBeDisabled()
+      expect(
+        screen.getByRole('combobox', { name: 'API operation' })
+      ).toBeDisabled()
+      expect(post).not.toHaveBeenCalled()
+    }
+  )
+
+  it('reformats the current result on language changes without another query in all seven locales and invalid-locale fallback', async () => {
+    vi.mocked(api.get).mockResolvedValue({
+      data: { success: true, data: savedConfig },
+    })
+    const post = vi.spyOn(api, 'post').mockResolvedValue({
+      data: {
+        success: true,
+        data: {
+          provider: 'topenrouter',
+          channel_id: 42,
+          channel_name: savedConfig.channel_name,
+          operation: 'list_groups',
+          success: true,
+          elapsed_ms: 1250,
+          total: 12345,
+        },
+      },
+    })
+    const user = userEvent.setup()
+    await openSettings(user)
+    await user.click(await screen.findByRole('button', { name: 'Execute' }))
+    expect(await screen.findByText('Material API test succeeded')).toBeVisible()
+    const section = screen.getByRole('region', { name: 'Material API test' })
+    const locales = [
+      {
+        language: 'zhCN',
+        resource: zh,
+        elapsed: '耗时：1,250 毫秒',
+        total: '总数：12,345',
+      },
+      {
+        language: 'zhTW',
+        resource: zhTW,
+        elapsed: '耗時：1,250 毫秒',
+        total: '總數：12,345',
+      },
+      {
+        language: 'en',
+        resource: en,
+        elapsed: 'Elapsed: 1,250 ms',
+        total: 'Total: 12,345',
+      },
+      {
+        language: 'fr',
+        resource: fr,
+        elapsed: 'Durée : 1\u202f250 ms',
+        total: 'Total : 12\u202f345',
+      },
+      {
+        language: 'ru',
+        resource: ru,
+        elapsed: 'Время: 1\u00a0250 мс',
+        total: 'Всего: 12\u00a0345',
+      },
+      {
+        language: 'ja',
+        resource: ja,
+        elapsed: '所要時間：1,250 ミリ秒',
+        total: '合計：12,345',
+      },
+      {
+        language: 'vi',
+        resource: viLocale,
+        elapsed: 'Thời gian: 1.250 mili giây',
+        total: 'Tổng: 12.345',
+      },
+      {
+        language: 'invalid_locale',
+        resource: en,
+        elapsed: `Elapsed: ${new Intl.NumberFormat().format(1250)} ms`,
+        total: `Total: ${new Intl.NumberFormat().format(12345)}`,
+      },
+    ]
+    try {
+      for (const locale of locales) {
+        i18next.addResourceBundle(
+          locale.language,
+          'translation',
+          locale.resource.translation
+        )
+        await act(async () => {
+          await i18next.changeLanguage(locale.language)
+        })
+        expect(
+          within(section).getByText(locale.elapsed, {
+            normalizer: (text) => text,
+          })
+        ).toBeVisible()
+        expect(
+          within(section).getByText(locale.total, {
+            normalizer: (text) => text,
+          })
+        ).toBeVisible()
+      }
+      expect(post).toHaveBeenCalledTimes(1)
+    } finally {
+      await act(async () => {
+        await i18next.changeLanguage('en')
+      })
+      for (const locale of locales) {
+        i18next.removeResourceBundle(locale.language, 'translation')
+      }
+    }
+  })
+
   it.each([true, false])(
     'displays the loaded enabled=%s state and its video-only scope',
     async (enabled) => {

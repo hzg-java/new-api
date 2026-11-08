@@ -71,6 +71,10 @@ type Task struct {
 	Progress               string                `json:"progress" gorm:"type:varchar(20);index"`
 	Properties             Properties            `json:"properties" gorm:"type:json"`
 	Username               string                `json:"username,omitempty" gorm:"-"`
+	SubmissionStage        string                `json:"submission_stage,omitempty" gorm:"type:varchar(32);index"`
+	SubmissionOwner        string                `json:"-" gorm:"type:varchar(64)"`
+	SubmissionLeaseUntil   int64                 `json:"-"`
+	SubmissionStartedAt    int64                 `json:"-"`
 	// 禁止返回给用户，内部可能包含key等隐私信息
 	PrivateData TaskPrivateData `json:"-" gorm:"column:private_data;type:json"`
 	Data        json.RawMessage `json:"data" gorm:"type:json"`
@@ -131,7 +135,8 @@ type TaskPrivateData struct {
 	// asked for background:true. Every task is durable and survives client
 	// disconnect regardless; this only echoes the protocol-level request
 	// attribute back on retrieval snapshots.
-	ResponsesBackground bool `json:"responses_background,omitempty"`
+	ResponsesBackground bool             `json:"responses_background,omitempty"`
+	VideoSubmission     *VideoSubmission `json:"video_submission,omitempty"`
 	// PluginState is plugin-owned cross-round data. Unlike Task.Data it is
 	// only replaced when a hook explicitly returns state.
 	PluginState json.RawMessage `json:"plugin_state,omitempty"`
@@ -142,6 +147,32 @@ type TaskPrivateData struct {
 	// and every retrieval surface treats the task as not found. The zero
 	// value keeps historical rows retained and retrievable.
 	ResultDiscarded bool `json:"result_discarded,omitempty"`
+}
+
+type VideoSubmission struct {
+	Request                json.RawMessage `json:"request,omitempty"`
+	ChannelFingerprint     string          `json:"channel_fingerprint"`
+	IntegrationFingerprint string          `json:"integration_fingerprint"`
+	PluginVersion          string          `json:"plugin_version"`
+	PluginHash             string          `json:"plugin_hash"`
+	UsePrice               bool            `json:"use_price"`
+	FreeModel              bool            `json:"free_model"`
+	TargetQuota            int             `json:"target_quota"`
+	Accounted              bool            `json:"accounted"`
+	OriginTaskIDs          []string        `json:"origin_task_ids,omitempty"`
+}
+
+func ClaimVideoSubmission(ctx context.Context, id int64, owner string) (bool, error) {
+	now := common.GetTimestamp()
+	result := DB.WithContext(ctx).Model(&Task{}).
+		Where("id = ? AND submission_stage IN ? AND status NOT IN ?", id, []string{"pending", "preparing"}, []TaskStatus{TaskStatusFailure, TaskStatusSuccess}).
+		Where("submission_lease_until < ?", now).
+		Updates(map[string]any{"submission_stage": "preparing", "submission_owner": owner, "submission_lease_until": now + 60, "submission_started_at": gorm.Expr("CASE WHEN submission_started_at IS NULL OR submission_started_at = 0 THEN ? ELSE submission_started_at END", now)})
+	return result.RowsAffected == 1, result.Error
+}
+
+func TaskCanPollUpstream(query *gorm.DB) *gorm.DB {
+	return query.Where("submission_stage IS NULL OR submission_stage = ''")
 }
 
 type TaskExecutionSnapshot struct {
@@ -186,6 +217,9 @@ func (t *Task) ResultRetrievable() bool {
 // GetUpstreamTaskID 获取上游真实 task ID（用于与 provider 通信）
 // 旧数据没有 UpstreamTaskID 时，TaskID 本身就是上游 ID
 func (t *Task) GetUpstreamTaskID() string {
+	if t.SubmissionStage != "" {
+		return ""
+	}
 	if t.PrivateData.UpstreamTaskID != "" {
 		return t.PrivateData.UpstreamTaskID
 	}
@@ -390,7 +424,7 @@ func TaskGetAllTasks(startIdx int, num int, queryParams SyncTaskQueryParams) []*
 
 func GetTimedOutUnfinishedTasks(cutoffUnix int64, limit int) []*Task {
 	var tasks []*Task
-	err := DB.Where("progress != ?", "100%").
+	err := TaskCanPollUpstream(DB).Where("progress != ?", "100%").
 		Where("status NOT IN ?", []string{TaskStatusFailure, TaskStatusSuccess}).
 		Where("submit_time < ?", cutoffUnix).
 		Order("submit_time").
@@ -406,7 +440,7 @@ func GetAllUnFinishSyncTasks(limit int) []*Task {
 	var tasks []*Task
 	var err error
 	// get all tasks progress is not 100%
-	err = DB.Where("progress != ?", "100%").Where("status != ?", TaskStatusFailure).Where("status != ?", TaskStatusSuccess).Limit(limit).Order("id").Find(&tasks).Error
+	err = TaskCanPollUpstream(DB).Where("progress != ?", "100%").Where("status != ?", TaskStatusFailure).Where("status != ?", TaskStatusSuccess).Limit(limit).Order("id").Find(&tasks).Error
 	if err != nil {
 		return nil
 	}
@@ -419,7 +453,7 @@ func GetAllUnFinishSyncTasks(limit int) []*Task {
 // the scheduler skips creating a row entirely.
 func HasUnfinishedSyncTasks() bool {
 	var id int64
-	err := DB.Model(&Task{}).
+	err := TaskCanPollUpstream(DB.Model(&Task{})).
 		Where("progress != ?", "100%").
 		Where("status != ?", TaskStatusFailure).
 		Where("status != ?", TaskStatusSuccess).
@@ -515,7 +549,10 @@ func (Task *Task) Insert() error {
 // (for example "data" when the submit route discards the upstream snapshot)
 // while the in-memory task keeps its values for presentation.
 func (Task *Task) InsertWithContext(ctx context.Context, omitColumns ...string) error {
-	tx := DB.WithContext(ctx)
+	return Task.insertWithDB(DB.WithContext(ctx), omitColumns...)
+}
+
+func (Task *Task) insertWithDB(tx *gorm.DB, omitColumns ...string) error {
 	if len(omitColumns) > 0 {
 		tx = tx.Omit(omitColumns...)
 	}
@@ -722,6 +759,30 @@ func (t *Task) ToOpenAIVideo() *dto.OpenAIVideo {
 	openAIVideo.Model = t.Properties.OriginModelName
 	openAIVideo.SetProgressStr(t.Progress)
 	openAIVideo.CreatedAt = t.CreatedAt
+	if t.PrivateData.VideoSubmission != nil && t.Status == TaskStatusFailure {
+		openAIVideo.Error = &dto.OpenAIVideoError{Code: "video_submission_failed", Message: t.FailReason}
+		var detail struct {
+			Error struct {
+				Code      string `json:"code"`
+				Materials []any  `json:"materials"`
+			} `json:"error"`
+		}
+		if common.Unmarshal(t.Data, &detail) == nil {
+			if detail.Error.Code != "" {
+				openAIVideo.Error.Code = detail.Error.Code
+			}
+			if len(detail.Error.Materials) > 0 {
+				openAIVideo.SetMetadata("material_errors", detail.Error.Materials)
+			}
+		}
+	}
+	if t.SubmissionStage != "" {
+		stage := t.SubmissionStage
+		if stage == "failed_final" {
+			stage = "failed"
+		}
+		openAIVideo.SetMetadata("submission_stage", stage)
+	}
 	if t.Status == TaskStatusSuccess {
 		if t.FinishTime != 0 {
 			openAIVideo.CompletedAt = t.FinishTime

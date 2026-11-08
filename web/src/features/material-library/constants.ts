@@ -5,12 +5,29 @@ import type {
   CapabilityStatus,
   MaterialLibraryType,
   MaterialStatus,
+  MaterialTestOperation,
 } from './types'
 
 // Label values are i18n keys; render them through t().
 export const MATERIAL_LIBRARY_LABEL: Record<MaterialLibraryType, string> = {
   AIGC: 'AIGC',
   LivenessFace: 'LivenessFace',
+}
+
+export const MATERIAL_TEST_OPERATION_LABEL: Record<
+  MaterialTestOperation,
+  string
+> = {
+  list_groups: 'List material groups',
+  create_group: 'Create material group',
+  get_group: 'Get material group details',
+  update_group: 'Update material group',
+  delete_group: 'Delete material group',
+  list_assets: 'List materials',
+  create_asset: 'Upload material',
+  get_asset: 'Get material details',
+  update_asset: 'Rename material',
+  delete_asset: 'Delete material',
 }
 
 export const MATERIAL_STATUS_LABEL: Record<MaterialStatus, string> = {

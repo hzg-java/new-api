@@ -2,6 +2,8 @@ package jsplugin
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"maps"
@@ -196,8 +198,9 @@ type UsageFieldSchema struct {
 }
 
 type LoadedPlugin struct {
-	Meta   Meta
-	Engine *Engine
+	Meta       Meta
+	Engine     *Engine
+	SourceHash string
 }
 
 // RegistrySnapshot is a read-only copy of the metadata currently stored in
@@ -505,7 +508,8 @@ func CompilePlugin(source string, options Options) (*LoadedPlugin, error) {
 			return nil, fmt.Errorf("plugin %s export %q is no longer supported", meta.Key, removed)
 		}
 	}
-	return &LoadedPlugin{Meta: meta, Engine: engine}, nil
+	digest := sha256.Sum256([]byte(source))
+	return &LoadedPlugin{Meta: meta, Engine: engine, SourceHash: hex.EncodeToString(digest[:])}, nil
 }
 
 func (r *Registry) Get(platform string) (*LoadedPlugin, bool) {

@@ -86,6 +86,239 @@ afterEach(() => {
 })
 
 describe('Mobile Cloud configuration', () => {
+  it('tests saved credentials without saving drafts and blocks duplicate tests or saves while pending', async () => {
+    vi.mocked(api.get).mockResolvedValue({
+      data: { success: true, data: { ...savedConfig, enabled: false } },
+    })
+    const result = {
+      provider: 'mobile_cloud',
+      channel_id: 42,
+      channel_name: savedConfig.channel_name,
+      operation: 'list_groups',
+      success: true,
+      elapsed_ms: 12,
+      total: 0,
+      message: 'Read-only query completed',
+    }
+    let finishTest!: (value: {
+      data: { success: boolean; data: typeof result }
+    }) => void
+    const post = vi.spyOn(api, 'post').mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishTest = resolve
+      })
+    )
+    const user = userEvent.setup()
+    renderSettings()
+    await user.type(await screen.findByLabelText('Access key (AK)'), 'draft-ak')
+    await user.type(screen.getByLabelText('Secret key (SK)'), 'draft-sk')
+    const groups = screen.getByRole('button', { name: 'Execute' })
+    expect(
+      screen.getByText(
+        'Tests use the saved configuration. Unsaved changes are not included.'
+      )
+    ).toBeVisible()
+    groups.focus()
+    await user.keyboard('{Enter}')
+    expect(groups).toBeDisabled()
+    expect(
+      screen.getByRole('combobox', { name: 'API operation' })
+    ).toBeDisabled()
+    expect(screen.getByLabelText('pageNo')).toBeDisabled()
+    expect(screen.getByLabelText('pageSize')).toBeDisabled()
+    const save = screen.getByRole('button', { name: 'Save configuration' })
+    expect(save).toBeDisabled()
+    expect(screen.getByLabelText('Access key (AK)')).toBeDisabled()
+    const form = save.closest('form')
+    if (!form) throw new Error('Configuration must expose a submit form')
+    fireEvent.submit(form)
+    fireEvent.click(groups)
+    expect(post).toHaveBeenCalledExactlyOnceWith(
+      '/api/material/mobile-cloud/test',
+      {
+        operation: 'list_groups',
+        parameters: { pageNo: 1, pageSize: 1, groupType: 'AIGC' },
+      },
+      { skipAuthRefresh: true }
+    )
+    expect(api.put).not.toHaveBeenCalled()
+    await act(async () => finishTest({ data: { success: true, data: result } }))
+    expect(await screen.findByText('Material API test succeeded')).toBeVisible()
+    expect(screen.getByText('Elapsed: 12 ms')).toBeVisible()
+    expect(screen.getByText('Total: 0')).toBeVisible()
+    expect(screen.getByText('Read-only query completed')).toBeVisible()
+    expect(screen.getByLabelText('Access key (AK)')).toHaveValue('draft-ak')
+    expect(screen.getByLabelText('Secret key (SK)')).toHaveValue('draft-sk')
+    await user.type(screen.getByLabelText('Pool-Id'), '-edited')
+    expect(
+      screen.queryByText('Material API test succeeded')
+    ).not.toBeInTheDocument()
+  })
+
+  it.each([
+    { configured: false },
+    { available: false },
+    { encryption_ready: false },
+    { channel_id: 0 },
+  ])(
+    'disables manual execution for unusable saved configuration %j',
+    async (state) => {
+      vi.mocked(api.get).mockResolvedValue({
+        data: { success: true, data: { ...savedConfig, ...state } },
+      })
+      const post = vi
+        .spyOn(api, 'post')
+        .mockRejectedValue(new Error('No network permitted'))
+      renderSettings()
+      expect(
+        await screen.findByRole('button', { name: 'Execute' })
+      ).toBeDisabled()
+      expect(
+        screen.getByRole('combobox', { name: 'API operation' })
+      ).toBeDisabled()
+      expect(post).not.toHaveBeenCalled()
+    }
+  )
+
+  it('clears a saved-credential test after replacing only the SK even when saved metadata is identical', async () => {
+    vi.mocked(api.get).mockResolvedValue({
+      data: { success: true, data: { ...savedConfig } },
+    })
+    vi.mocked(api.put).mockResolvedValueOnce({
+      data: { success: true, data: { ...savedConfig } },
+    })
+    const post = vi.spyOn(api, 'post').mockResolvedValue({
+      data: {
+        success: true,
+        data: {
+          provider: 'mobile_cloud',
+          channel_id: savedConfig.channel_id,
+          channel_name: savedConfig.channel_name,
+          operation: 'list_groups',
+          success: true,
+          elapsed_ms: 4,
+        },
+      },
+    })
+    const user = userEvent.setup()
+    const client = renderSettings()
+    await user.type(
+      await screen.findByLabelText('Secret key (SK)'),
+      'replacement-sk'
+    )
+    await user.click(screen.getByRole('button', { name: 'Execute' }))
+    expect(await screen.findByText('Material API test succeeded')).toBeVisible()
+    expect(screen.getByLabelText('Secret key (SK)')).toHaveValue(
+      'replacement-sk'
+    )
+    const savedMetadata = client.getQueryData(configKey)
+
+    await user.click(screen.getByRole('button', { name: 'Save configuration' }))
+    await waitFor(() =>
+      expect(screen.getByLabelText('Secret key (SK)')).toHaveValue('')
+    )
+    expect(api.put).toHaveBeenCalledExactlyOnceWith(configPath, {
+      enabled: savedConfig.enabled,
+      channel_id: savedConfig.channel_id,
+      endpoint: savedConfig.endpoint,
+      pool_id: savedConfig.pool_id,
+      access_key: '',
+      secret_key: 'replacement-sk',
+    })
+    expect(client.getQueryData(configKey)).toBe(savedMetadata)
+    await waitFor(() =>
+      expect(
+        screen.queryByText('Material API test succeeded')
+      ).not.toBeInTheDocument()
+    )
+    expect(screen.queryByText('Elapsed: 4 ms')).not.toBeInTheDocument()
+    expect(post).toHaveBeenCalledTimes(1)
+  })
+
+  it('disables tests during saving and clears a prior test when saved metadata changes', async () => {
+    vi.mocked(api.get).mockResolvedValue({
+      data: { success: true, data: savedConfig },
+    })
+    vi.spyOn(api, 'post').mockResolvedValue({
+      data: {
+        success: true,
+        data: {
+          provider: 'mobile_cloud',
+          channel_id: 42,
+          channel_name: savedConfig.channel_name,
+          operation: 'list_groups',
+          success: true,
+          elapsed_ms: 4,
+        },
+      },
+    })
+    let finishSave!: (value: {
+      data: { success: boolean; data: typeof savedConfig }
+    }) => void
+    vi.mocked(api.put).mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishSave = resolve
+      })
+    )
+    const user = userEvent.setup()
+    const client = renderSettings()
+    await user.click(await screen.findByRole('button', { name: 'Execute' }))
+    expect(await screen.findByText('Material API test succeeded')).toBeVisible()
+    expect(screen.queryByText(/^Total:/)).not.toBeInTheDocument()
+    act(() => client.setQueryData(configKey, { ...savedConfig, channel_id: 7 }))
+    await waitFor(() =>
+      expect(
+        screen.queryByText('Material API test succeeded')
+      ).not.toBeInTheDocument()
+    )
+    await user.click(screen.getByRole('button', { name: 'Save configuration' }))
+    await waitFor(() => expect(api.put).toHaveBeenCalledTimes(1))
+    expect(screen.getByRole('button', { name: 'Execute' })).toBeDisabled()
+    await act(async () =>
+      finishSave({ data: { success: true, data: savedConfig } })
+    )
+  })
+
+  it('keeps pending tests locked and discards a result after saved configuration changes', async () => {
+    vi.mocked(api.get).mockResolvedValue({
+      data: { success: true, data: savedConfig },
+    })
+    const result = {
+      provider: 'mobile_cloud',
+      channel_id: 42,
+      channel_name: savedConfig.channel_name,
+      operation: 'list_groups',
+      success: true,
+      elapsed_ms: 5,
+    }
+    let finishTest!: (value: {
+      data: { success: boolean; data: typeof result }
+    }) => void
+    vi.spyOn(api, 'post').mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishTest = resolve
+      })
+    )
+    const user = userEvent.setup()
+    const client = renderSettings()
+    await user.click(await screen.findByRole('button', { name: 'Execute' }))
+    act(() => client.setQueryData(configKey, { ...savedConfig, channel_id: 7 }))
+    await waitFor(() =>
+      expect(screen.getByLabelText('Channel ID')).toHaveValue(7)
+    )
+    expect(screen.getByRole('button', { name: 'Execute' })).toBeDisabled()
+    expect(
+      screen.getByRole('button', { name: 'Save configuration' })
+    ).toBeDisabled()
+    await act(async () => finishTest({ data: { success: true, data: result } }))
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Execute' })).toBeEnabled()
+    )
+    expect(
+      screen.queryByText('Material API test succeeded')
+    ).not.toBeInTheDocument()
+  })
+
   it.each([true, false])(
     'displays the loaded enabled=%s state and its video-only scope',
     async (enabled) => {

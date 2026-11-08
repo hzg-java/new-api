@@ -19,6 +19,7 @@ import {
   retryMaterial,
   saveMobileCloudConfig,
   saveTopenRouterConfig,
+  testMaterialIntegration,
   updateMaterialGroup,
 } from '../api'
 import { mobileCloudConfigSchema } from '../lib/mobile-cloud-config-schema'
@@ -82,6 +83,68 @@ it.each([
       { method: 'get', url: path, disableDuplicate: true },
       { method: 'put', url: path, data: JSON.stringify(payload) },
     ])
+  }
+)
+
+it.each([
+  { provider: 'mobile_cloud', route: 'mobile-cloud' },
+  { provider: 'topenrouter', route: 'topenrouter' },
+] as const)(
+  'posts manual parameters and confirmation to the saved $provider integration without replay',
+  async ({ provider, route }) => {
+    const result = {
+      provider,
+      channel_id: 42,
+      channel_name: 'Saved channel',
+      operation: 'list_groups',
+      success: true,
+      elapsed_ms: 12,
+      total: 0,
+    }
+    const adapter = vi.fn<AxiosAdapter>(async (config) => ({
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      config,
+      data: { success: true, data: result },
+    }))
+    api.defaults.adapter = adapter
+    const requests = [
+      { operation: 'list_groups', parameters: { pageNo: 1, pageSize: 1 } },
+      {
+        operation: 'create_asset',
+        parameters: {
+          assetUrl: 'https://example.test/a.png',
+          assetType: 'Image',
+        },
+      },
+      {
+        operation: 'delete_asset',
+        parameters: { assetId: 'asset-1' },
+        confirmed: true,
+      },
+    ] as const
+    for (const request of requests) {
+      expect(await testMaterialIntegration(provider, request)).toEqual({
+        success: true,
+        data: result,
+      })
+    }
+    expect(
+      adapter.mock.calls.map(([config]) => ({
+        method: config.method,
+        url: config.url,
+        data: config.data,
+        skipAuthRefresh: config.skipAuthRefresh,
+      }))
+    ).toEqual(
+      requests.map((request) => ({
+        method: 'post',
+        url: `/api/material/${route}/test`,
+        data: JSON.stringify(request),
+        skipAuthRefresh: true,
+      }))
+    )
   }
 )
 

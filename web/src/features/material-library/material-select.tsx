@@ -14,6 +14,7 @@ type MaterialSelectProps = {
   value: string
   onChange: (value: string) => void
   options: { value: string; label: string }[]
+  disabled?: boolean
 }
 
 export function MaterialSelect(props: MaterialSelectProps) {
@@ -24,6 +25,7 @@ export function MaterialSelect(props: MaterialSelectProps) {
       <Select
         items={props.options}
         value={props.value}
+        disabled={props.disabled}
         onValueChange={(value) => {
           if (value !== null) props.onChange(value)
         }}

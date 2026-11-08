@@ -240,6 +240,17 @@ func (a *TaskAdaptor) BuildRequestHeader(_ *gin.Context, req *http.Request, _ *r
 	return nil
 }
 
+func (a *TaskAdaptor) ValidateDeferredMaterialRequest(c *gin.Context, info *relaycommon.RelayInfo) error {
+	descriptor, err := a.buildSubmit(c, info)
+	if err != nil {
+		return err
+	}
+	if descriptor.BodyType == "multipart" {
+		return errors.New("configured material channels require public image URLs, not uploaded files")
+	}
+	return service.ValidateVideoMaterialBody(descriptor.Body)
+}
+
 func (a *TaskAdaptor) PrepareMaterialRequest(c *gin.Context, info *relaycommon.RelayInfo) (func(), *dto.TaskError) {
 	switch constant.NormalizeTaskAction(info.Action) {
 	case constant.TaskActionImageToVideo, constant.TaskActionTextToVideo, constant.TaskActionFirstTailToVideo, constant.TaskActionReferenceToVideo:
@@ -922,6 +933,9 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
 	})
 	if !claimed {
 		return nil, fmt.Errorf("plugin does not claim openai_video")
+	}
+	if task.PrivateData.VideoSubmission != nil && task.SubmissionStage != "" {
+		return common.Marshal(task.ToOpenAIVideo())
 	}
 	view, err := service.BuildTaskPluginView(task)
 	if err != nil {

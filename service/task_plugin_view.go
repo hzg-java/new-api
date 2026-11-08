@@ -23,6 +23,10 @@ func BuildTaskPluginView(task *model.Task) (dto.TaskView, error) {
 		UpdatedAt:  task.UpdatedAt,
 		FinishedAt: task.FinishTime,
 	}
+	if task.PrivateData.VideoSubmission != nil && (task.SubmissionStage == "pending" || task.SubmissionStage == "preparing" || task.SubmissionStage == "submitting") {
+		view.Data = map[string]any{"id": task.TaskID, "status": "queued", "submission_stage": task.SubmissionStage}
+		return view, nil
+	}
 	if len(task.Data) > 0 {
 		if err := common.Unmarshal(task.Data, &view.Data); err != nil {
 			return dto.TaskView{}, err

@@ -10,6 +10,9 @@ import type {
   MaterialGroupResponse,
   MaterialListResponse,
   MaterialResponse,
+  MaterialIntegrationProvider,
+  MaterialTestRequest,
+  MaterialTestResponse,
   MobileCloudConfigResponse,
   TopenRouterConfigResponse,
 } from './types'
@@ -189,5 +192,16 @@ export async function saveTopenRouterConfig(
   input: TopenRouterConfigFormValues
 ): Promise<TopenRouterConfigResponse> {
   const res = await api.put('/api/material/topenrouter/config', input)
+  return res.data
+}
+
+export async function testMaterialIntegration(
+  provider: MaterialIntegrationProvider,
+  request: MaterialTestRequest
+): Promise<MaterialTestResponse> {
+  const route = provider === 'mobile_cloud' ? 'mobile-cloud' : 'topenrouter'
+  const res = await api.post(`/api/material/${route}/test`, request, {
+    skipAuthRefresh: true,
+  })
   return res.data
 }
