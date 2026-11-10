@@ -573,6 +573,7 @@ type ClaudeUsage struct {
 	ClaudeCacheCreation1hTokens int                  `json:"claude_cache_creation_1_h_tokens"`
 	ServerToolUse               *ClaudeServerToolUse `json:"server_tool_use,omitempty"`
 	BillingUsage                *BillingUsage        `json:"billing_usage,omitempty"`
+	Billing                     *float64             `json:"billing,omitempty"`
 }
 
 type ClaudeCacheCreationUsage struct {

@@ -357,6 +357,9 @@ func TestUpdateBatchTasksSettlesTieredUsageForTerminalStates(t *testing.T) {
 			require.NoError(t, model.DB.First(&persisted, task.ID).Error)
 			assert.Equal(t, testCase.status, persisted.Status)
 			assert.Equal(t, testCase.actualQuota, persisted.Quota)
+			require.NotNil(t, persisted.PrivateData.SettledQuota)
+			assert.Equal(t, testCase.actualQuota, *persisted.PrivateData.SettledQuota)
+			assert.Equal(t, BillingAmountCNY(testCase.actualQuota), TaskBillingAmountCNY(&persisted))
 			var persistedData map[string]any
 			require.NoError(t, common.Unmarshal(persisted.Data, &persistedData))
 			assert.Equal(t, "must-be-preserved", persistedData["provider_payload"])
@@ -462,6 +465,44 @@ func TestUpdateBatchTasksRefundsFailedTaskWithoutUsageSettlement(t *testing.T) {
 	log := getLastLog(t)
 	require.NotNil(t, log)
 	assert.Equal(t, model.LogTypeRefund, log.Type)
+}
+
+func TestTerminalTaskBillingFundingFailureRemainsHandled(t *testing.T) {
+	for _, path := range []string{"adaptor", "tokens"} {
+		t.Run(path, func(t *testing.T) {
+			truncate(t)
+			seedUser(t, 65, 10000)
+			seedToken(t, 65, 65, "failed-task-handled", 8000)
+			seedChannel(t, 65)
+			seedChargedAccounting(t, 65, 65, 65, 3000, 1)
+			task := makeTask(65, 65, 3000, 65, BillingSourceWallet, 0)
+			task.Status = model.TaskStatusFailure
+			task.PrivateData.BillingContext.ModelRatio = 1
+			require.NoError(t, model.DB.Create(task).Error)
+			// Only reject extra charges: an accidental fallback refund would succeed.
+			require.NoError(t, model.DB.Exec(`CREATE TRIGGER fail_extra_charge BEFORE UPDATE ON users WHEN NEW.quota < OLD.quota BEGIN SELECT RAISE(ABORT, 'charge failed'); END`).Error)
+			t.Cleanup(func() { require.NoError(t, model.DB.Exec("DROP TRIGGER IF EXISTS fail_extra_charge").Error) })
+			adaptor := &mockAdaptor{adjustReturn: 5000}
+			result := &relaycommon.TaskInfo{Status: model.TaskStatusFailure}
+			if path == "tokens" {
+				adaptor.adjustReturn = 0
+				result.TotalTokens = 5000
+			}
+			finalizeTerminalTask(t.Context(), adaptor, task, result)
+			var stored model.Task
+			require.NoError(t, model.DB.First(&stored, task.ID).Error)
+			assert.Equal(t, 10000, getUserQuota(t, 65))
+			assert.Equal(t, 8000, getTokenRemainQuota(t, 65))
+			assert.Equal(t, 3000, getTokenUsedQuota(t, 65))
+			used, requests := getUserUsageAccounting(t, 65)
+			assert.Equal(t, 3000, used)
+			assert.Equal(t, 1, requests)
+			assert.EqualValues(t, 3000, getChannelUsedQuota(t, 65))
+			assert.Nil(t, stored.PrivateData.SettledQuota)
+			assert.Equal(t, 3000, stored.Quota)
+			assert.Zero(t, countLogs(t))
+		})
+	}
 }
 
 func TestUpdateVideoTasksCanSkipPollingSleepPerChannel(t *testing.T) {

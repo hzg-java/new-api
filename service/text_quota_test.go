@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"net/http/httptest"
@@ -28,6 +29,154 @@ import (
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
+
+func TestBillingAmountCNY(t *testing.T) {
+	oldQuotaPerUnit, oldExchangeRate := common.QuotaPerUnit, operation_setting.USDExchangeRate
+	t.Cleanup(func() {
+		common.QuotaPerUnit, operation_setting.USDExchangeRate = oldQuotaPerUnit, oldExchangeRate
+	})
+
+	for _, tc := range []struct {
+		name                       string
+		quota                      int
+		quotaPerUnit, exchangeRate float64
+		want                       *float64
+	}{
+		{name: "confirmed zero", quotaPerUnit: 500_000, exchangeRate: 7.25, want: common.GetPointer(0.0)},
+		{name: "whole unit", quota: 500_000, quotaPerUnit: 500_000, exchangeRate: 7.25, want: common.GetPointer(7.25)},
+		{name: "no extra rounding", quota: 1, quotaPerUnit: 8, exchangeRate: 3, want: common.GetPointer(0.375)},
+		{name: "negative quota", quota: -1, quotaPerUnit: 500_000, exchangeRate: 7.25},
+		{name: "zero quota unit", quota: 1, exchangeRate: 7.25},
+		{name: "negative quota unit", quota: 1, quotaPerUnit: -1, exchangeRate: 7.25},
+		{name: "nan quota unit", quota: 1, quotaPerUnit: math.NaN(), exchangeRate: 7.25},
+		{name: "infinite quota unit", quota: 1, quotaPerUnit: math.Inf(1), exchangeRate: 7.25},
+		{name: "zero exchange rate", quota: 1, quotaPerUnit: 500_000},
+		{name: "negative exchange rate", quota: 1, quotaPerUnit: 500_000, exchangeRate: -1},
+		{name: "nan exchange rate", quota: 1, quotaPerUnit: 500_000, exchangeRate: math.NaN()},
+		{name: "infinite exchange rate", quota: 1, quotaPerUnit: 500_000, exchangeRate: math.Inf(1)},
+		{name: "division overflow", quota: 1, quotaPerUnit: math.SmallestNonzeroFloat64, exchangeRate: 1},
+		{name: "multiplication overflow", quota: 2, quotaPerUnit: 1, exchangeRate: math.MaxFloat64},
+		{name: "zero still requires valid settings", quotaPerUnit: 500_000, exchangeRate: math.NaN()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			common.QuotaPerUnit, operation_setting.USDExchangeRate = tc.quotaPerUnit, tc.exchangeRate
+			amount := BillingAmountCNY(tc.quota)
+			if tc.want == nil {
+				assert.Nil(t, amount)
+				return
+			}
+			require.NotNil(t, amount)
+			assert.Equal(t, *tc.want, *amount)
+		})
+	}
+}
+
+func TestSettleBillingRecordsConfirmedQuota(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	for _, withSession := range []bool{false, true} {
+		for _, quota := range []int{0, 125} {
+			t.Run(fmt.Sprintf("session=%t/quota=%d", withSession, quota), func(t *testing.T) {
+				info := &relaycommon.RelayInfo{FinalPreConsumedQuota: quota, UserQuota: math.MaxInt}
+				if withSession {
+					info.Billing = &BillingSession{relayInfo: info, preConsumedQuota: quota}
+				}
+				require.Nil(t, info.SettledQuota)
+				require.NoError(t, SettleBilling(ctx, info, quota))
+				require.NotNil(t, info.SettledQuota)
+				assert.Equal(t, quota, *info.SettledQuota)
+				if withSession {
+					require.NoError(t, SettleBilling(ctx, info, quota+1))
+					assert.Equal(t, quota, *info.SettledQuota, "an idempotent settlement must retain the first actual quota")
+				}
+			})
+		}
+	}
+}
+
+func TestSettleBillingDoesNotConfirmQueuedCharges(t *testing.T) {
+	oldBatch := common.BatchUpdateEnabled
+	common.BatchUpdateEnabled = true
+	t.Cleanup(func() { common.BatchUpdateEnabled = oldBatch })
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	for _, quota := range []int{0, 125} {
+		info := &relaycommon.RelayInfo{FinalPreConsumedQuota: quota}
+		info.Billing = &BillingSession{relayInfo: info, preConsumedQuota: quota}
+		require.NoError(t, SettleBilling(ctx, info, quota))
+		if quota == 0 {
+			require.NotNil(t, info.SettledQuota)
+			assert.Zero(t, *info.SettledQuota)
+		} else {
+			assert.Nil(t, info.SettledQuota, "batch acceptance is not a durable charge confirmation")
+		}
+	}
+}
+
+func TestSettleBillingRecordsQuotaAfterAdjustment(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	for _, withSession := range []bool{false, true} {
+		t.Run(fmt.Sprintf("session=%t", withSession), func(t *testing.T) {
+			truncate(t)
+			const userID = 703
+			seedUser(t, userID, 1_000)
+			info := &relaycommon.RelayInfo{
+				UserId: userID, IsPlayground: true, FinalPreConsumedQuota: 100, UserQuota: math.MaxInt,
+			}
+			if withSession {
+				info.Billing = &BillingSession{relayInfo: info, preConsumedQuota: 100, funding: &WalletFunding{userId: userID}}
+			}
+
+			require.NoError(t, SettleBilling(ctx, info, 125))
+			require.NotNil(t, info.SettledQuota)
+			assert.Equal(t, 125, *info.SettledQuota)
+			if withSession {
+				require.NoError(t, SettleBilling(ctx, info, 250))
+				assert.Equal(t, 125, *info.SettledQuota)
+			}
+			var user model.User
+			require.NoError(t, model.DB.First(&user, userID).Error)
+			assert.Equal(t, 975, user.Quota, "only the existing settlement delta is charged")
+		})
+	}
+}
+
+func TestSettleBillingPartialFailureCannotBeConfirmedByRetry(t *testing.T) {
+	truncate(t)
+	const userID = 704
+	seedUser(t, userID, 1000)
+	failure := errors.New("token adjustment failed")
+	require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register("test:reject-billing-token", func(tx *gorm.DB) {
+		if tx.Statement.Table == model.DB.NamingStrategy.TableName("tokens") {
+			tx.AddError(failure)
+		}
+	}))
+	t.Cleanup(func() { require.NoError(t, model.DB.Callback().Update().Remove("test:reject-billing-token")) })
+	info := &relaycommon.RelayInfo{UserId: userID, TokenId: 999, TokenKey: "unused"}
+	info.Billing = &BillingSession{relayInfo: info, funding: &WalletFunding{userId: userID}}
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	for range 2 {
+		require.ErrorIs(t, SettleBilling(ctx, info, 125), failure)
+		assert.Nil(t, info.SettledQuota)
+	}
+	var user model.User
+	require.NoError(t, model.DB.First(&user, userID).Error)
+	assert.Equal(t, 875, user.Quota)
+}
+
+func TestSettleBillingClearsQuotaOnFailure(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	for _, withSession := range []bool{false, true} {
+		t.Run(fmt.Sprintf("session=%t", withSession), func(t *testing.T) {
+			info := &relaycommon.RelayInfo{
+				BillingSource: BillingSourceSubscription, SettledQuota: common.GetPointer(42),
+			}
+			if withSession {
+				info.Billing = &BillingSession{relayInfo: info, funding: &SubscriptionFunding{}}
+			}
+			require.Error(t, SettleBilling(ctx, info, 100))
+			assert.Nil(t, info.SettledQuota, "a failed settlement must not expose a confirmed amount")
+		})
+	}
+}
 
 // The configured DSNs must point at isolated test databases. Each dialect runs
 // the real reservation, settlement and log paths with the same billing cases.

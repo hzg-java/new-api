@@ -1999,6 +1999,36 @@ func TestDeferredVideoSubmissionReportsMaterialFailure(t *testing.T) {
 	assert.Equal(t, 1, uploads)
 }
 
+func TestVideoSubmissionSettlementReloadsConfirmedBilling(t *testing.T) {
+	db := setupMaterialTestDB(t, &model.Task{}, &model.User{}, &model.Token{}, &model.Channel{}, &model.Log{})
+	previousLogDB, previousRedis := model.LOG_DB, common.RedisEnabled
+	model.LOG_DB, common.RedisEnabled = db, false
+	t.Cleanup(func() { model.LOG_DB, common.RedisEnabled = previousLogDB, previousRedis })
+	user := model.User{Username: "video-confirmation", Quota: 900, UsedQuota: 100}
+	require.NoError(t, db.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: "video-confirmation", RemainQuota: 900, UsedQuota: 100}
+	require.NoError(t, db.Create(&token).Error)
+	channel := model.Channel{Name: "video-confirmation", UsedQuota: 100}
+	require.NoError(t, db.Create(&channel).Error)
+	task := model.Task{TaskID: "video-confirmation", UserId: user.Id, ChannelId: channel.Id, Quota: 100, Status: model.TaskStatusFailure, SubmissionStage: "failed", SubmissionOwner: "worker", SubmissionLeaseUntil: common.GetTimestamp() + 60, PrivateData: model.TaskPrivateData{TokenId: token.Id, VideoSubmission: &model.VideoSubmission{Accounted: true}}}
+	require.NoError(t, db.Create(&task).Error)
+	latest := task.PrivateData
+	latest.ResponsesBackground = true
+	latest.PluginState = json.RawMessage(`{"round":2}`)
+	require.NoError(t, db.Model(&model.Task{}).Where("id = ?", task.ID).Update("private_data", latest).Error)
+	require.NoError(t, settleVideoSubmission(t.Context(), &task, "worker"))
+	require.NotNil(t, task.PrivateData.SettledQuota)
+	assert.Zero(t, *task.PrivateData.SettledQuota)
+	assert.True(t, task.PrivateData.ResponsesBackground)
+	assert.JSONEq(t, `{"round":2}`, string(task.PrivateData.PluginState))
+	assert.Equal(t, "failed_final", task.SubmissionStage)
+	var stored model.Task
+	require.NoError(t, db.First(&stored, task.ID).Error)
+	require.NotNil(t, stored.PrivateData.SettledQuota)
+	assert.Zero(t, *stored.PrivateData.SettledQuota)
+	assert.JSONEq(t, `{"round":2}`, string(stored.PrivateData.PluginState))
+}
+
 func TestDeferredVideoSubmissionLifecycle(t *testing.T) {
 	db := setupMaterialConcurrentPostgres(t)
 	require.NoError(t, db.AutoMigrate(&model.Task{}, &model.TaskEvent{}, &model.Channel{}, &model.Token{}))

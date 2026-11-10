@@ -245,6 +245,13 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 		if info != nil && billingPrepared {
 			apiErr = RefundFailedRequestBilling(c, info, apiErr)
 		}
+		if state.terminal != nil && info != nil {
+			var amount *float64
+			if apiErr == nil && info.SettledQuota != nil {
+				amount = service.BillingAmountCNY(*info.SettledQuota)
+			}
+			state.terminal.body = service.InjectUsageBilling(state.terminal.body, amount)
+		}
 	}()
 	if modelName == "" {
 		return newResponsesWSInvalidRequestError(errors.New("model is required"))
@@ -705,7 +712,7 @@ func (s *responsesWSSession) writeClient(kind int, message []byte) error {
 	if err := s.client.SetWriteDeadline(time.Now().Add(responsesWSWriteTimeout)); err != nil {
 		return err
 	}
-	return s.client.WriteMessage(kind, message)
+	return s.client.WriteMessage(kind, service.InjectUsageBilling(message, nil))
 }
 
 func (s *responsesWSSession) sendError(eventID, streamID string, apiErr *types.NewAPIError) {

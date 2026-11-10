@@ -1224,7 +1224,48 @@ func renderTaskPluginQuery(
 		time.Since(renderStarted).Milliseconds(),
 	)
 	c.Abort()
-	c.JSON(http.StatusOK, result)
+	if !multiple {
+		c.JSON(http.StatusOK, service.TaskBillingResponse(tasksByID[taskIDs[0]], result))
+		return
+	}
+	// Batch presenters own their envelope. Clean upstream charges before adding
+	// local per-task amounts, so cleaning the envelope cannot erase those amounts.
+	cleaned, err := common.Marshal(service.TaskBillingResponse(nil, result))
+	if err != nil || common.Unmarshal(cleaned, &result) != nil {
+		abortTaskPluginRouteError(c, http.StatusInternalServerError)
+		return
+	}
+	// Attribute a total only to an identifiable public task, never the batch.
+	var items []any
+	if object, ok := result.(map[string]any); ok {
+		items, _ = object["data"].([]any)
+		if items == nil {
+			var task *model.Task
+			if data, ok := object["data"].(map[string]any); ok {
+				id, _ := data["task_id"].(string)
+				task = tasksByID[id]
+			}
+			c.JSON(http.StatusOK, service.TaskBillingResponse(task, result))
+			return
+		}
+		for i, item := range items {
+			object, _ := item.(map[string]any)
+			id, _ := object["task_id"].(string)
+			items[i] = service.TaskBillingResponse(tasksByID[id], item)
+		}
+		c.JSON(http.StatusOK, object)
+		return
+	}
+	if items, ok := result.([]any); ok {
+		for i, item := range items {
+			object, _ := item.(map[string]any)
+			id, _ := object["task_id"].(string)
+			items[i] = service.TaskBillingResponse(tasksByID[id], item)
+		}
+		c.JSON(http.StatusOK, items)
+		return
+	}
+	c.JSON(http.StatusOK, service.TaskBillingResponse(nil, result))
 }
 
 // RespondTaskPluginError gives a pinned plugin a sanitized error DTO and writes

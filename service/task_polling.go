@@ -109,7 +109,7 @@ func sweepTimedOutTasks(ctx context.Context) {
 			continue
 		}
 		timedOutCount++
-		if !isLegacy && task.Quota != 0 {
+		if !isLegacy {
 			RefundTaskQuota(ctx, task, reason)
 		}
 	}
@@ -622,7 +622,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		logger.LogDebug(ctx, "No update needed for task %s", task.TaskID)
 	}
 
-	if shouldFinalizeBilling {
+	if shouldFinalizeBilling && snap.Status != task.Status {
 		finalizeTerminalTask(ctx, adaptor, task, taskResult)
 	}
 
@@ -632,8 +632,8 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 // finalizeTerminalTask 终态统一收尾（状态 CAS 赢家调用，恰好一次）：采样 + 结算 + 失败兜底退款。
 func finalizeTerminalTask(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, taskResult *relaycommon.TaskInfo) {
 	perfmetrics.RecordTaskResult(task, taskResult)
-	billingSettled := settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
-	if task.Status == model.TaskStatusFailure && !billingSettled && task.Quota != 0 {
+	billingHandled := settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
+	if task.Status == model.TaskStatusFailure && !billingHandled && !task.PrivateData.BillingAdjustmentFailed {
 		RefundTaskQuota(ctx, task, task.FailReason)
 	}
 }
@@ -673,11 +673,14 @@ func truncateBase64(s string) string {
 }
 
 // settleTaskBillingOnComplete 任务完成时的统一计费调整。
-// 返回 true 表示用量结算路径已接管最终计费；失败任务仅在返回 false 时补做全额退款。
+// 返回 true 表示计费路径已接管，不表示资金调整成功；确认由 SettledQuota 表达。
 // 优先级：1. tiered snapshot → 2. adaptor 调整 → 3. token 重算。
 //
 // 表达式求值失败会保留预扣额度，因此也视为已接管，避免错误全退。
 func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, taskResult *relaycommon.TaskInfo) bool {
+	if task.Status != model.TaskStatusSuccess && task.Status != model.TaskStatusFailure {
+		return false
+	}
 	if bc := task.PrivateData.BillingContext; bc != nil && bc.TieredSnapshot != nil {
 		// 用量表达式结算只适用于成功任务；失败任务由调用方全额退款。
 		if task.Status == model.TaskStatusFailure {
@@ -686,6 +689,7 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 		result, usageFacts, err := EvaluateTaskCompletionUsage(bc.TieredSnapshot, taskResult.UsageFacts)
 		if err != nil {
 			logger.LogWarn(ctx, fmt.Sprintf("任务 %s 表达式结算失败，保留预扣额度: %v", task.TaskID, err))
+			RecalculateTaskQuota(ctx, task, task.Quota, "表达式失败保留预扣")
 			return true
 		}
 		if result.Clamp != nil {
@@ -699,7 +703,11 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 	// 按次计费的成功任务保持预扣；失败任务由调用方全额退款。
 	if bc := task.PrivateData.BillingContext; bc != nil && bc.PerCallBilling {
 		logger.LogInfo(ctx, fmt.Sprintf("任务 %s 按次计费，跳过差额结算", task.TaskID))
-		return false
+		if task.Status == model.TaskStatusFailure {
+			return false
+		}
+		RecalculateTaskQuota(ctx, task, task.Quota, "按次保留预扣")
+		return true
 	}
 	// 优先让 adaptor 决定最终额度。
 	if actualQuota := adaptor.AdjustBillingOnComplete(task, taskResult); actualQuota > 0 {
@@ -712,9 +720,15 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 		tokens = taskResult.CompletionTokens
 	}
 	if tokens > 0 {
-		return RecalculateTaskQuotaByTokens(ctx, task, tokens)
+		if handled, _ := recalculateTaskQuotaByTokens(ctx, task, tokens); handled {
+			return true
+		}
 	}
-	return false
+	if task.Status == model.TaskStatusFailure {
+		return false
+	}
+	RecalculateTaskQuota(ctx, task, task.Quota, "缺少可重算用量保留预扣")
+	return true
 }
 
 func classifyPollHTTP(statusCode int) string {

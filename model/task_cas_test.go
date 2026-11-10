@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
@@ -13,7 +14,11 @@ import (
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
+	"gorm.io/gorm/schema"
 )
 
 func TestMain(m *testing.M) {
@@ -99,6 +104,224 @@ func insertTask(t *testing.T, task *Task) {
 	task.CreatedAt = time.Now().Unix()
 	task.UpdatedAt = time.Now().Unix()
 	require.NoError(t, DB.Create(task).Error)
+}
+
+func testTaskBillingDatabases(t *testing.T, run func(*testing.T, *gorm.DB)) {
+	t.Helper()
+	for _, engine := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(engine, func(t *testing.T) {
+			var dialect gorm.Dialector
+			switch engine {
+			case "sqlite":
+				dialect = sqlite.Open(":memory:")
+			case "mysql":
+				dsn := os.Getenv("TEST_MYSQL_DSN")
+				if dsn == "" {
+					t.Skip("TEST_MYSQL_DSN is not configured")
+				}
+				dialect = mysql.Open(dsn)
+			case "postgres":
+				dsn := os.Getenv("TEST_POSTGRES_DSN")
+				if dsn == "" {
+					t.Skip("TEST_POSTGRES_DSN is not configured")
+				}
+				dialect = postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true})
+			}
+			db, err := gorm.Open(dialect, &gorm.Config{DisableAutomaticPing: true, Logger: gormlogger.Default.LogMode(gormlogger.Silent), NamingStrategy: schema.NamingStrategy{TablePrefix: fmt.Sprintf("tb%x_", time.Now().UnixNano())}})
+			require.True(t, err == nil, "test database connection failed (details suppressed)")
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			sqlDB.SetMaxOpenConns(1)
+			t.Cleanup(func() { _ = sqlDB.Close() })
+			require.True(t, sqlDB.Ping() == nil, "test database ping failed (details suppressed)")
+			var version string
+			query := "SELECT version()"
+			if engine == "sqlite" {
+				query = "SELECT sqlite_version()"
+			}
+			require.NoError(t, db.Raw(query).Scan(&version).Error)
+			t.Logf("database: %s %s", engine, version)
+			previous, previousType := DB, common.MainDatabaseType()
+			DB = db
+			switch engine {
+			case "sqlite":
+				common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+			case "mysql":
+				common.SetMainDatabaseType(common.DatabaseTypeMySQL)
+			case "postgres":
+				common.SetMainDatabaseType(common.DatabaseTypePostgreSQL)
+			}
+			t.Cleanup(func() { DB = previous; common.SetMainDatabaseType(previousType) })
+			run(t, db)
+		})
+	}
+}
+
+func TestTaskBillingConfirmationDatabase(t *testing.T) {
+	testTaskBillingDatabases(t, func(t *testing.T, db *gorm.DB) {
+		require.NoError(t, db.AutoMigrate(&Task{}))
+		t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable(&Task{})) })
+		task := &Task{TaskID: "billing", Quota: 5000, Status: TaskStatusSuccess, PrivateData: TaskPrivateData{UpstreamTaskID: "upstream", PluginState: json.RawMessage(`{"keep":true}`), BillingContext: &TaskBillingContext{ModelPrice: 1}}}
+		require.NoError(t, db.Create(task).Error)
+		for _, quota := range []int{3000, 0, 0} {
+			require.NoError(t, task.ConfirmSettledQuota(quota))
+			var stored Task
+			require.NoError(t, db.First(&stored, task.ID).Error)
+			require.NotNil(t, stored.PrivateData.SettledQuota)
+			assert.Equal(t, quota, *stored.PrivateData.SettledQuota)
+			assert.Equal(t, quota, stored.Quota)
+			assert.Equal(t, "upstream", stored.PrivateData.UpstreamTaskID)
+			assert.JSONEq(t, `{"keep":true}`, string(stored.PrivateData.PluginState))
+		}
+		for _, confirm := range []bool{false, true} {
+			// Hold a stale billing snapshot while a poller changes private state.
+			var stale, latest Task
+			require.NoError(t, db.First(&stale, task.ID).Error)
+			require.NoError(t, db.First(&latest, task.ID).Error)
+			latest.PrivateData.ResponsesBackground = true
+			latest.PrivateData.BillingContext.ModelPrice = 2
+			latest.PrivateData.PluginState = json.RawMessage(`{"round":2}`)
+			latest.PrivateData.PollFailures = 4
+			latest.PrivateData.ResultURL = "https://example.invalid/new-result"
+			require.NoError(t, db.Model(&Task{}).Where("id = ?", task.ID).Update("private_data", latest.PrivateData).Error)
+			stale.Quota = 125
+			if confirm {
+				require.NoError(t, stale.ConfirmSettledQuota(125))
+			} else {
+				stale.PrivateData.BillingAdjustmentFailed = true
+				require.NoError(t, stale.UpdateQuota())
+			}
+			var stored Task
+			require.NoError(t, db.First(&stored, task.ID).Error)
+			assert.True(t, stored.PrivateData.ResponsesBackground)
+			assert.JSONEq(t, `{"round":2}`, string(stored.PrivateData.PluginState))
+			assert.Equal(t, 4, stored.PrivateData.PollFailures)
+			assert.Equal(t, latest.PrivateData.ResultURL, stored.PrivateData.ResultURL)
+			assert.Equal(t, 2.0, stored.PrivateData.BillingContext.ModelPrice)
+			assert.Equal(t, 125, stored.Quota)
+			assert.Equal(t, !confirm, stored.PrivateData.BillingAdjustmentFailed)
+			// Reset only the non-billing state to make both interleavings stale.
+			stored.PrivateData.ResponsesBackground = false
+			stored.PrivateData.PluginState = json.RawMessage(`{"round":1}`)
+			require.NoError(t, db.Model(&Task{}).Where("id = ?", task.ID).Update("private_data", stored.PrivateData).Error)
+		}
+		zero := TaskPrivateData{SettledQuota: common.GetPointer(0)}
+		value, err := zero.Value()
+		require.NoError(t, err)
+		assert.JSONEq(t, `{"settled_quota":0}`, value.(string))
+		require.NoError(t, zero.Scan(nil))
+		assert.Nil(t, zero.SettledQuota)
+		task.ID = 999999999
+		require.Error(t, task.ConfirmSettledQuota(0))
+		require.Error(t, task.UpdateQuota())
+	})
+}
+
+func TestVideoSubmissionBillingConfirmationDatabase(t *testing.T) {
+	testTaskBillingDatabases(t, func(t *testing.T, db *gorm.DB) {
+		require.NoError(t, db.AutoMigrate(&Task{}, &User{}, &Token{}, &Channel{}, &UserSubscription{}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Migrator().DropTable(&Task{}, &User{}, &Token{}, &Channel{}, &UserSubscription{}))
+		})
+		oldBatch := common.BatchUpdateEnabled
+		common.BatchUpdateEnabled = true // Durable video settlement does not use the batch queue.
+		t.Cleanup(func() { common.BatchUpdateEnabled = oldBatch })
+		for i, tc := range []struct {
+			name         string
+			status       TaskStatus
+			target       int
+			missingToken bool
+			subscription bool
+		}{
+			{"success exact", TaskStatusSuccess, 100, false, false},
+			{"success delta", TaskStatusSuccess, 150, false, false},
+			{"failure refund", TaskStatusFailure, 0, false, false},
+			{"pending exact", TaskStatusSubmitted, 100, false, false},
+			{"pending delta", TaskStatusSubmitted, 150, false, false},
+			{"deleted token refund", TaskStatusFailure, 0, true, false},
+			{"subscription refund", TaskStatusFailure, 0, false, true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				user := User{Username: fmt.Sprintf("video-billing-%d", i), AffCode: fmt.Sprintf("video-billing-%d", i), Quota: 900, UsedQuota: 100, RequestCount: 1}
+				require.NoError(t, db.Create(&user).Error)
+				token := Token{UserId: user.Id, Key: fmt.Sprintf("video-billing-%d", i), RemainQuota: 900, UsedQuota: 100}
+				require.NoError(t, db.Create(&token).Error)
+				channel := Channel{Name: tc.name, UsedQuota: 100}
+				require.NoError(t, db.Create(&channel).Error)
+				task := Task{TaskID: tc.name, UserId: user.Id, ChannelId: channel.Id, Quota: 100, Status: tc.status, SubmissionStage: "settling", SubmissionOwner: "worker", SubmissionLeaseUntil: common.GetTimestamp() + 60, PrivateData: TaskPrivateData{TokenId: token.Id, BillingAdjustmentFailed: true, ResponsesBackground: true, PluginState: json.RawMessage(`{"keep":true}`), VideoSubmission: &VideoSubmission{Accounted: true}}}
+				if tc.missingToken {
+					require.NoError(t, db.Delete(&token).Error)
+				}
+				sub := UserSubscription{UserId: user.Id, AmountTotal: 1000, AmountUsed: 100}
+				if tc.subscription {
+					require.NoError(t, db.Create(&sub).Error)
+					task.PrivateData.BillingSource = "subscription"
+					task.PrivateData.SubscriptionId = sub.Id
+				}
+				require.NoError(t, db.Create(&task).Error)
+				if tc.name == "success delta" {
+					// Fail the final write after wallet/token updates: the transaction
+					// must roll back both ledgers and publish no confirmation.
+					require.NoError(t, db.Callback().Update().Before("gorm:update").Register("fail_video_confirmation", func(tx *gorm.DB) {
+						if _, ok := tx.Statement.Model.(*Task); ok {
+							tx.AddError(fmt.Errorf("forced video confirmation failure"))
+						}
+					}))
+					_, applied, err := AdjustVideoSubmissionQuota(t.Context(), task.ID, "worker", tc.target)
+					require.ErrorContains(t, err, "forced video confirmation failure")
+					assert.False(t, applied)
+					require.NoError(t, db.Callback().Update().Remove("fail_video_confirmation"))
+					var rolledBack Task
+					require.NoError(t, db.First(&rolledBack, task.ID).Error)
+					assert.Nil(t, rolledBack.PrivateData.SettledQuota)
+					assert.Equal(t, 100, rolledBack.Quota)
+					require.NoError(t, db.First(&user, user.Id).Error)
+					require.NoError(t, db.First(&token, token.Id).Error)
+					assert.Equal(t, 900, user.Quota)
+					assert.Equal(t, 900, token.RemainQuota)
+					assert.Equal(t, 100, token.UsedQuota)
+				}
+				previous, applied, err := AdjustVideoSubmissionQuota(t.Context(), task.ID, "wrong-owner", tc.target)
+				require.NoError(t, err)
+				assert.False(t, applied)
+				assert.Equal(t, 100, previous)
+				for range 2 {
+					_, applied, err = AdjustVideoSubmissionQuota(t.Context(), task.ID, "worker", tc.target)
+					require.NoError(t, err)
+					require.True(t, applied)
+				}
+				var stored Task
+				require.NoError(t, db.First(&stored, task.ID).Error)
+				assert.Equal(t, tc.target, stored.Quota)
+				if (tc.status == TaskStatusSuccess || tc.status == TaskStatusFailure) && !tc.missingToken {
+					require.NotNil(t, stored.PrivateData.SettledQuota)
+					assert.Equal(t, tc.target, *stored.PrivateData.SettledQuota)
+					assert.False(t, stored.PrivateData.BillingAdjustmentFailed)
+				} else {
+					assert.Nil(t, stored.PrivateData.SettledQuota)
+				}
+				assert.True(t, stored.PrivateData.ResponsesBackground)
+				assert.JSONEq(t, `{"keep":true}`, string(stored.PrivateData.PluginState))
+				require.NoError(t, db.First(&user, user.Id).Error)
+				wantWallet := 1000 - tc.target
+				if tc.subscription {
+					wantWallet = 900
+					require.NoError(t, db.First(&sub, sub.Id).Error)
+					assert.EqualValues(t, tc.target, sub.AmountUsed)
+				}
+				assert.Equal(t, wantWallet, user.Quota)
+				assert.Equal(t, tc.target, user.UsedQuota)
+				assert.Equal(t, 1, user.RequestCount)
+				require.NoError(t, db.First(&channel, channel.Id).Error)
+				assert.EqualValues(t, tc.target, channel.UsedQuota)
+				if !tc.missingToken {
+					require.NoError(t, db.First(&token, token.Id).Error)
+					assert.Equal(t, 1000-tc.target, token.RemainQuota)
+					assert.Equal(t, tc.target, token.UsedQuota)
+				}
+			})
+		}
+	})
 }
 
 func TestGetTaskForProtocolObservationScopesOwnerAndPlatform(t *testing.T) {

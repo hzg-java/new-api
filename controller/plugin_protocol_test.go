@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -26,6 +28,59 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
+
+func TestTaskVideoRetrievalBillingUsesPersistedConfirmation(t *testing.T) {
+	db, _ := openTaskDialectDatabase(t, &model.Task{}, &model.Channel{})
+	oldDB := model.DB
+	model.DB = db
+	t.Cleanup(func() { model.DB = oldDB })
+	const source = `
+export const meta={apiVersion:1,key:"video-billing-test",name:"Billing",version:"1.0.0",author:{name:"Test"},models:["video-billing-model"],fetchMode:"per_task",protocols:["openai_video"]};
+export const protocols={openai_video:{decodeRequest:function(){return {kind:"submit",model:"video-billing-model"}},render:function(ctx,task){return {usage:{billing:99,cost:7,custom:"keep"},data:{usage:{billing:999,cost:3}},error:task.status === "FAILURE" ? {message:"failed"} : null,vendor:true}}}};
+export function listArtifacts(){return []} export function buildContentRequest(){return {url:"https://example.invalid/video"}}
+export function buildSubmitRequest(){return {}} export function parseSubmitResponse(){return {taskId:"vendor"}} export function buildQueryRequest(){return {}} export function parseTaskResult(){return {status:"SUCCESS"}}
+`
+	_, err := pluginruntime.DefaultRegistry.Register(source, pluginruntime.Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, pluginruntime.DefaultRegistry.Unregister("video-billing-test")) })
+	for _, tc := range []struct {
+		name   string
+		status model.TaskStatus
+		quota  *int
+	}{
+		{"pending", model.TaskStatusInProgress, nil},
+		{"historical success", model.TaskStatusSuccess, nil},
+		{"confirmed", model.TaskStatusSuccess, common.GetPointer(3000)},
+		{"refunded", model.TaskStatusFailure, common.GetPointer(0)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			task := &model.Task{TaskID: model.GenerateTaskID(), UserId: 71, Platform: "video-billing-test", Status: tc.status, Quota: 5000, PrivateData: model.TaskPrivateData{SettledQuota: tc.quota, Key: "secret"}}
+			require.NoError(t, db.Create(task).Error)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Set("id", 71)
+			c.Params = gin.Params{{Key: "task_id", Value: task.TaskID}}
+			c.Request = httptest.NewRequest(http.MethodGet, "/v1/videos/"+task.TaskID, nil)
+			require.Nil(t, relay.RelayTaskFetch(c, relayconstant.RelayModeVideoFetchByID))
+			var output struct {
+				Usage map[string]any `json:"usage"`
+				Data  struct {
+					Usage map[string]any `json:"usage"`
+				} `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &output))
+			assert.Equal(t, map[string]any{"cost": float64(3)}, output.Data.Usage)
+			assert.Equal(t, float64(7), output.Usage["cost"])
+			assert.Equal(t, "keep", output.Usage["custom"])
+			if tc.quota == nil {
+				assert.NotContains(t, output.Usage, "billing")
+			} else {
+				assert.Equal(t, *service.BillingAmountCNY(*tc.quota), output.Usage["billing"])
+			}
+			assert.NotContains(t, recorder.Body.String(), "secret")
+		})
+	}
+}
 
 func TestServeTaskPluginProtocolWaitsForDurableSubmissionBeforeWriting(t *testing.T) {
 	pinned := compilePluginProtocolTestEndpoint(t, "durable-barrier", `
@@ -482,10 +537,11 @@ func TestServeTaskPluginProtocolStreamsPinnedGenerationWithHostFraming(t *testin
 			status = model.TaskStatus(model.TaskStatusSuccess)
 		}
 		return &model.Task{
-			TaskID:   taskID,
-			UserId:   userID,
-			Platform: platform,
-			Status:   status,
+			TaskID:      taskID,
+			UserId:      userID,
+			Platform:    platform,
+			Status:      status,
+			PrivateData: model.TaskPrivateData{SettledQuota: common.GetPointer(3000)},
 		}, true, nil
 	}
 
@@ -509,6 +565,22 @@ func TestServeTaskPluginProtocolStreamsPinnedGenerationWithHostFraming(t *testin
 	assert.Contains(t, recorder.Body.String(), `"sequence_number":7`)
 	assert.Contains(t, recorder.Body.String(), "old-generation")
 	assert.NotContains(t, recorder.Body.String(), "new-generation")
+	assert.Equal(t, 1, strings.Count(recorder.Body.String(), `"billing":`))
+	for _, frame := range strings.Split(recorder.Body.String(), "\n\n") {
+		if !strings.Contains(frame, "event: response.completed\n") {
+			assert.NotContains(t, frame, `"billing":`)
+			continue
+		}
+		_, payload, ok := strings.Cut(frame, "data: ")
+		require.True(t, ok)
+		var event struct {
+			Response struct {
+				Usage map[string]any `json:"usage"`
+			} `json:"response"`
+		}
+		require.NoError(t, common.UnmarshalJsonStr(payload, &event))
+		assert.Equal(t, *service.BillingAmountCNY(3000), event.Response.Usage["billing"])
+	}
 }
 
 func TestServeTaskPluginProtocolStreamMissingRenderEventsUsesFailureEnvelope(t *testing.T) {
@@ -632,6 +704,7 @@ func TestServeTaskPluginProtocolNonStreamUsesFinalHookAndHostEnvelope(t *testing
 					id: "plugin-controlled-id",
 					status: "plugin-controlled-status",
 					metadata: {plugin_field: "kept", task_id: "plugin-controlled-task"},
+					usage: {billing:99,cost:7.5,custom:"kept"},
 					output: [{
 						id: "plugin-controlled-item",
 						type: "message",
@@ -669,6 +742,7 @@ func TestServeTaskPluginProtocolNonStreamUsesFinalHookAndHostEnvelope(t *testing
 			UserId:   71,
 			Status:   model.TaskStatusSuccess,
 		}
+		task.PrivateData.SettledQuota = common.GetPointer(3000)
 		task.SetData(map[string]any{"value": "plugin-semantic-result"})
 		return task, true, nil
 	}
@@ -692,6 +766,13 @@ func TestServeTaskPluginProtocolNonStreamUsesFinalHookAndHostEnvelope(t *testing
 	assert.Equal(t, "content_task_final_0_0", response.Output[0].Content[0].ID)
 	assert.Equal(t, "plugin-semantic-result", response.Output[0].Content[0].Text)
 	assert.Contains(t, recorder.Body.String(), `"custom_field":"kept"`)
+	var fields struct {
+		Usage map[string]any `json:"usage"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &fields))
+	assert.Equal(t, *service.BillingAmountCNY(3000), fields.Usage["billing"])
+	assert.Equal(t, 7.5, fields.Usage["cost"])
+	assert.Equal(t, "kept", fields.Usage["custom"])
 	assert.NotContains(t, recorder.Body.String(), "plugin-controlled-id")
 	assert.NotContains(t, recorder.Body.String(), "client_response_secret")
 }
@@ -844,11 +925,12 @@ func TestServeTaskPluginProtocolNonStreamTaskFailureSkipsFinalHook(t *testing.T)
 	}
 	deps.loadTask = func(context.Context, int, constant.TaskPlatform, string) (*model.Task, bool, error) {
 		task := &model.Task{
-			TaskID:     "task_failed",
-			Platform:   constant.TaskPlatform(pinned.Plugin.Meta.Key),
-			UserId:     71,
-			Status:     model.TaskStatusFailure,
-			FailReason: "upstream credential at https://secret.invalid/",
+			TaskID:      "task_failed",
+			Platform:    constant.TaskPlatform(pinned.Plugin.Meta.Key),
+			UserId:      71,
+			Status:      model.TaskStatusFailure,
+			FailReason:  "upstream credential at https://secret.invalid/",
+			PrivateData: model.TaskPrivateData{SettledQuota: common.GetPointer(0)},
 		}
 		task.SetData(map[string]any{"secret": "database-secret"})
 		return task, true, nil
@@ -864,6 +946,11 @@ func TestServeTaskPluginProtocolNonStreamTaskFailureSkipsFinalHook(t *testing.T)
 	assert.Equal(t, "server_error", response.Error.Code)
 	assert.Equal(t, "The task failed.", response.Error.Message)
 	assert.Empty(t, response.Output)
+	var confirmed struct {
+		Usage map[string]any `json:"usage"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &confirmed))
+	assert.Equal(t, 0.0, confirmed.Usage["billing"])
 	assert.NotContains(t, recorder.Body.String(), "secret")
 	assert.NotContains(t, recorder.Body.String(), "credential")
 	assert.Empty(t, logs)
@@ -986,10 +1073,20 @@ func TestServeTaskPluginProtocolBackgroundNonStreamReturnsPendingWithoutObservat
 	`)
 	c, recorder := newPluginProtocolTestContext(false, false)
 	setProtocolRequestBackground(c, true)
+	db := setupMaterialTestDB(t, &model.Task{})
 	loadCalls := 0
+	var taskID int64
 	deps := pluginProtocolTestDeps()
 	deps.submit = func(_ *gin.Context, info *relaycommon.RelayInfo) (*taskSubmissionOutcome, *dto.TaskError) {
-		return pluginProtocolTestOutcome(info, pinned.Plugin.Meta.Key, "task_background", nil), nil
+		outcome := pluginProtocolTestOutcome(info, pinned.Plugin.Meta.Key, "task_background", nil)
+		require.NoError(t, db.Create(outcome.Task).Error)
+		taskID = outcome.Task.ID
+		// Polling finishes between submission and background-flag persistence.
+		latest := outcome.Task.PrivateData
+		latest.PluginState = json.RawMessage(`{"round":2}`)
+		latest.SettledQuota = common.GetPointer(3000)
+		require.NoError(t, db.Model(&model.Task{}).Where("id = ?", taskID).Update("private_data", latest).Error)
+		return outcome, nil
 	}
 	deps.loadTask = func(context.Context, int, constant.TaskPlatform, string) (*model.Task, bool, error) {
 		loadCalls++
@@ -1016,6 +1113,12 @@ func TestServeTaskPluginProtocolBackgroundNonStreamReturnsPendingWithoutObservat
 	assert.Equal(t, "queued", metadata["task_status"])
 	assert.Equal(t, "/v1/responses/resp_background", metadata["retrieval_path"])
 	assert.NotEqual(t, "text/event-stream", recorder.Header().Get("Content-Type"))
+	var stored model.Task
+	require.NoError(t, db.First(&stored, taskID).Error)
+	assert.True(t, stored.PrivateData.ResponsesBackground)
+	assert.JSONEq(t, `{"round":2}`, string(stored.PrivateData.PluginState))
+	require.NotNil(t, stored.PrivateData.SettledQuota)
+	assert.Equal(t, 3000, *stored.PrivateData.SettledQuota)
 }
 
 func TestServeTaskPluginProtocolBackgroundStreamEntersObservation(t *testing.T) {
@@ -1166,12 +1269,13 @@ func TestRetrieveTaskPluginResponseSuccessRendersFinal(t *testing.T) {
 	`, logsAppender(&logs))
 	c, recorder := newPluginProtocolRetrieveContext("resp_retrieve_success")
 	deps := pluginProtocolRetrieveDeps(pinned, &model.Task{
-		TaskID:     "task_retrieve_success",
-		Platform:   constant.TaskPlatform(pinned.Plugin.Meta.Key),
-		UserId:     71,
-		Status:     model.TaskStatusSuccess,
-		Properties: model.Properties{OriginModelName: "video-model"},
-		CreatedAt:  1_710_000_000,
+		TaskID:      "task_retrieve_success",
+		Platform:    constant.TaskPlatform(pinned.Plugin.Meta.Key),
+		UserId:      71,
+		Status:      model.TaskStatusSuccess,
+		Properties:  model.Properties{OriginModelName: "video-model"},
+		CreatedAt:   1_710_000_000,
+		PrivateData: model.TaskPrivateData{SettledQuota: common.GetPointer(0)},
 	}, true, nil)
 
 	retrieveTaskPluginResponse(c, deps)
@@ -1183,6 +1287,11 @@ func TestRetrieveTaskPluginResponseSuccessRendersFinal(t *testing.T) {
 	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
 	assert.Equal(t, "completed", response.Status)
 	assert.Equal(t, "resp_retrieve_success", response.ID)
+	var fields struct {
+		Usage map[string]any `json:"usage"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &fields))
+	assert.Equal(t, float64(0), fields.Usage["billing"])
 	require.Len(t, response.Output, 1)
 	require.Len(t, response.Output[0].Content, 1)
 	assert.Equal(t, "retrieved-final", response.Output[0].Content[0].Text)
@@ -1688,7 +1797,9 @@ func TestServeTaskPluginImageProtocolRendersImmediateResultAndInlinesBase64(t *t
 				return "image/png", "QUFB", nil
 			}
 			deps.submit = func(_ *gin.Context, info *relaycommon.RelayInfo) (*taskSubmissionOutcome, *dto.TaskError) {
-				return imageProtocolTestOutcome(info, model.TaskStatusSuccess, "https://cdn.example/1.png", "https://cdn.example/2.png"), nil
+				outcome := imageProtocolTestOutcome(info, model.TaskStatusSuccess, "https://cdn.example/1.png", "https://cdn.example/2.png")
+				outcome.Task.PrivateData.SettledQuota = common.GetPointer(3000)
+				return outcome, nil
 			}
 			serveTaskPluginImageProtocol(c, pinned, deps)
 			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
@@ -1696,6 +1807,7 @@ func TestServeTaskPluginImageProtocolRendersImmediateResultAndInlinesBase64(t *t
 			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
 			assert.Equal(t, float64(1_710_000_000), response["created"])
 			assert.Equal(t, "test", response["vendor"], "plugin fields are preserved")
+			assert.Equal(t, *service.BillingAmountCNY(3000), response["usage"].(map[string]any)["billing"])
 			data, ok := response["data"].([]any)
 			require.True(t, ok)
 			require.Len(t, data, 2)

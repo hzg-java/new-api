@@ -167,7 +167,7 @@ func serveTaskPluginImageProtocol(c *gin.Context, pinned pluginruntime.PinnedEnd
 			item["b64_json"] = encoded
 		}
 	}
-	c.JSON(http.StatusOK, response)
+	c.JSON(http.StatusOK, service.TaskBillingResponse(task, response))
 }
 
 // waitTaskPluginImageTask polls an asynchronous image task inside the client

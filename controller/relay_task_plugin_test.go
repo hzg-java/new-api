@@ -72,6 +72,201 @@ func TestChatCompletionResponseWriterOmitsTopLevelModel(t *testing.T) {
 	})
 }
 
+func TestInjectUsageBillingPreservesResponseUsage(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, want string
+	}{
+		{name: "responses completed", body: `{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":12,"cost":0.5,"billing":999}},"vendor":true}`, want: `{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":12,"cost":0.5,"billing":0.25}},"vendor":true}`},
+		{name: "video no usage", body: `{"id":"task_1","status":"completed"}`, want: `{"id":"task_1","status":"completed","usage":{"billing":0.25}}`},
+		{name: "null error", body: `{"id":"resp_1","error":null,"usage":{"billing":999,"input_tokens":12}}`, want: `{"id":"resp_1","error":null,"usage":{"billing":0.25,"input_tokens":12}}`},
+		{name: "error envelope", body: `{"type":"error","error":{"message":"failed"}}`, want: `{"type":"error","error":{"message":"failed"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.JSONEq(t, tc.want, string(service.InjectUsageBilling([]byte(tc.body), common.GetPointer(0.25))))
+		})
+	}
+}
+
+func TestBillingResponseWriterReturnsSettledJSONAmount(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		amount *float64
+		want   string
+	}{
+		{name: "paid", amount: common.GetPointer(0.01234), want: `{"usage":{"total_tokens":1200,"cost":0.5,"billing":0.01234},"vendor":{"keep":true}}`},
+		{name: "free", amount: common.GetPointer(0.0), want: `{"usage":{"total_tokens":1200,"cost":0.5,"billing":0},"vendor":{"keep":true}}`},
+		{name: "unknown", want: `{"usage":{"total_tokens":1200,"cost":0.5},"vendor":{"keep":true}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			writer := service.NewBillingResponseWriter(c.Writer)
+			writer.Header().Set("Content-Type", "application/json")
+			writer.Header().Set("Content-Length", "999")
+			writer.WriteHeader(http.StatusOK)
+			_, err := writer.Write([]byte(`{"usage":{"total_tokens":1200,"cost":0.5,"billing":999},"vendor":{"keep":true}}`))
+			require.NoError(t, err)
+			writer.Flush()
+			assert.Empty(t, recorder.Body.String())
+			require.NoError(t, writer.Finish(tc.amount))
+			assert.JSONEq(t, tc.want, recorder.Body.String())
+			assert.Empty(t, recorder.Result().Header.Get("Content-Length"))
+		})
+	}
+}
+
+func TestBillingResponseWriterSettlesStreamBeforeTerminal(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "chat", body: "data: {\"id\":\"chat_1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: {\"id\":\"chat_1\",\"choices\":[],\"usage\":{\"total_tokens\":12,\"cost\":0.5}}\n\ndata: [DONE]\n\n", want: `"billing":0.01234`},
+		{name: "chat_without_usage", body: "data: {\"id\":\"chat_1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", want: `"billing":0.01234`},
+		{name: "responses", body: "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"total_tokens\":12}}}\n\n", want: `"billing":0.01234`},
+		{name: "claude", body: "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hello\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":12}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n", want: `"billing":0.01234`},
+		{name: "claude with ping", body: "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hello\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":12}}\n\nevent: ping\ndata: {\"type\":\"ping\"}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n", want: `"billing":0.01234`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			writer := service.NewBillingResponseWriter(c.Writer)
+			writer.Header().Set("Content-Type", "text/event-stream")
+			for _, part := range strings.SplitAfter(tc.body, "\n") {
+				_, err := writer.WriteString(part)
+				require.NoError(t, err)
+				writer.Flush()
+			}
+			assert.Contains(t, recorder.Body.String(), "hello")
+			assert.NotContains(t, recorder.Body.String(), "[DONE]")
+			assert.NotContains(t, recorder.Body.String(), "response.completed")
+			assert.NotContains(t, recorder.Body.String(), "message_stop")
+			require.NoError(t, writer.Finish(common.GetPointer(0.01234)))
+			assert.Equal(t, 1, strings.Count(recorder.Body.String(), tc.want))
+			if strings.Contains(tc.body, "[DONE]") {
+				assert.True(t, strings.HasSuffix(recorder.Body.String(), "data: [DONE]\n\n"))
+			}
+		})
+	}
+}
+
+func TestBillingResponseWriterPreservesWriterAndContentContracts(t *testing.T) {
+	t.Run("logical write remains uncommitted", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		writer := service.NewBillingResponseWriter(c.Writer)
+		assert.Same(t, c.Writer, writer.Unwrap())
+		writer.Header().Set("Content-Type", "application/json")
+		_, err := writer.WriteString(`{"error":null,"usage":{"billing":999}}`)
+		require.NoError(t, err)
+		assert.True(t, writer.Written())
+		assert.Equal(t, len(`{"error":null,"usage":{"billing":999}}`), writer.Size())
+		assert.False(t, c.Writer.Written())
+		require.NoError(t, writer.Finish(common.GetPointer(0.25)))
+		assert.JSONEq(t, `{"error":null,"usage":{"billing":0.25}}`, recorder.Body.String())
+	})
+	t.Run("content carrying usage is immediate", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		writer := service.NewBillingResponseWriter(c.Writer)
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, err := writer.WriteString("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}],\"usage\":{\"total_tokens\":3,\"billing\":999}}\n\n")
+		require.NoError(t, err)
+		writer.Flush()
+		assert.Contains(t, recorder.Body.String(), "hello")
+		assert.NotContains(t, recorder.Body.String(), "billing")
+		require.NoError(t, writer.Finish(nil))
+	})
+	t.Run("image payload is immediate with one final usage", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		writer := service.NewBillingResponseWriter(c.Writer)
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, err := writer.WriteString("event: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"b64_json\":\"aW1hZ2U=\",\"usage\":{\"total_tokens\":12,\"cost\":0.5,\"billing\":999}}\n\n")
+		require.NoError(t, err)
+		writer.Flush()
+		assert.Contains(t, recorder.Body.String(), `"b64_json":"aW1hZ2U="`)
+		assert.NotContains(t, recorder.Body.String(), "billing")
+		_, err = writer.WriteString("data: [DONE]\n\n")
+		require.NoError(t, err)
+		require.NoError(t, writer.Finish(common.GetPointer(0.25)))
+		assert.Equal(t, 1, strings.Count(recorder.Body.String(), `"b64_json"`))
+		assert.Contains(t, recorder.Body.String(), "event: image_generation.usage")
+		assert.Contains(t, recorder.Body.String(), `"billing":0.25`)
+		assert.True(t, strings.HasSuffix(recorder.Body.String(), "data: [DONE]\n\n"))
+	})
+	t.Run("image EOF publishes confirmed fee without replaying image", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		writer := service.NewBillingResponseWriter(c.Writer)
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, err := writer.WriteString("event: image_edit.completed\ndata: {\"type\":\"image_edit.completed\",\"b64_json\":\"aW1hZ2U=\"}\n\n")
+		require.NoError(t, err)
+		require.NoError(t, writer.Finish(common.GetPointer(0.25)))
+		assert.Equal(t, 1, strings.Count(recorder.Body.String(), `"b64_json"`))
+		assert.Contains(t, recorder.Body.String(), "event: image_edit.usage")
+		assert.Contains(t, recorder.Body.String(), `"billing":0.25`)
+	})
+	t.Run("HTTP error strips upstream fee", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		writer := service.NewBillingResponseWriter(c.Writer)
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusBadRequest)
+		_, err := writer.WriteString(`{"error":{"message":"failed"},"usage":{"billing":999,"cost":0.3}}`)
+		require.NoError(t, err)
+		require.NoError(t, writer.Finish(common.GetPointer(0.25)))
+		assert.JSONEq(t, `{"error":{"message":"failed"},"usage":{"cost":0.3}}`, recorder.Body.String())
+	})
+	t.Run("abort discards buffered success", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		writer := service.NewBillingResponseWriter(c.Writer)
+		writer.Header().Set("Content-Type", "application/json")
+		_, err := writer.WriteString(`{"usage":{"total_tokens":1}}`)
+		require.NoError(t, err)
+		writer.Abort()
+		require.NoError(t, writer.Finish(common.GetPointer(1.0)))
+		assert.Empty(t, recorder.Body.String())
+		assert.False(t, c.Writer.Written())
+	})
+}
+
+func TestBillingResponseWriterDiscardsUnsentRetryBody(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	writer := service.NewBillingResponseWriter(c.Writer)
+	writer.Header().Set("Content-Type", "application/json")
+	_, err := writer.WriteString(`{"usage":{"billing":999},"attempt":1}`)
+	require.NoError(t, err)
+	writer.Reset()
+	_, err = writer.WriteString(`{"usage":{"cost":0.5},"attempt":2}`)
+	require.NoError(t, err)
+	require.NoError(t, writer.Finish(common.GetPointer(0.25)))
+	assert.JSONEq(t, `{"usage":{"cost":0.5,"billing":0.25},"attempt":2}`, recorder.Body.String())
+}
+
+func TestBillingResponseWriterLeavesBinaryAndErrorsUnchanged(t *testing.T) {
+	for _, contentType := range []string{"audio/mpeg", "application/json"} {
+		t.Run(contentType, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			writer := service.NewBillingResponseWriter(c.Writer)
+			writer.Header().Set("Content-Type", contentType)
+			writer.WriteHeader(http.StatusBadRequest)
+			body := "raw-audio\x00\x01"
+			if contentType == "application/json" {
+				body = `{"error":{"message":"failed"}}`
+			}
+			_, err := writer.WriteString(body)
+			require.NoError(t, err)
+			require.NoError(t, writer.Finish(common.GetPointer(1.0)))
+			assert.Equal(t, body, recorder.Body.String())
+			assert.Equal(t, http.StatusBadRequest, recorder.Code)
+		})
+	}
+}
+
 func TestDoubaoTaskPresentersOmitModel(t *testing.T) {
 	source, err := builtinplugins.Source("doubao")
 	require.NoError(t, err)
@@ -200,6 +395,37 @@ func TestPresentTaskSubmissionUsesHostOpenAIVideoCreateReceipt(t *testing.T) {
 	assert.NotContains(t, recorder.Body.String(), "task_id")
 }
 
+func TestImmediateTaskConfirmationWriteFailureOmitsBillingWithoutResettling(t *testing.T) {
+	events := []string{}
+	db := setupTaskSubmissionDatabase(t, true, &events)
+	oldConsume := common.LogConsumeEnabled
+	common.LogConsumeEnabled = false
+	t.Cleanup(func() { common.LogConsumeEnabled = oldConsume })
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register("test:fail-task-confirmation", func(tx *gorm.DB) {
+		if tx.Statement.Table == db.NamingStrategy.TableName("tasks") {
+			tx.AddError(errors.New("confirmation write failed"))
+		}
+	}))
+	billing := &taskSubmissionTestBilling{events: &events}
+	info := taskSubmissionRelayInfo(billing)
+	c := taskSubmissionTestContext()
+	outcome, taskErr := executeTaskSubmissionWith(c, info, func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+		return &relay.TaskSubmitResult{Platform: "plugin", UpstreamTaskID: "private", Quota: 3000, Immediate: &relaycommon.TaskInfo{Status: model.TaskStatusSuccess}}, nil
+	})
+	require.Nil(t, taskErr)
+	require.NotNil(t, outcome)
+	assert.Equal(t, []string{"reserve", "insert", "settle"}, events)
+	assert.Zero(t, billing.refunds)
+	assert.Nil(t, outcome.Task.PrivateData.SettledQuota)
+	var stored model.Task
+	require.NoError(t, db.First(&stored, outcome.Task.ID).Error)
+	assert.Nil(t, stored.PrivateData.SettledQuota)
+	assert.Equal(t, 3000, stored.Quota)
+	presentTaskSubmission(c, outcome)
+	assert.NotContains(t, c.Writer.Header().Get("Content-Type"), "stream")
+	assert.Equal(t, []string{"reserve", "insert", "settle"}, events)
+}
+
 func TestExecuteTaskSubmissionRefundsWhenInsertFails(t *testing.T) {
 	events := make([]string, 0, 3)
 	database := setupTaskSubmissionDatabase(t, false, &events)
@@ -234,6 +460,7 @@ func TestExecuteTaskSubmissionSettlementFailureStaysDurableAndWritesNothing(t *t
 		return &relay.TaskSubmitResult{
 			UpstreamTaskID: "upstream_private",
 			Platform:       constant.TaskPlatform("plugin"),
+			Immediate:      &relaycommon.TaskInfo{Status: model.TaskStatusSuccess},
 		}, nil
 	})
 
@@ -300,6 +527,7 @@ func TestExecuteTaskSubmissionPersistsPinnedPluginProvenance(t *testing.T) {
 	require.NotNil(t, stored.PrivateData.Execution.TaskPlugin.Author)
 	assert.Equal(t, "Community Author", stored.PrivateData.Execution.TaskPlugin.Author.Name)
 	assert.Equal(t, "upstream-private", stored.PrivateData.UpstreamTaskID)
+	assert.Nil(t, stored.PrivateData.SettledQuota, "asynchronous submission only reserves billing")
 }
 
 // A submit route declaring retainResult: false persists the task row for
@@ -675,6 +903,9 @@ export function buildQueryRequest(){throw new Error("completed submissions must 
 			var stored model.Task
 			require.NoError(t, db.Where("task_id = ?", info.PublicTaskID).First(&stored).Error)
 			assert.Equal(t, want, stored.Quota)
+			require.NotNil(t, stored.PrivateData.SettledQuota)
+			assert.Equal(t, want, *stored.PrivateData.SettledQuota)
+			assert.Equal(t, service.BillingAmountCNY(want), service.TaskBillingAmountCNY(&stored))
 			assert.Equal(t, model.TaskStatus(tc.status), stored.Status)
 			assert.Positive(t, stored.FinishTime)
 			assert.Equal(t, float64(4), info.TieredBillingSnapshot.EstimatedQuotaBeforeGroup/(0.01*common.QuotaPerUnit))

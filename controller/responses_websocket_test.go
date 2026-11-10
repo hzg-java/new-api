@@ -2,10 +2,12 @@ package controller
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -25,6 +27,7 @@ import (
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/alicebob/miniredis/v2"
@@ -412,6 +415,21 @@ func newResponsesWSBillingTest(t *testing.T, expression string, handle func(*web
 		c.Set(common.RequestIdKey, "responses-http-billing")
 		Relay(c, types.RelayFormatOpenAIResponses)
 	})
+	for path, format := range map[string]types.RelayFormat{
+		"/v1/chat/completions":     types.RelayFormatOpenAI,
+		"/v1/embeddings":           types.RelayFormatEmbedding,
+		"/v1/rerank":               types.RelayFormatRerank,
+		"/v1/messages":             types.RelayFormatClaude,
+		"/v1/images/generations":   types.RelayFormatOpenAIImage,
+		"/v1/audio/transcriptions": types.RelayFormatOpenAIAudio,
+		"/v1/audio/translations":   types.RelayFormatOpenAIAudio,
+	} {
+		engine.POST(path, middleware.TokenAuth(), middleware.ModelRequestRateLimit(), middleware.Distribute(), func(c *gin.Context) {
+			defer func() { fixture.httpDone <- struct{}{} }()
+			c.Set(common.RequestIdKey, "format-http-billing")
+			Relay(c, format)
+		})
+	}
 	gateway := httptest.NewServer(engine)
 	fixture.gatewayURL = gateway.URL
 	t.Cleanup(gateway.Close)
@@ -472,8 +490,9 @@ func TestResponsesInterruptedStreamHealth(t *testing.T) {
 					}
 					cancel()
 				} else {
-					_, err = io.Copy(io.Discard, response.Body)
+					body, err := io.ReadAll(response.Body)
 					require.NoError(t, err)
+					assert.NotContains(t, string(body), `"billing"`)
 				}
 				require.NoError(t, response.Body.Close())
 				select {
@@ -552,6 +571,9 @@ func TestResponsesWebSocketReusesConnectionAndSettlesEachRequest(t *testing.T) {
 					return
 				}
 			}
+			if !assert.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","delta":"hello","usage":{"billing":999,"cost":0.3},"response":{"usage":{"billing":999}}}`))) {
+				return
+			}
 			terminal := fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp_%d","status":"completed","model":"ws-billing","output":[],"usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010}}}`, index)
 			if !assert.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(terminal))) {
 				return
@@ -568,15 +590,25 @@ func TestResponsesWebSocketReusesConnectionAndSettlesEachRequest(t *testing.T) {
 		require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
 		_, data, err := client.ReadMessage()
 		require.NoError(t, err)
+		assert.NotContains(t, string(data), "billing")
+		assert.Contains(t, string(data), `"delta":"hello"`)
+		assert.Contains(t, string(data), `"cost":0.3`)
+		_, data, err = client.ReadMessage()
+		require.NoError(t, err)
 		var terminal struct {
 			Type     string `json:"type"`
 			Response struct {
-				ID string `json:"id"`
+				ID    string `json:"id"`
+				Usage struct {
+					Billing *float64 `json:"billing"`
+				} `json:"usage"`
 			} `json:"response"`
 		}
 		require.NoError(t, common.Unmarshal(data, &terminal))
 		require.Equal(t, "response.completed", terminal.Type, "unexpected response: %s", data)
 		assert.Equal(t, fmt.Sprintf("resp_%d", index+1), terminal.Response.ID)
+		require.NotNil(t, terminal.Response.Usage.Billing)
+		assert.Equal(t, *service.BillingAmountCNY((index + 1) * 1000), *terminal.Response.Usage.Billing)
 		observed := <-received
 		assert.Equal(t, "Bearer upstream-first", observed.Authorization)
 		assert.Equal(t, "gpt-4o", observed.Model)
@@ -705,7 +737,7 @@ func TestResponsesWebSocketDialsNativeResponsesChannelTypes(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, response.Body.Close())
 			assert.Equal(t, http.StatusOK, response.StatusCode)
-			assert.Contains(t, string(body), terminal)
+			assert.Contains(t, string(body), string(service.InjectUsageBilling([]byte(terminal), service.BillingAmountCNY(1000))))
 			select {
 			case <-fixture.httpDone:
 			case <-time.After(3 * time.Second):
@@ -766,7 +798,7 @@ func TestResponsesWebSocketCancelErrorDoesNotFinishActiveRequest(t *testing.T) {
 		if !assert.NoError(t, err) || !assert.JSONEq(t, `{"type":"response.cancel","response_id":"wrong"}`, string(cancel)) {
 			return
 		}
-		if !assert.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"response_not_found","message":"No such response"}}`))) {
+		if !assert.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"response_not_found","message":"No such response"},"usage":{"billing":999,"cost":0.3}}`))) {
 			return
 		}
 		<-complete
@@ -791,6 +823,7 @@ func TestResponsesWebSocketCancelErrorDoesNotFinishActiveRequest(t *testing.T) {
 	cancelError := readResponsesWSTestEvent(t, fixture.client)
 	assert.Equal(t, "error", cancelError["type"])
 	assert.Equal(t, float64(http.StatusBadRequest), cancelError["status"])
+	assert.Equal(t, map[string]any{"cost": 0.3}, cancelError["usage"])
 	require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"ws-billing","input":"overlapping","stream_id":"other","event_id":"busy"}`)))
 	conflict := readResponsesWSTestEvent(t, fixture.client)
 	assert.Equal(t, "error", conflict["type"])
@@ -939,13 +972,36 @@ func TestResponsesStreamOutcomesPreserveAccounting(t *testing.T) {
 					require.NoError(t, err)
 					require.NoError(t, response.Body.Close())
 					assert.Equal(t, http.StatusOK, response.StatusCode)
-					assert.Contains(t, string(body), terminal)
+					var expectedEvent map[string]any
+					require.NoError(t, common.Unmarshal([]byte(terminal), &expectedEvent))
+					found := false
+					for line := range strings.SplitSeq(string(body), "\n") {
+						payload, ok := strings.CutPrefix(line, "data:")
+						if !ok || strings.TrimSpace(payload) == "[DONE]" {
+							continue
+						}
+						var event map[string]any
+						require.NoError(t, common.Unmarshal([]byte(strings.TrimSpace(payload)), &event))
+						if event["type"] == expectedEvent["type"] {
+							found = true
+							assert.JSONEq(t, string(service.InjectUsageBilling([]byte(terminal), service.BillingAmountCNY(1000))), strings.TrimSpace(payload))
+							if result, ok := event["response"].(map[string]any); ok {
+								usage, ok := result["usage"].(map[string]any)
+								require.True(t, ok)
+								assert.Equal(t, *service.BillingAmountCNY(1000), usage["billing"])
+							}
+						}
+					}
+					assert.True(t, found, "terminal must be delivered once")
 				} else {
 					require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","stream_id":"planner","model":"ws-billing","input":"hi","max_output_tokens":1}`)))
-					for _, expected := range events {
+					for index, expected := range events {
 						actual, err := common.Marshal(readResponsesWSTestEvent(t, fixture.client))
 						require.NoError(t, err)
-						assert.JSONEq(t, expected, string(actual), "upstream frames must be delivered once and unchanged")
+						if index == len(events)-1 {
+							expected = string(service.InjectUsageBilling([]byte(expected), service.BillingAmountCNY(1000)))
+						}
+						assert.JSONEq(t, expected, string(actual), "provider fields must be preserved alongside local billing")
 					}
 				}
 				quotas := []int{1000}
@@ -993,6 +1049,115 @@ func TestResponsesStreamOutcomesPreserveAccounting(t *testing.T) {
 	}
 }
 
+func TestModelResponsesReturnPlatformBilling(t *testing.T) {
+	for _, tc := range []struct {
+		name, path, request, response string
+		stream                        bool
+		contentType                   string
+		free, noLogs                  bool
+	}{
+		{name: "chat", path: "/v1/chat/completions", request: `{"model":"ws-billing","messages":[{"role":"user","content":"hello"}]}`, response: `{"id":"chat_1","object":"chat.completion","model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":10,"total_tokens":1010,"cost":0.3,"billing":999}}`},
+		{name: "chat stream without requested usage", path: "/v1/chat/completions", stream: true, request: `{"model":"ws-billing","stream":true,"messages":[{"role":"user","content":"hello"}]}`, response: "data: {\"id\":\"chat_1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":10,\"total_tokens\":1010,\"billing\":999}}\n\ndata: [DONE]\n\n"},
+		{name: "embeddings", path: "/v1/embeddings", request: `{"model":"ws-billing","input":"hello"}`, response: `{"object":"list","data":[{"object":"embedding","embedding":[0.1],"index":0}],"usage":{"prompt_tokens":1000,"total_tokens":1000,"vendor_count":7,"billing":999}}`},
+		{name: "embeddings mislabeled json", path: "/v1/embeddings", contentType: "text/plain", request: `{"model":"ws-billing","input":"hello"}`, response: `{"object":"list","data":[{"object":"embedding","embedding":[0.1],"index":0}],"usage":{"prompt_tokens":1000,"total_tokens":1000,"billing":999}}`},
+		{name: "free embeddings", path: "/v1/embeddings", free: true, request: `{"model":"ws-billing","input":"hello"}`, response: `{"object":"list","data":[{"object":"embedding","embedding":[0.1],"index":0}],"usage":{"prompt_tokens":1000,"total_tokens":1000,"billing":999}}`},
+		{name: "embeddings with disabled consume log", path: "/v1/embeddings", noLogs: true, request: `{"model":"ws-billing","input":"hello"}`, response: `{"object":"list","data":[{"object":"embedding","embedding":[0.1],"index":0}],"usage":{"prompt_tokens":1000,"total_tokens":1000,"billing":999}}`},
+		{name: "rerank", path: "/v1/rerank", request: `{"model":"ws-billing","query":"hello","documents":["hello"]}`, response: `{"results":[{"index":0,"relevance_score":1}],"usage":{"total_tokens":1000,"billing":999}}`},
+		{name: "claude converted upstream", path: "/v1/messages", request: `{"model":"ws-billing","max_tokens":20,"messages":[{"role":"user","content":"hello"}]}`, response: `{"id":"chat_1","object":"chat.completion","model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":10,"total_tokens":1010,"billing":999}}`},
+		{name: "image no usage", path: "/v1/images/generations", request: `{"model":"ws-billing","prompt":"hello"}`, response: `{"created":123,"data":[{"b64_json":"aW1hZ2U="}],"vendor":"preserved"}`},
+		{name: "image SSE", path: "/v1/images/generations", stream: true, request: `{"model":"ws-billing","prompt":"hello","stream":true}`, response: "data: {\"type\":\"image_generation.completed\",\"b64_json\":\"aW1hZ2U=\",\"usage\":{\"total_tokens\":12,\"billing\":999}}\n\ndata: [DONE]\n\n"},
+		{name: "image SSE normal EOF", path: "/v1/images/generations", stream: true, request: `{"model":"ws-billing","prompt":"hello","stream":true}`, response: "data: {\"type\":\"image_generation.completed\",\"b64_json\":\"aW1hZ2U=\",\"usage\":{\"total_tokens\":12,\"billing\":999}}\n\n"},
+		{name: "audio transcription json", path: "/v1/audio/transcriptions", response: `{"text":"hello","usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010,"cost":0.3,"billing":999}}`},
+		{name: "audio translation json", path: "/v1/audio/translations", response: `{"text":"hello","usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010,"billing":999}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			expression, quota := `tier("request", fixed(0.002))`, 1000
+			if tc.free {
+				expression, quota = `tier("free", fixed(0))`, 0
+			}
+			fixture := newResponsesWSBillingTest(t, expression, func(*websocket.Conn, *http.Request) {})
+			if tc.noLogs {
+				common.LogConsumeEnabled = false
+			}
+			fixture.httpUpstream = func(w http.ResponseWriter, _ *http.Request) {
+				if tc.stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+				} else {
+					w.Header().Set("Content-Type", "application/json")
+				}
+				if tc.contentType != "" {
+					w.Header().Set("Content-Type", tc.contentType)
+				}
+				_, _ = io.WriteString(w, tc.response)
+			}
+			var requestBody io.Reader = strings.NewReader(tc.request)
+			contentType := "application/json"
+			if strings.HasPrefix(tc.path, "/v1/audio/") {
+				var body bytes.Buffer
+				form := multipart.NewWriter(&body)
+				require.NoError(t, form.WriteField("model", "ws-billing"))
+				require.NoError(t, form.WriteField("response_format", "json"))
+				file, err := form.CreateFormFile("file", "audio.wav")
+				require.NoError(t, err)
+				_, err = file.Write([]byte("fixture audio"))
+				require.NoError(t, err)
+				require.NoError(t, form.Close())
+				requestBody, contentType = &body, form.FormDataContentType()
+			}
+			request, err := http.NewRequest(http.MethodPost, fixture.gatewayURL+tc.path, requestBody)
+			require.NoError(t, err)
+			request.Header.Set("Authorization", "Bearer sk-"+fixture.token.Key)
+			request.Header.Set("Content-Type", contentType)
+			response, err := (&http.Client{Timeout: 3 * time.Second}).Do(request)
+			require.NoError(t, err)
+			body, err := io.ReadAll(response.Body)
+			require.NoError(t, err)
+			require.NoError(t, response.Body.Close())
+			require.Equal(t, http.StatusOK, response.StatusCode, string(body))
+			var result map[string]any
+			if tc.stream {
+				if strings.Contains(tc.response, "[DONE]") {
+					assert.True(t, strings.HasSuffix(string(body), "data: [DONE]\n\n"))
+				}
+				for line := range strings.SplitSeq(string(body), "\n") {
+					payload, ok := strings.CutPrefix(line, "data:")
+					if !ok || strings.TrimSpace(payload) == "[DONE]" {
+						continue
+					}
+					require.NoError(t, common.Unmarshal([]byte(strings.TrimSpace(payload)), &result))
+				}
+			} else {
+				require.NoError(t, common.Unmarshal(body, &result))
+			}
+			usage, ok := result["usage"].(map[string]any)
+			require.True(t, ok, string(body))
+			assert.Equal(t, *service.BillingAmountCNY(quota), usage["billing"])
+			if tc.name == "chat" {
+				assert.Equal(t, 0.3, usage["cost"])
+			}
+			if tc.name == "embeddings" {
+				assert.Equal(t, float64(7), usage["vendor_count"])
+			}
+			select {
+			case <-fixture.httpDone:
+			case <-time.After(3 * time.Second):
+				t.Fatal("HTTP request did not finish")
+			}
+			if tc.noLogs {
+				var count int64
+				require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("type = ?", model.LogTypeConsume).Count(&count).Error)
+				assert.Zero(t, count)
+				require.NoError(t, model.DB.First(fixture.user, fixture.user.Id).Error)
+				require.NoError(t, model.DB.First(fixture.token, fixture.token.Id).Error)
+				assert.Equal(t, 100000-quota, fixture.user.Quota)
+				assert.Equal(t, 3000-quota, fixture.token.RemainQuota)
+			} else {
+				assertResponsesWSAccounting(t, fixture, []int{quota})
+			}
+		})
+	}
+}
+
 func TestResponsesHTTPHealthCountsFinalResult(t *testing.T) {
 	for _, tc := range []struct {
 		name, code            string
@@ -1027,9 +1192,18 @@ func TestResponsesHTTPHealthCountsFinalResult(t *testing.T) {
 			request.Header.Set("Content-Type", "application/json")
 			response, err := http.DefaultClient.Do(request)
 			require.NoError(t, err)
-			_, err = io.Copy(io.Discard, response.Body)
+			body, err := io.ReadAll(response.Body)
 			require.NoError(t, err)
 			require.NoError(t, response.Body.Close())
+			var result map[string]any
+			require.NoError(t, common.Unmarshal(body, &result))
+			if tc.success {
+				usage, ok := result["usage"].(map[string]any)
+				require.True(t, ok)
+				assert.Equal(t, *service.BillingAmountCNY(1000), usage["billing"])
+			} else {
+				assert.NotContains(t, result, "usage")
+			}
 			select {
 			case <-fixture.httpDone:
 			case <-time.After(3 * time.Second):

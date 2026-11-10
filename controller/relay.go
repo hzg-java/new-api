@@ -26,6 +26,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -144,11 +145,39 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		return
 	}
 
+	var billingWriter *service.BillingResponseWriter
+	if relayFormat != types.RelayFormatGemini && relayFormat != types.RelayFormatOpenAIRealtime {
+		originalWriter := c.Writer
+		billingWriter = service.NewBillingResponseWriter(originalWriter)
+		billingWriter.ExpectJSON = relayFormat != types.RelayFormatOpenAIAudio
+		if audio, ok := request.(*dto.AudioRequest); ok && relayInfo.RelayMode != relayconstant.RelayModeAudioSpeech {
+			billingWriter.ExpectJSON = audio.ResponseFormat == "json" || audio.ResponseFormat == "verbose_json"
+		}
+		c.Writer = billingWriter
+		defer func() {
+			var amount *float64
+			if newAPIError == nil && relayInfo.SettledQuota != nil && (relayInfo.StreamStatus == nil || relayInfo.StreamStatus.IsNormalEnd() && !relayInfo.StreamStatus.HasErrors()) {
+				amount = service.BillingAmountCNY(*relayInfo.SettledQuota)
+			}
+			if newAPIError != nil && !originalWriter.Written() {
+				billingWriter.Abort()
+			}
+			if err := billingWriter.Finish(amount); err != nil {
+				logger.LogWarn(c, "write billing response failed: "+err.Error())
+			}
+			c.Writer = originalWriter
+		}()
+	}
+
 	defer func() {
 		recovered := recover()
 		resultErr := newAPIError
 		if recovered != nil {
 			resultErr = types.NewError(fmt.Errorf("relay panic: %v", recovered), types.ErrorCodeBadResponse)
+			newAPIError = resultErr
+			if billingWriter != nil {
+				billingWriter.Abort()
+			}
 		}
 		if relayFormat != types.RelayFormatOpenAIRealtime {
 			perfmetrics.RecordRelayResult(c.Request.Context(), relayInfo, resultErr)
@@ -176,6 +205,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.LastError = nil
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
+		if billingWriter != nil {
+			billingWriter.Reset()
+		}
 		relayInfo.StreamStatus = nil
 		relayInfo.PerformanceBusinessRejection = false
 		relayInfo.PerformanceOutputTokens = 0
@@ -1076,6 +1108,11 @@ func executeTaskSubmissionWith(
 			diagnostics.failed("settle", "billing_error", taskErr, true)
 			return nil, taskErr
 		}
+		if immediateTerminal && relayInfo.SettledQuota != nil {
+			if err := task.ConfirmSettledQuota(*relayInfo.SettledQuota); err != nil {
+				logger.LogError(c, "persist final task billing confirmation failed: "+err.Error())
+			}
+		}
 	}
 	if task.Status != model.TaskStatusFailure {
 		service.MarkRequestPolicySuccess(c, nil)
@@ -1119,7 +1156,7 @@ func presentTaskSubmission(c *gin.Context, outcome *taskSubmissionOutcome) {
 				if valueErr == nil {
 					if body, callErr := pinned.Plugin.Engine.CallPath(c.Request.Context(), "native", []string{pinned.Route.Render}, requestContext.JSValue(), viewValue); callErr == nil {
 						diagnostics.present(outcome.Task, "native_presenter")
-						c.JSON(http.StatusOK, body)
+						c.JSON(http.StatusOK, service.TaskBillingResponse(outcome.Task, body))
 						return
 					} else {
 						logger.LogError(c, "task plugin native submit presenter failed: "+callErr.Error())
@@ -1135,7 +1172,7 @@ func presentTaskSubmission(c *gin.Context, outcome *taskSubmissionOutcome) {
 	if pinnedValue, exists := c.Get(pluginruntime.ContextKeyPinnedEndpoint); exists {
 		if pinned, ok := pinnedValue.(pluginruntime.PinnedEndpoint); ok && pinned.Protocol == "openai_video" && pinned.Operation.Name == "create" {
 			diagnostics.present(outcome.Task, "openai_video_create")
-			c.JSON(http.StatusOK, outcome.Task.ToOpenAIVideo())
+			c.JSON(http.StatusOK, service.TaskBillingResponse(outcome.Task, outcome.Task.ToOpenAIVideo()))
 			return
 		}
 	}
@@ -1144,13 +1181,13 @@ func presentTaskSubmission(c *gin.Context, outcome *taskSubmissionOutcome) {
 		createdAt = outcome.Task.SubmitTime
 	}
 	diagnostics.present(outcome.Task, "host_fallback")
-	c.JSON(http.StatusOK, map[string]any{
+	c.JSON(http.StatusOK, service.TaskBillingResponse(outcome.Task, map[string]any{
 		"id":         outcome.Task.TaskID,
 		"task_id":    outcome.Task.TaskID,
 		"status":     "queued",
 		"model":      outcome.RelayInfo.OriginModelName,
 		"created_at": createdAt,
-	})
+	}))
 }
 
 func respondTaskSubmissionError(c *gin.Context, taskErr *taskdto.TaskError) {

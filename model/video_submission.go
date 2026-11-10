@@ -172,7 +172,7 @@ func AdjustVideoSubmissionQuota(ctx context.Context, taskID int64, owner string,
 	err = DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var task Task
 		if err := lockForUpdate(tx).
-			Select("id", "user_id", "channel_id", "quota", "private_data", "submission_stage", "submission_owner", "submission_lease_until").
+			Select("id", "user_id", "channel_id", "quota", "private_data", "status", "submission_stage", "submission_owner", "submission_lease_until").
 			Where("id = ?", taskID).First(&task).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return nil
@@ -188,7 +188,26 @@ func AdjustVideoSubmissionQuota(ctx context.Context, taskID int64, owner string,
 		if task.Quota < 0 {
 			return errors.New("video submission stored quota is negative")
 		}
+		terminal := task.Status == TaskStatusSuccess || task.Status == TaskStatusFailure
 		if task.Quota == targetQuota {
+			// The reservation itself was transactional, so no second money move
+			// is needed. A deleted token still leaves its accounting uncertain.
+			confirmed := terminal
+			if confirmed && task.PrivateData.TokenId > 0 {
+				var token Token
+				tokenErr := lockForUpdate(tx).Select("id", "user_id").Where("id = ?", task.PrivateData.TokenId).First(&token).Error
+				if tokenErr != nil && !errors.Is(tokenErr, gorm.ErrRecordNotFound) {
+					return tokenErr
+				}
+				confirmed = tokenErr == nil && token.UserId == userID
+			}
+			if confirmed {
+				task.PrivateData.SettledQuota = &targetQuota
+				task.PrivateData.BillingAdjustmentFailed = false
+				if err := tx.Model(&Task{}).Where("id = ?", taskID).Update("private_data", task.PrivateData).Error; err != nil {
+					return err
+				}
+			}
 			applied = true
 			return nil
 		}
@@ -251,6 +270,7 @@ func AdjustVideoSubmissionQuota(ctx context.Context, taskID int64, owner string,
 			return result.Error
 		}
 
+		tokenAdjusted := task.PrivateData.TokenId <= 0
 		if task.PrivateData.TokenId > 0 {
 			var token Token
 			tokenErr := lockForUpdate(tx).
@@ -281,6 +301,7 @@ func AdjustVideoSubmissionQuota(ctx context.Context, taskID int64, owner string,
 				if result.RowsAffected != 1 {
 					return gorm.ErrRecordNotFound
 				}
+				tokenAdjusted = true
 			}
 		}
 
@@ -300,10 +321,19 @@ func AdjustVideoSubmissionQuota(ctx context.Context, taskID int64, owner string,
 			}
 		}
 
+		updates := map[string]any{"quota": targetQuota}
+		if terminal {
+			task.PrivateData.SettledQuota = nil
+			task.PrivateData.BillingAdjustmentFailed = !tokenAdjusted
+			if tokenAdjusted {
+				task.PrivateData.SettledQuota = &targetQuota
+			}
+			updates["private_data"] = task.PrivateData
+		}
 		result = tx.Model(&Task{}).
 			Where("id = ? AND quota = ? AND submission_owner = ? AND submission_stage = ? AND submission_lease_until >= ?",
 				taskID, previousQuota, owner, task.SubmissionStage, common.GetTimestamp()).
-			Update("quota", targetQuota)
+			Updates(updates)
 		if result.Error != nil {
 			return result.Error
 		}

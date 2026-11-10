@@ -1062,6 +1062,75 @@ export function parseTaskResult() { return {status: "SUCCESS"}; }
 	assert.NotContains(t, recorder.Body.String(), "secret")
 }
 
+func TestNativeTaskQueryBillingPreservesPresenterShape(t *testing.T) {
+	for _, tc := range []struct {
+		name, render string
+		multiple     bool
+	}{
+		{"single object", `return {task_id:tasks.task_id,usage:{billing:99,cost:7,custom:"keep"}};`, false},
+		{"array", `return tasks.map(function(task){return {task_id:task.task_id,usage:{billing:99,cost:7,custom:"keep"}};});`, true},
+		{"data array", `return {code:"success",usage:{billing:99},data:tasks.map(function(task){return {task_id:task.task_id,usage:{billing:99,cost:7,custom:"keep"}};})};`, true},
+		{"single task from batch", `return {data:{task_id:tasks[0].task_id},usage:{billing:99,cost:7,custom:"keep"}};`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupTaskPluginRouteDB(t)
+			plugin := compileTaskRoutePlugin(t, `
+export const meta={apiVersion:1,key:"billing-query",name:"Billing",version:"1.0.0",author:{name:"Test"},models:["model"],fetchMode:"per_task",routes:[{method:"GET",path:"/billing/:task_id",type:"query",render:"query"}]};
+export const native={query:function(ctx,tasks){`+tc.render+`}};
+export function buildSubmitRequest(){return {}} export function parseSubmitResponse(){return {taskId:"one"}} export function buildQueryRequest(){return {}} export function parseTaskResult(){return {status:"SUCCESS"}}
+`)
+			for _, task := range []*model.Task{
+				{TaskID: "task_paid", UserId: 7, Platform: "billing-query", Status: model.TaskStatusSuccess, Quota: 5000, PrivateData: model.TaskPrivateData{SettledQuota: common.GetPointer(3000), Key: "private-key"}},
+				{TaskID: "task_pending", UserId: 7, Platform: "billing-query", Status: model.TaskStatusInProgress, Quota: 5000},
+				{TaskID: "task_free", UserId: 7, Platform: "billing-query", Status: model.TaskStatusFailure, PrivateData: model.TaskPrivateData{SettledQuota: common.GetPointer(0)}},
+			} {
+				insertTaskPluginRouteTask(t, task)
+			}
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, "/billing/task_paid", nil)
+			common.SetContextKey(c, constant.ContextKeyUserId, 7)
+			ids := []string{"task_paid"}
+			if tc.multiple {
+				ids = []string{"task_paid", "task_pending", "task_free"}
+			}
+			renderTaskPluginQuery(c, jsplugin.PinnedRoute{Plugin: plugin}, jsplugin.RouteRequestContext{}, ids, "query", tc.multiple)
+			require.Equal(t, http.StatusOK, recorder.Code)
+			assert.NotContains(t, recorder.Body.String(), "private-key")
+			var response any
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			var items []any
+			switch body := response.(type) {
+			case []any:
+				items = body
+			case map[string]any:
+				if data, ok := body["data"].([]any); ok {
+					items = data
+					assert.NotContains(t, body["usage"], "billing")
+				} else {
+					items = []any{body}
+				}
+			default:
+				t.Fatal("presenter shape changed")
+			}
+			for i, item := range items {
+				usage := item.(map[string]any)["usage"].(map[string]any)
+				assert.Equal(t, float64(7), usage["cost"])
+				assert.Equal(t, "keep", usage["custom"])
+				if i == 1 {
+					assert.NotContains(t, usage, "billing")
+					continue
+				}
+				quota := 3000
+				if i == 2 {
+					quota = 0
+				}
+				assert.Equal(t, *service.BillingAmountCNY(quota), usage["billing"])
+			}
+		})
+	}
+}
+
 func TestPrepareTaskPluginDynamicDecoderRejectsRendererField(t *testing.T) {
 	plugin := compileTaskRoutePlugin(t, `
 export const meta = {apiVersion:1,key:"dynamic-renderer",name:"Dynamic",version:"1.0.0",author:{name:"Test"},models:["model"],fetchMode:"per_task",routes:[{method:"POST",path:"/vendor/query",type:"dynamic",decode:"decode",render:"show"}]};

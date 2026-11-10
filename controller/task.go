@@ -54,7 +54,7 @@ func GetTask(c *gin.Context) {
 	if task.Status == model.TaskStatusSuccess && taskFailReasonIsLegacyResultURL(task.FailReason) {
 		failReason = ""
 	}
-	c.JSON(http.StatusOK, gin.H{
+	c.JSON(http.StatusOK, service.TaskBillingResponse(task, gin.H{
 		"task_id":     task.TaskID,
 		"platform":    task.Platform,
 		"status":      task.Status,
@@ -62,7 +62,7 @@ func GetTask(c *gin.Context) {
 		"fail_reason": failReason,
 		"created_at":  createdAt,
 		"finished_at": task.FinishTime,
-	})
+	}))
 }
 
 func GetTaskArtifacts(c *gin.Context) {

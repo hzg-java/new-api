@@ -14,6 +14,7 @@ import (
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
@@ -50,10 +51,11 @@ func TestTaskPluginResponsesNonStreamDecodesWithOfficialGoSDK(t *testing.T) {
 	}
 	deps.loadTask = func(context.Context, int, constant.TaskPlatform, string) (*model.Task, bool, error) {
 		return &model.Task{
-			TaskID:   "task_sdk_final",
-			UserId:   71,
-			Platform: constant.TaskPlatform(pinned.Plugin.Meta.Key),
-			Status:   model.TaskStatusSuccess,
+			TaskID:      "task_sdk_final",
+			UserId:      71,
+			Platform:    constant.TaskPlatform(pinned.Plugin.Meta.Key),
+			Status:      model.TaskStatusSuccess,
+			PrivateData: model.TaskPrivateData{SettledQuota: common.GetPointer(1000)},
 		}, true, nil
 	}
 	server := newPluginProtocolSDKTestServer(t, pinned, deps)
@@ -79,6 +81,9 @@ func TestTaskPluginResponsesNonStreamDecodesWithOfficialGoSDK(t *testing.T) {
 	assert.Equal(t, "video-model", response.Model)
 	assert.Equal(t, "official-sdk-final", response.OutputText())
 	assert.Equal(t, "task_sdk_final", response.Metadata["task_id"])
+	var usage map[string]any
+	require.NoError(t, common.Unmarshal([]byte(response.Usage.RawJSON()), &usage))
+	assert.Equal(t, *service.BillingAmountCNY(1000), usage["billing"])
 }
 
 func TestTaskPluginResponsesStreamDecodesWithOfficialGoSDK(t *testing.T) {
@@ -96,10 +101,11 @@ func TestTaskPluginResponsesStreamDecodesWithOfficialGoSDK(t *testing.T) {
 	}
 	deps.loadTask = func(context.Context, int, constant.TaskPlatform, string) (*model.Task, bool, error) {
 		return &model.Task{
-			TaskID:   "task_sdk_stream",
-			UserId:   71,
-			Platform: constant.TaskPlatform(pinned.Plugin.Meta.Key),
-			Status:   model.TaskStatusSuccess,
+			TaskID:      "task_sdk_stream",
+			UserId:      71,
+			Platform:    constant.TaskPlatform(pinned.Plugin.Meta.Key),
+			Status:      model.TaskStatusSuccess,
+			PrivateData: model.TaskPrivateData{SettledQuota: common.GetPointer(1000)},
 		}, true, nil
 	}
 	server := newPluginProtocolSDKTestServer(t, pinned, deps)
@@ -128,6 +134,9 @@ func TestTaskPluginResponsesStreamDecodesWithOfficialGoSDK(t *testing.T) {
 		sequenceNumbers = append(sequenceNumbers, event.SequenceNumber)
 		if event.Type == "response.completed" {
 			completedText = event.Response.OutputText()
+			var usage map[string]any
+			require.NoError(t, common.Unmarshal([]byte(event.Response.Usage.RawJSON()), &usage))
+			assert.Equal(t, *service.BillingAmountCNY(1000), usage["billing"])
 		}
 	}
 

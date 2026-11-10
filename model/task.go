@@ -131,6 +131,9 @@ type TaskPrivateData struct {
 	TokenId        int                 `json:"token_id,omitempty"`        // 令牌 ID，用于令牌额度退款
 	NodeName       string              `json:"node_name,omitempty"`       // 发起任务的节点名，轮询结算阶段据此归属日志而非最后查询节点
 	BillingContext *TaskBillingContext `json:"billing_context,omitempty"` // 计费参数快照（用于轮询阶段重新计算）
+	SettledQuota   *int                `json:"settled_quota,omitempty"`
+	// Partial adjustments require reconciliation, never an automatic retry.
+	BillingAdjustmentFailed bool `json:"billing_adjustment_failed,omitempty"`
 	// ResponsesBackground records that the openai_responses create request
 	// asked for background:true. Every task is durable and survives client
 	// disconnect regardless; this only echoes the protocol-level request
@@ -242,6 +245,7 @@ func GenerateTaskID() string {
 }
 
 func (p *TaskPrivateData) Scan(val any) error {
+	*p = TaskPrivateData{}
 	bytesValue := jsonScanBytes(val)
 	if len(bytesValue) == 0 {
 		return nil
@@ -252,7 +256,7 @@ func (p *TaskPrivateData) Scan(val any) error {
 func (p TaskPrivateData) Value() (driver.Value, error) {
 	if p.Key == "" && p.UpstreamTaskID == "" && p.ResultURL == "" &&
 		p.Execution == nil && p.VideoInfo == nil && p.BillingSource == "" && p.SubscriptionId == 0 &&
-		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil &&
+		p.TokenId == 0 && p.NodeName == "" && p.BillingContext == nil && p.SettledQuota == nil && !p.BillingAdjustmentFailed &&
 		!p.ResponsesBackground && len(p.PluginState) == 0 && p.PollFailures == 0 &&
 		!p.ResultDiscarded {
 		return nil, nil
@@ -622,8 +626,76 @@ func (Task *Task) Update() error {
 	return err
 }
 
+// Only completion facts and tier may replace the persisted pricing snapshot.
+func (p *TaskPrivateData) mergeBillingUsageSnapshot(bc *TaskBillingContext) {
+	if bc == nil || bc.TieredSnapshot == nil || p.BillingContext == nil || p.BillingContext.TieredSnapshot == nil {
+		return
+	}
+	p.BillingContext.TieredSnapshot.UsageFacts = bc.TieredSnapshot.UsageFacts
+	p.BillingContext.TieredSnapshot.EstimatedTier = bc.TieredSnapshot.EstimatedTier
+}
+
 func (t *Task) UpdateQuota() error {
-	return DB.Model(t).Update("quota", t.Quota).Error
+	if t.ID == 0 {
+		return errors.New("task billing requires a persisted task")
+	}
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var stored Task
+		if err := lockForUpdate(tx).Select("id", "private_data").First(&stored, t.ID).Error; err != nil {
+			return err
+		}
+		stored.PrivateData.SettledQuota = t.PrivateData.SettledQuota
+		stored.PrivateData.BillingAdjustmentFailed = t.PrivateData.BillingAdjustmentFailed
+		stored.PrivateData.mergeBillingUsageSnapshot(t.PrivateData.BillingContext)
+		// The locked read proves existence, including a MySQL unchanged-row update.
+		return tx.Model(&Task{}).Where("id = ?", t.ID).Updates(map[string]any{
+			"quota": t.Quota, "private_data": stored.PrivateData,
+		}).Error
+	})
+}
+
+// ConfirmSettledQuota persists the final total, including explicit zero. Only
+// billing's successful completion path may call this; task status is not proof.
+func (t *Task) ConfirmSettledQuota(quota int) error {
+	if t.ID == 0 || quota < 0 {
+		return errors.New("invalid task billing confirmation")
+	}
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var stored Task
+		if err := lockForUpdate(tx).Select("id", "private_data").First(&stored, t.ID).Error; err != nil {
+			return err
+		}
+		stored.PrivateData.SettledQuota = &quota
+		stored.PrivateData.BillingAdjustmentFailed = false
+		stored.PrivateData.mergeBillingUsageSnapshot(t.PrivateData.BillingContext)
+		return tx.Model(&Task{}).Where("id = ?", t.ID).Updates(map[string]any{
+			"quota": quota, "private_data": stored.PrivateData,
+		}).Error
+	})
+	if err != nil {
+		return err
+	}
+	t.Quota = quota
+	t.PrivateData.SettledQuota = &quota
+	t.PrivateData.BillingAdjustmentFailed = false
+	return nil
+}
+
+// MarkResponsesBackground merges the protocol flag without replacing billing or
+// plugin state written since the submission snapshot was loaded.
+func (t *Task) MarkResponsesBackground(ctx context.Context) error {
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var stored Task
+		if err := lockForUpdate(tx).Select("id", "private_data").First(&stored, t.ID).Error; err != nil {
+			return err
+		}
+		stored.PrivateData.ResponsesBackground = true
+		return tx.Model(&Task{}).Where("id = ?", t.ID).Update("private_data", stored.PrivateData).Error
+	})
+	if err == nil {
+		t.PrivateData.ResponsesBackground = true
+	}
+	return err
 }
 
 // UpdateWithStatus performs a conditional UPDATE guarded by fromStatus (CAS).

@@ -580,7 +580,9 @@ func (m *PluginResponsesMachine) FinalResponse(payload any, taskStatus string) (
 		response["incomplete_details"] = nil
 		response["model"] = m.model
 		response["metadata"] = m.finalMetadata(response["metadata"])
-		response["usage"] = zeroPluginResponsesUsage()
+		if usage, ok := response["usage"].(map[string]any); !ok || usage == nil {
+			response["usage"] = zeroPluginResponsesUsage()
+		}
 		delete(response, "sequence_number")
 		m.terminal = true
 		return response, nil

@@ -8,6 +8,47 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestUsageBillingJSONContract(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input string
+		want  *float64
+	}{
+		{name: "unknown", input: `{}`},
+		{name: "null", input: `{"billing":null}`},
+		{name: "confirmed zero", input: `{"billing":0}`, want: new(float64)},
+		{name: "confirmed amount", input: `{"billing":0.123456789}`, want: kitutil.GetPointer(0.123456789)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, format := range []struct {
+				name  string
+				usage any
+			}{
+				{name: "openai", usage: &Usage{Cost: "upstream-cost"}},
+				{name: "claude", usage: &ClaudeUsage{}},
+			} {
+				t.Run(format.name, func(t *testing.T) {
+					require.NoError(t, kitutil.Unmarshal([]byte(tc.input), format.usage))
+					encoded, err := kitutil.Marshal(format.usage)
+					require.NoError(t, err)
+					var fields map[string]any
+					require.NoError(t, kitutil.Unmarshal(encoded, &fields))
+					if tc.want == nil {
+						assert.NotContains(t, fields, "billing")
+					} else {
+						require.Contains(t, fields, "billing")
+						assert.IsType(t, float64(0), fields["billing"])
+						assert.Equal(t, *tc.want, fields["billing"])
+					}
+					if format.name == "openai" {
+						assert.Equal(t, "upstream-cost", fields["cost"])
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestNewGeminiChatBillingUsageRequiresTokenContent(t *testing.T) {
 	require.Nil(t, NewGeminiChatBillingUsage(nil))
 	require.Nil(t, NewGeminiChatBillingUsage(&GeminiUsageMetadata{}))

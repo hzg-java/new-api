@@ -423,7 +423,10 @@ func settleVideoSubmission(ctx context.Context, task *model.Task, owner string) 
 		}
 		model.RecordTaskBillingLog(model.RecordTaskBillingLogParams{UserId: task.UserId, LogType: logType, ChannelId: task.ChannelId, ModelName: task.Properties.OriginModelName, Quota: quota, TokenId: task.PrivateData.TokenId, Group: task.Group, Other: other, NodeName: task.PrivateData.NodeName})
 	}
-	task.Quota = target
+	// The transaction may have merged newer private state.
+	if err := model.DB.WithContext(ctx).First(task, task.ID).Error; err != nil {
+		return err
+	}
 	stage := ""
 	if task.Status == model.TaskStatusFailure {
 		stage = "failed_final"

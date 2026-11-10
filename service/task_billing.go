@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"math"
@@ -127,13 +128,13 @@ func taskAdjustFunding(task *model.Task, delta int) error {
 
 // taskAdjustTokenQuota 调整任务的令牌额度，delta > 0 表示扣费，delta < 0 表示退还。
 // 需要通过 resolveTokenKey 运行时获取 key（不从 PrivateData 中读取）。
-func taskAdjustTokenQuota(ctx context.Context, task *model.Task, delta int) {
+func taskAdjustTokenQuota(ctx context.Context, task *model.Task, delta int) bool {
 	if task.PrivateData.TokenId <= 0 || delta == 0 {
-		return
+		return true
 	}
 	tokenKey := resolveTokenKey(ctx, task.PrivateData.TokenId, task.TaskID)
 	if tokenKey == "" {
-		return
+		return false
 	}
 	var err error
 	if delta > 0 {
@@ -143,6 +144,99 @@ func taskAdjustTokenQuota(ctx context.Context, task *model.Task, delta int) {
 	}
 	if err != nil {
 		logger.LogWarn(ctx, fmt.Sprintf("调整令牌额度失败 (delta=%d, task=%s): %s", delta, task.TaskID, err.Error()))
+	}
+	return err == nil
+}
+
+func TaskBillingAmountCNY(task *model.Task) *float64 {
+	if task == nil || task.PrivateData.BillingAdjustmentFailed || task.PrivateData.SettledQuota == nil ||
+		(task.Status != model.TaskStatusSuccess && task.Status != model.TaskStatusFailure) {
+		return nil
+	}
+	return BillingAmountCNY(*task.PrivateData.SettledQuota)
+}
+
+// Billing belongs to the host envelope, never the plugin's task snapshot.
+func TaskBillingResponse(task *model.Task, response any) any {
+	encoded, err := common.Marshal(response)
+	if err != nil {
+		return response
+	}
+	cleaned, err := stripTaskUsageBilling(encoded)
+	if err != nil {
+		return response
+	}
+	var object map[string]json.RawMessage
+	if common.Unmarshal(cleaned, &object) != nil || object == nil {
+		return json.RawMessage(cleaned)
+	}
+	// This is a task envelope, not an ordinary HTTP error: a terminal failed
+	// task may have a confirmed refund. Never repeat its total on deliverables.
+	if amount := TaskBillingAmountCNY(task); amount != nil {
+		var usage map[string]json.RawMessage
+		_ = common.Unmarshal(object["usage"], &usage)
+		if usage == nil {
+			usage = make(map[string]json.RawMessage)
+		}
+		usage["billing"], err = common.Marshal(*amount)
+		if err != nil {
+			return json.RawMessage(cleaned)
+		}
+		object["usage"], err = common.Marshal(usage)
+		if err != nil {
+			return json.RawMessage(cleaned)
+		}
+		if patched, err := common.Marshal(object); err == nil {
+			return json.RawMessage(patched)
+		}
+	}
+	return json.RawMessage(cleaned)
+}
+
+// stripTaskUsageBilling preserves scalar JSON verbatim (including large numbers)
+// while removing untrusted charges at every object/array nesting level.
+func stripTaskUsageBilling(data json.RawMessage) (json.RawMessage, error) {
+	switch common.GetJsonType(data) {
+	case "object":
+		var object map[string]json.RawMessage
+		if err := common.Unmarshal(data, &object); err != nil {
+			return nil, err
+		}
+		for key, value := range object {
+			if key == "usage" && common.GetJsonType(value) == "object" {
+				var usage map[string]json.RawMessage
+				if err := common.Unmarshal(value, &usage); err != nil {
+					return nil, err
+				}
+				delete(usage, "billing")
+				var err error
+				value, err = common.Marshal(usage)
+				if err != nil {
+					return nil, err
+				}
+			}
+			cleaned, err := stripTaskUsageBilling(value)
+			if err != nil {
+				return nil, err
+			}
+			object[key] = cleaned
+		}
+		return common.Marshal(object)
+	case "array":
+		var items []json.RawMessage
+		if err := common.Unmarshal(data, &items); err != nil {
+			return nil, err
+		}
+		for i := range items {
+			cleaned, err := stripTaskUsageBilling(items[i])
+			if err != nil {
+				return nil, err
+			}
+			items[i] = cleaned
+		}
+		return common.Marshal(items)
+	default:
+		return data, nil
 	}
 }
 
@@ -259,21 +353,41 @@ func taskModelName(task *model.Task) string {
 
 // RefundTaskQuota 统一的任务失败退款逻辑。
 // 当异步任务失败时，退还资金与令牌额度，并回减用户和渠道用量。
-// 返回资金来源是否已成功退还；失败时保留 quota，供显式重试或人工对账。
+// 仅在资金、令牌和回写均成功时确认零费用；部分成功必须人工对账。
 func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool {
+	if task.PrivateData.BillingAdjustmentFailed {
+		return false
+	}
 	quota := task.Quota
 	if quota == 0 {
+		if err := task.ConfirmSettledQuota(0); err != nil {
+			logger.LogError(ctx, fmt.Sprintf("确认任务退款失败 task %s: %s", task.TaskID, err.Error()))
+			return false
+		}
 		return true
 	}
 
+	// Persist the reconciliation guard before moving funds, so a failed final
+	// writeback cannot make a reloaded task refund the same reservation twice.
+	task.PrivateData.SettledQuota = nil
+	task.PrivateData.BillingAdjustmentFailed = true
+	if err := task.UpdateQuota(); err != nil {
+		logger.LogError(ctx, fmt.Sprintf("准备任务退款失败 task %s: %s", task.TaskID, err.Error()))
+		return false
+	}
 	// 1. 退还资金来源（钱包或订阅）
 	if err := taskAdjustFunding(task, -quota); err != nil {
+		task.PrivateData.BillingAdjustmentFailed = false
+		if persistErr := task.UpdateQuota(); persistErr != nil {
+			logger.LogError(ctx, fmt.Sprintf("回写任务退款失败状态 task %s: %s", task.TaskID, persistErr.Error()))
+		}
 		logger.LogWarn(ctx, fmt.Sprintf("退还资金来源失败 task %s: %s", task.TaskID, err.Error()))
 		return false
 	}
 
-	// 2. 退还令牌额度
-	taskAdjustTokenQuota(ctx, task, -quota)
+	// 2. 退还令牌额度。资金已移动后不再自动重试或补做另一轮退款。
+	tokenAdjusted := taskAdjustTokenQuota(ctx, task, -quota)
+	task.PrivateData.BillingAdjustmentFailed = true
 
 	// 3. 回减预扣时累计的用户和渠道用量，请求次数保持不变
 	model.UpdateUserUsedQuota(task.UserId, -quota)
@@ -298,9 +412,17 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool 
 	// 5. 资金退款完成后再清除持久化标记。
 	// 回写失败必须显式告警，避免漏掉潜在的重复退款风险。
 	task.Quota = 0
-	if err := task.UpdateQuota(); err != nil {
-		logger.LogError(ctx, fmt.Sprintf("退款成功但清除 task quota 失败 task %s: %s", task.TaskID, err.Error()))
+	if !tokenAdjusted || common.BatchUpdateEnabled {
+		if err := task.UpdateQuota(); err != nil {
+			logger.LogError(ctx, fmt.Sprintf("退款回写 quota 失败 task %s: %s", task.TaskID, err.Error()))
+		}
+		return false
 	}
+	if err := task.ConfirmSettledQuota(0); err != nil {
+		logger.LogError(ctx, fmt.Sprintf("退款成功但确认 task quota 失败 task %s: %s", task.TaskID, err.Error()))
+		return false
+	}
+	task.PrivateData.BillingAdjustmentFailed = false
 	return true
 }
 
@@ -308,17 +430,30 @@ func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool 
 // actualQuota 是任务完成后的实际应扣额度，与预扣额度 (task.Quota) 做差额结算。
 // reason 用于日志记录（例如 "token重算" 或 "adaptor调整"）。
 // clamps 可选：若计算 actualQuota 时发生额度饱和，将其记入日志 admin_info（仅管理员可见）。
-func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int, reason string, clamps ...*common.QuotaClamp) {
-	if actualQuota < 0 {
-		return
+func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int, reason string, clamps ...*common.QuotaClamp) bool {
+	if actualQuota < 0 || task.PrivateData.BillingAdjustmentFailed {
+		return false
 	}
 	preConsumedQuota := task.Quota
 	quotaDelta := actualQuota - preConsumedQuota
 
 	if quotaDelta == 0 {
+		// A paid reservation may still be queued. Only a genuinely free zero
+		// needs no ledger movement; never change batch behavior for a response.
+		if common.BatchUpdateEnabled && actualQuota != 0 {
+			task.PrivateData.SettledQuota = nil
+			if err := task.UpdateQuota(); err != nil {
+				logger.LogError(ctx, fmt.Sprintf("回写任务用量快照失败 task %s: %s", task.TaskID, err.Error()))
+			}
+			return false
+		}
 		logger.LogInfo(ctx, fmt.Sprintf("任务 %s 预扣费准确（%s，%s）",
 			task.TaskID, logger.LogQuota(actualQuota), reason))
-		return
+		if err := task.ConfirmSettledQuota(actualQuota); err != nil {
+			logger.LogError(ctx, fmt.Sprintf("确认 task quota 失败 task %s: %s", task.TaskID, err.Error()))
+			return false
+		}
+		return true
 	}
 
 	logger.LogInfo(ctx, fmt.Sprintf("任务 %s 差额结算：delta=%s（实际：%s，预扣：%s，%s）",
@@ -329,19 +464,39 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 		reason,
 	))
 
+	// A durable guard keeps partial failures unconfirmed after reload too.
+	task.PrivateData.SettledQuota = nil
+	task.PrivateData.BillingAdjustmentFailed = true
+	if err := task.UpdateQuota(); err != nil {
+		logger.LogError(ctx, fmt.Sprintf("准备任务差额结算失败 task %s: %s", task.TaskID, err.Error()))
+		return false
+	}
 	// 调整资金来源
 	if err := taskAdjustFunding(task, quotaDelta); err != nil {
+		task.PrivateData.BillingAdjustmentFailed = false
+		if persistErr := task.UpdateQuota(); persistErr != nil {
+			logger.LogError(ctx, fmt.Sprintf("回写差额结算失败状态 task %s: %s", task.TaskID, persistErr.Error()))
+		}
 		logger.LogError(ctx, fmt.Sprintf("差额结算资金调整失败 task %s: %s", task.TaskID, err.Error()))
-		return
+		return false
 	}
 
-	// 调整令牌额度
-	taskAdjustTokenQuota(ctx, task, quotaDelta)
-
+	// Keep the applied funding total even if token adjustment or writeback fails.
+	// Neither the caller's failure fallback nor a retry may move these funds twice.
+	tokenAdjusted := taskAdjustTokenQuota(ctx, task, quotaDelta)
+	task.PrivateData.BillingAdjustmentFailed = true
 	task.Quota = actualQuota
-	if err := task.UpdateQuota(); err != nil {
-		logger.LogError(ctx, fmt.Sprintf("差额结算回写 quota 失败 task %s: %s", task.TaskID, err.Error()))
+	var persistErr error
+	confirmed := tokenAdjusted && !common.BatchUpdateEnabled
+	if confirmed {
+		persistErr = task.ConfirmSettledQuota(actualQuota)
+	} else {
+		persistErr = task.UpdateQuota()
 	}
+	if persistErr != nil {
+		logger.LogError(ctx, fmt.Sprintf("差额结算回写 quota 失败 task %s: %s", task.TaskID, persistErr.Error()))
+	}
+	task.PrivateData.BillingAdjustmentFailed = !confirmed || persistErr != nil
 
 	// 提交阶段已经累计过一次请求；结算阶段只调整最终用量。
 	model.UpdateUserUsedQuota(task.UserId, quotaDelta)
@@ -375,14 +530,22 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 		Other:     other,
 		NodeName:  task.PrivateData.NodeName,
 	})
+	return !task.PrivateData.BillingAdjustmentFailed
 }
 
 // RecalculateTaskQuotaByTokens 根据实际 token 消耗重新计费（异步差额结算）。
 // 当任务成功且返回了 totalTokens 时，根据模型倍率和分组倍率重新计算实际扣费额度，
 // 与预扣费的差额进行补扣或退还。支持钱包和订阅计费来源。
 func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTokens int) bool {
+	_, settled := recalculateTaskQuotaByTokens(ctx, task, totalTokens)
+	return settled
+}
+
+// The first result distinguishes unavailable token pricing from an attempted
+// settlement failure; only the former may retain the reservation as final.
+func recalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTokens int) (bool, bool) {
 	if totalTokens <= 0 {
-		return false
+		return false, false
 	}
 
 	modelName := taskModelName(task)
@@ -391,13 +554,13 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 	modelRatio, hasRatioSetting, _ := ratio_setting.GetModelRatio(modelName)
 	if bc := task.PrivateData.BillingContext; bc != nil {
 		if bc.PerCallBilling || bc.TieredSnapshot != nil {
-			return false
+			return false, false
 		}
 		modelRatio, hasRatioSetting = bc.ModelRatio, true
 	}
 	// 只有配置了倍率(非固定价格)时才按 token 重新计费
 	if !hasRatioSetting || modelRatio <= 0 {
-		return false
+		return false, false
 	}
 
 	// 获取用户和组的倍率信息
@@ -409,7 +572,7 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 		}
 	}
 	if group == "" {
-		return false
+		return false, false
 	}
 
 	groupRatio := ratio_setting.GetGroupRatio(group)
@@ -436,8 +599,7 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 	actualQuota, clamp := common.QuotaFromFloatChecked(float64(totalTokens) * modelRatio * finalGroupRatio * otherMultiplier)
 
 	reason := fmt.Sprintf("token重算：tokens=%d, modelRatio=%.2f, groupRatio=%.2f, otherMultiplier=%.4f", totalTokens, modelRatio, finalGroupRatio, otherMultiplier)
-	RecalculateTaskQuota(ctx, task, actualQuota, reason, clamp)
-	return true
+	return true, RecalculateTaskQuota(ctx, task, actualQuota, reason, clamp)
 }
 
 // EvaluateTaskCompletionUsage evaluates actual facts against the frozen task

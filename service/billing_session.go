@@ -35,6 +35,7 @@ type BillingSession struct {
 	trusted          bool // 是否命中信任额度旁路
 	fundingSettled   bool // funding.Settle 已成功，资金来源已提交
 	settled          bool // Settle 全部完成（资金 + 令牌）
+	settlementErr    error
 	refunded         bool // Refund 已调用
 	mu               sync.Mutex
 }
@@ -46,7 +47,7 @@ func (s *BillingSession) Settle(actualQuota int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.settled {
-		return nil
+		return s.settlementErr
 	}
 	delta := actualQuota - s.preConsumedQuota
 	if delta == 0 {
@@ -79,6 +80,7 @@ func (s *BillingSession) Settle(actualQuota int) error {
 		s.relayInfo.SubscriptionPostDelta += int64(delta)
 	}
 	s.settled = true
+	s.settlementErr = tokenErr
 	return tokenErr
 }
 

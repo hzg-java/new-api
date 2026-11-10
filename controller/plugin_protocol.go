@@ -369,7 +369,7 @@ func serveTaskPluginProtocol(
 	if background {
 		outcome.Task.PrivateData.ResponsesBackground = true
 		if outcome.Task.ID != 0 {
-			if err := model.DB.Model(outcome.Task).Update("private_data", outcome.Task.PrivateData).Error; err != nil {
+			if err := outcome.Task.MarkResponsesBackground(c.Request.Context()); err != nil {
 				logger.LogError(c, "persist task background flag failed: "+err.Error())
 			}
 		}
@@ -383,7 +383,7 @@ func serveTaskPluginProtocol(
 				outcome.Task.TaskID,
 				taskPluginDebugStatus(string(outcome.Task.Status)),
 			)
-			c.JSON(http.StatusOK, machine.PendingResponse(string(outcome.Task.Status)))
+			c.JSON(http.StatusOK, service.TaskBillingResponse(outcome.Task, machine.PendingResponse(string(outcome.Task.Status))))
 			return
 		}
 		logger.LogDebug(c, "task_plugin subsystem=protocol event=background_stream generation=%d plugin=%q public_task_id=%q", generation, pluginKey, outcome.Task.TaskID)
@@ -600,7 +600,11 @@ func streamTaskPluginProtocol(
 				hookElapsed.Milliseconds(),
 			)
 			for _, event := range events {
-				if err = writeTaskPluginProtocolEvent(c, event); err != nil {
+				var amount *float64
+				if event.Type == "response.completed" || event.Type == "response.failed" {
+					amount = service.TaskBillingAmountCNY(task)
+				}
+				if err = writeTaskPluginProtocolEvent(c, event, amount); err != nil {
 					logger.LogDebug(c, "task_plugin subsystem=protocol event=client_write_failed generation=%d plugin=%q mode=stream stage=event event_type=%q sequence=%d", generation, pluginKey, event.Type, event.SequenceNumber)
 					return
 				}
@@ -761,7 +765,7 @@ func waitTaskPluginProtocol(
 		}
 		if !loadOverloaded && (task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure) {
 			if task.Status == model.TaskStatusFailure {
-				writeTaskPluginProtocolFailureResponse(c, machine, string(task.Status))
+				writeTaskPluginProtocolFailureResponse(c, machine, string(task.Status), task)
 				return
 			}
 			response, hookElapsed, callErr := renderTaskPluginProtocolFinalResponse(
@@ -810,7 +814,7 @@ func waitTaskPluginProtocol(
 					taskPluginDebugStatus(lastStatus),
 					hookElapsed.Milliseconds(),
 				)
-				c.JSON(http.StatusOK, response)
+				c.JSON(http.StatusOK, service.TaskBillingResponse(task, response))
 				logger.LogDebug(
 					c,
 					"task_plugin subsystem=protocol event=observation_complete generation=%d plugin=%q mode=nonstream reason=terminal status=%q ticks=%d",
@@ -1037,7 +1041,7 @@ func retrieveTaskPluginResponse(c *gin.Context, deps pluginProtocolBridgeDeps) {
 
 	if task.Status == model.TaskStatusFailure {
 		logger.LogDebug(c, "task_plugin subsystem=protocol event=retrieve_final generation=%d plugin=%q public_task_id=%q status=%q", generationNumber, plugin.Meta.Key, task.TaskID, taskPluginDebugStatus(string(task.Status)))
-		writeTaskPluginProtocolFailureResponse(c, machine, string(task.Status))
+		writeTaskPluginProtocolFailureResponse(c, machine, string(task.Status), task)
 		return
 	}
 	if task.Status != model.TaskStatusSuccess {
@@ -1080,7 +1084,7 @@ func retrieveTaskPluginResponse(c *gin.Context, deps pluginProtocolBridgeDeps) {
 			task.TaskID,
 			hookElapsed.Milliseconds(),
 		)
-		writeTaskPluginProtocolFailureResponse(c, machine, string(task.Status))
+		writeTaskPluginProtocolFailureResponse(c, machine, string(task.Status), task)
 		return
 	}
 	logger.LogDebug(
@@ -1092,7 +1096,7 @@ func retrieveTaskPluginResponse(c *gin.Context, deps pluginProtocolBridgeDeps) {
 		taskPluginDebugStatus(string(task.Status)),
 		hookElapsed.Milliseconds(),
 	)
-	c.JSON(http.StatusOK, response)
+	c.JSON(http.StatusOK, service.TaskBillingResponse(task, response))
 }
 
 func writeTaskPluginResponseNotFound(c *gin.Context, responseID, reason string) {
@@ -1137,6 +1141,7 @@ func writeTaskPluginProtocolFailureResponse(
 	c *gin.Context,
 	machine *relay.PluginResponsesMachine,
 	taskStatus string,
+	tasks ...*model.Task,
 ) {
 	if taskStatus == string(model.TaskStatusFailure) {
 		response, err := machine.FinalResponse(nil, taskStatus)
@@ -1145,7 +1150,11 @@ func writeTaskPluginProtocolFailureResponse(
 			respondPluginProtocolError(c, http.StatusInternalServerError, "task_protocol_error", "Task protocol request failed")
 			return
 		}
-		c.JSON(http.StatusOK, response)
+		var task *model.Task
+		if len(tasks) > 0 {
+			task = tasks[0]
+		}
+		c.JSON(http.StatusOK, service.TaskBillingResponse(task, response))
 		return
 	}
 	response, err := machine.FailureResponse(taskStatus)
@@ -1250,10 +1259,17 @@ func taskPluginProtocolEventsTerminal(events []dto.PluginResponsesStreamEvent) b
 	return false
 }
 
-func writeTaskPluginProtocolEvent(c *gin.Context, event dto.PluginResponsesStreamEvent) error {
+func writeTaskPluginProtocolEvent(c *gin.Context, event dto.PluginResponsesStreamEvent, amounts ...*float64) error {
 	encoded, err := common.Marshal(event)
 	if err != nil {
 		return err
+	}
+	var amount *float64
+	if len(amounts) > 0 {
+		amount = amounts[0]
+	}
+	if event.Response != nil {
+		encoded = service.InjectUsageBilling(encoded, amount)
 	}
 	helper.ExtendWriteDeadline(c)
 	if _, err = c.Writer.Write([]byte("event: " + event.Type + "\n")); err != nil {

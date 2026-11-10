@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"encoding/json"
+	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/gin-gonic/gin"
@@ -10,6 +11,10 @@ import (
 
 type chatCompletionResponseWriter struct {
 	gin.ResponseWriter
+}
+
+func (w *chatCompletionResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func (w *chatCompletionResponseWriter) WriteHeader(code int) {
