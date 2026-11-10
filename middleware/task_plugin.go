@@ -1196,6 +1196,21 @@ func renderTaskPluginQuery(
 		views = append(views, viewValue)
 	}
 
+	terminalTasks := make([]*model.Task, 0, len(tasks))
+	for _, task := range tasks {
+		if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
+			terminalTasks = append(terminalTasks, task)
+		}
+	}
+	if len(terminalTasks) > 0 {
+		capture := &service.TaskResponseCapture{ResponseWriter: c.Writer}
+		c.Writer = capture
+		defer func() {
+			for _, task := range terminalTasks {
+				capture.RecordFinal(task)
+			}
+		}()
+	}
 	var rendererInput any = views
 	if !multiple {
 		rendererInput = views[0]

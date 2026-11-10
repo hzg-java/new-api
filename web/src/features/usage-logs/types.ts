@@ -330,6 +330,7 @@ export interface TaskEvent {
   timestamp: number
   payload: string
   upstream_request?: string
+  client_response?: string
   detail_complete?: boolean
   detail_unavailable?: string
 }

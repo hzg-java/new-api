@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -312,6 +313,11 @@ func runVideoSubmission(parent context.Context, task *model.Task, plugin *plugin
 			return errors.New("video submission lease lost")
 		}
 		task.SubmissionStage = "submitting"
+		if upstream, ok := common.GetContextKeyType[json.RawMessage](c, constant.ContextKeyTaskEventUpstreamRequest); ok && len(upstream) > 0 {
+			if err := model.RecordTaskEventDetail(task.ID, "request", task.SubmitTime, model.TaskEventRequestDetail{UpstreamRequest: upstream}); err != nil {
+				logger.LogWarn(ctx, "record video task upstream request: "+err.Error())
+			}
+		}
 		return nil
 	})
 	if ctx.Err() != nil {

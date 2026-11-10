@@ -114,6 +114,185 @@ describe('task event content', () => {
     }
   )
 
+  test.each([
+    [ROLE.ADMIN, 'SUCCESS'],
+    [ROLE.ADMIN, 'FAILURE'],
+    [ROLE.SUPER_ADMIN, 'SUCCESS'],
+    [ROLE.SUPER_ADMIN, 'FAILURE'],
+  ] as const)(
+    'administrator role %s shows and exactly copies a %s client response without replacing upstream or submission responses',
+    async (role, status) => {
+      const user = userEvent.setup()
+      useAuthStore.getState().auth.setUser({ id: 7, username: 'admin', role })
+      const acceptedPayload = '{"status":"queued","id":"submission-response"}'
+      const resultPayload = '{"output":"upstream-result"}'
+      const clientResponse = `{"status_code":200,"content_type":"application/json","body":{"status":"${status}","id":9007199254740993,"scale":1.2300,"enabled":false,"items":[0,null]}}`
+      render(
+        <TaskTimeline
+          events={[
+            {
+              kind: 'accepted',
+              timestamp: 1700000000,
+              payload: acceptedPayload,
+            },
+            {
+              kind: 'result',
+              timestamp: 1700000001,
+              payload: resultPayload,
+              client_response: clientResponse,
+            },
+          ]}
+        />
+      )
+      expect(screen.getAllByRole('listitem')).toHaveLength(2)
+      expect(
+        screen
+          .getAllByRole('textbox', { name: /Accepted|Result|Response/ })
+          .map((viewer) => viewer.getAttribute('aria-label'))
+      ).toEqual(['Submission Accepted', 'Task Result', 'Final Client Response'])
+      expect(
+        screen.getByRole('textbox', { name: 'Submission Accepted' })
+      ).toHaveTextContent('submission-response')
+      const upstream = screen.getByRole('textbox', { name: 'Task Result' })
+      expect(upstream).toHaveTextContent('upstream-result')
+      expect(upstream).not.toHaveTextContent('status_code')
+      const response = screen.getByRole('textbox', {
+        name: 'Final Client Response',
+      })
+      expect(response).toHaveAttribute('aria-readonly', 'true')
+      expect(
+        Array.from(
+          response.querySelectorAll('.cm-line'),
+          (line) => line.textContent
+        )
+      ).toEqual([
+        '{',
+        '  "status_code": 200,',
+        '  "content_type": "application/json",',
+        '  "body": {',
+        `    "status": "${status}",`,
+        '    "id": 9007199254740993,',
+        '    "scale": 1.2300,',
+        '    "enabled": false,',
+        '    "items": [',
+        '      0,',
+        '      null',
+        '    ]',
+        '  }',
+        '}',
+      ])
+      const copyButtons = screen.getAllByRole('button', {
+        name: 'Copy to clipboard',
+      })
+      expect(copyButtons).toHaveLength(3)
+      await user.click(copyButtons[0])
+      expect(await navigator.clipboard.readText()).toBe(acceptedPayload)
+      await user.click(copyButtons[1])
+      expect(await navigator.clipboard.readText()).toBe(resultPayload)
+      await user.click(copyButtons[2])
+      expect(await navigator.clipboard.readText()).toBe(clientResponse)
+    }
+  )
+
+  test.each([undefined, ''])(
+    'omits the final client response block for a historical result with value %s',
+    (clientResponse) => {
+      useAuthStore
+        .getState()
+        .auth.setUser({ id: 7, username: 'admin', role: ROLE.ADMIN })
+      render(
+        <TaskTimeline
+          events={[
+            {
+              kind: 'result',
+              timestamp: 1700000000,
+              payload: '{"output":"historical-result"}',
+              client_response: clientResponse,
+            },
+          ]}
+        />
+      )
+      expect(
+        screen.getAllByRole('textbox', { name: /Result|Response/ })
+      ).toHaveLength(1)
+      expect(
+        screen.getByRole('textbox', { name: 'Task Result' })
+      ).toHaveTextContent('historical-result')
+      expect(
+        screen.queryByText('Final Client Response')
+      ).not.toBeInTheDocument()
+      expect(
+        screen.getAllByRole('button', { name: 'Copy to clipboard' })
+      ).toHaveLength(1)
+    }
+  )
+
+  test('omits final client responses on unfinished events even when the field is injected', () => {
+    useAuthStore
+      .getState()
+      .auth.setUser({ id: 7, username: 'admin', role: ROLE.ADMIN })
+    render(
+      <TaskTimeline
+        events={[
+          {
+            kind: 'request',
+            timestamp: 1700000000,
+            payload: '{"prompt":"hello"}',
+            client_response: '{"body":"unfinished-response-canary"}',
+          },
+          {
+            kind: 'accepted',
+            timestamp: 1700000001,
+            payload: '{"status":"queued"}',
+            client_response: '{"body":"unfinished-response-canary"}',
+          },
+        ]}
+      />
+    )
+    expect(
+      screen.getAllByRole('textbox', { name: /Request|Accepted|Response/ })
+    ).toHaveLength(2)
+    expect(screen.queryByText('Final Client Response')).not.toBeInTheDocument()
+    expect(
+      screen.queryByText(/unfinished-response-canary/)
+    ).not.toBeInTheDocument()
+    expect(
+      screen.getAllByRole('button', { name: 'Copy to clipboard' })
+    ).toHaveLength(2)
+  })
+
+  test('shows and copies the final client response unavailability marker without replacing the upstream result', async () => {
+    const user = userEvent.setup()
+    useAuthStore
+      .getState()
+      .auth.setUser({ id: 7, username: 'admin', role: ROLE.ADMIN })
+    const clientResponse = '{"unavailable":"size_limit_exceeded"}'
+    render(
+      <TaskTimeline
+        events={[
+          {
+            kind: 'result',
+            timestamp: 1700000000,
+            payload: '{"output":"upstream-result"}',
+            client_response: clientResponse,
+          },
+        ]}
+      />
+    )
+    expect(
+      screen.getByRole('textbox', { name: 'Task Result' })
+    ).toHaveTextContent('upstream-result')
+    expect(
+      screen.getByRole('textbox', { name: 'Final Client Response' })
+    ).toHaveTextContent('"unavailable": "size_limit_exceeded"')
+    const copyButtons = screen.getAllByRole('button', {
+      name: 'Copy to clipboard',
+    })
+    expect(copyButtons).toHaveLength(2)
+    await user.click(copyButtons[1])
+    expect(await navigator.clipboard.readText()).toBe(clientResponse)
+  })
+
   test.each([undefined, ''])(
     'omits the actual request block for historical or unconfigured requests with value %s',
     (upstreamRequest) => {
@@ -200,7 +379,7 @@ describe('task event content', () => {
   })
 
   test.each([ROLE.USER, null])(
-    'hides result and actual request but preserves business details for role %s',
+    'hides result, actual request and injected client responses but preserves business details for role %s',
     (role) => {
       useAuthStore
         .getState()
@@ -213,16 +392,19 @@ describe('task event content', () => {
               timestamp: 1700000000,
               payload: '{"prompt":"hello","duration":0}',
               upstream_request: '{"image":"upstream-request-canary"}',
+              client_response: '{"body":"client-response-canary"}',
             },
             {
               kind: 'accepted',
               timestamp: 1700000001,
               payload: '{"status":"queued"}',
+              client_response: '{"body":"client-response-canary"}',
             },
             {
               kind: 'result',
               timestamp: 1700000002,
               payload: '{"output":"result-canary"}',
+              client_response: '{"body":"client-response-canary"}',
             },
           ]}
         />
@@ -241,6 +423,12 @@ describe('task event content', () => {
       expect(screen.queryByText('Actual Model Request')).not.toBeInTheDocument()
       expect(
         screen.queryByText(/upstream-request-canary/)
+      ).not.toBeInTheDocument()
+      expect(
+        screen.queryByText('Final Client Response')
+      ).not.toBeInTheDocument()
+      expect(
+        screen.queryByText(/client-response-canary/)
       ).not.toBeInTheDocument()
       expect(
         screen.getAllByRole('button', { name: 'Copy to clipboard' })

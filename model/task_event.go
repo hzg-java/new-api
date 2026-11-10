@@ -3,6 +3,7 @@ package model
 import (
 	"encoding/json"
 	"errors"
+	"maps"
 	"math"
 	"net/url"
 	"regexp"
@@ -21,11 +22,16 @@ type TaskEvent struct {
 	DetailComplete    *bool  `json:"detail_complete,omitempty" gorm:"-"`
 	DetailUnavailable string `json:"detail_unavailable,omitempty" gorm:"-"`
 	UpstreamRequest   string `json:"upstream_request,omitempty" gorm:"-"`
+	ClientResponse    string `json:"client_response,omitempty" gorm:"-"`
 }
 
 type TaskEventRequestDetail struct {
-	Request         any
+	Request         any // A nil request preserves the recorded client snapshot.
 	UpstreamRequest json.RawMessage
+}
+
+type TaskEventClientResponse struct {
+	Response any
 }
 
 const TaskEventPayloadLimit = 60 * 1024
@@ -40,7 +46,7 @@ var (
 func taskEventCredentialKey(key string) bool {
 	key = strings.ToLower(strings.NewReplacer("-", "", "_", "", ".", "").Replace(key))
 	switch key {
-	case "key", "apikey", "authorization", "proxyauthorization", "cookie", "setcookie", "password", "passwd", "secret", "clientsecret", "accesskey", "secretkey", "privatekey", "credential", "credentials", "auth", "token", "accesstoken", "refreshtoken", "idtoken", "session", "sessionid", "signature", "sig", "xamzsignature", "xamzcredential", "xamzsecuritytoken", "xgoogsignature", "xgoogcredential":
+	case "key", "apikey", "authorization", "proxyauthorization", "cookie", "setcookie", "password", "passwd", "secret", "clientsecret", "accesskey", "secretkey", "privatekey", "credential", "credentials", "auth", "token", "access", "accesstoken", "refreshtoken", "idtoken", "session", "sessionid", "signature", "sig", "xamzsignature", "xamzcredential", "xamzsecuritytoken", "xgoogsignature", "xgoogcredential":
 		return true
 	}
 	return strings.HasSuffix(key, "token") || strings.HasSuffix(key, "secret") || strings.HasSuffix(key, "password") || strings.HasSuffix(key, "apikey")
@@ -133,28 +139,42 @@ func RecordTaskEventDetail(taskID int64, kind string, timestamp int64, detail an
 	if err := RecordTaskEvent(taskID, kind, timestamp, nil); err != nil {
 		return err
 	}
+	request, requestDetail := detail.(TaskEventRequestDetail)
+	response, responseDetail := detail.(TaskEventClientResponse)
 	var upstream json.RawMessage
-	if request, ok := detail.(TaskEventRequestDetail); ok {
+	preserveRequest := requestDetail && request.Request == nil
+	preservePayload := preserveRequest || responseDetail
+	if requestDetail {
 		detail = request.Request
 		upstream = request.UpstreamRequest
 	}
-	redacted, err := RedactTaskEventDetail(detail)
-	info := map[string]any{"payload": redacted, "complete": true}
-	if marker, ok := detail.(map[string]any); ok {
-		if reason, ok := marker["unavailable"].(string); ok {
-			info["complete"] = false
-			info["unavailable"] = reason
+	updates := make(map[string]any)
+	if !preservePayload {
+		redacted, err := RedactTaskEventDetail(detail)
+		updates = map[string]any{"payload": redacted, "complete": true}
+		if marker, ok := detail.(map[string]any); ok {
+			if reason, ok := marker["unavailable"].(string); ok {
+				updates["complete"] = false
+				updates["unavailable"] = reason
+			}
 		}
-	}
-	if err != nil {
-		info = map[string]any{"complete": false, "unavailable": "invalid_payload"}
+		if err != nil {
+			updates = map[string]any{"complete": false, "unavailable": "invalid_payload"}
+		}
 	}
 	if len(upstream) > 0 {
 		redactedUpstream, err := RedactTaskEventDetail(upstream)
 		if err != nil {
 			redactedUpstream = json.RawMessage(`{"unavailable":"invalid_payload"}`)
 		}
-		info["upstream_request"] = redactedUpstream
+		updates["upstream_request"] = redactedUpstream
+	}
+	if responseDetail {
+		redacted, err := RedactTaskEventDetail(response.Response)
+		if err != nil {
+			redacted = json.RawMessage(`{"unavailable":"invalid_payload"}`)
+		}
+		updates["client_response"] = redacted
 	}
 	for range 8 {
 		var event TaskEvent
@@ -165,6 +185,29 @@ func RecordTaskEventDetail(taskID int64, kind string, timestamp int64, detail an
 		if err := common.UnmarshalJsonStr(event.Payload, &payload); err != nil {
 			return err
 		}
+		info := make(map[string]any)
+		var recorded map[string]json.RawMessage
+		if admin := payload["admin_info"]; len(admin) > 0 {
+			if err := common.Unmarshal(admin, &recorded); err != nil {
+				return err
+			}
+		}
+		if preservePayload {
+			if len(recorded) == 0 {
+				info["complete"], info["unavailable"] = false, "not_recorded"
+			}
+			for key, value := range recorded {
+				info[key] = value
+			}
+		} else {
+			if requestDetail && len(upstream) == 0 && len(recorded["upstream_request"]) > 0 {
+				info["upstream_request"] = recorded["upstream_request"]
+			}
+			if len(recorded["client_response"]) > 0 {
+				info["client_response"] = recorded["client_response"]
+			}
+		}
+		maps.Copy(info, updates)
 		admin, err := common.Marshal(info)
 		if err != nil {
 			return err
@@ -174,7 +217,7 @@ func RecordTaskEventDetail(taskID int64, kind string, timestamp int64, detail an
 		if err != nil {
 			return err
 		}
-		if len(encoded) > TaskEventPayloadLimit && len(upstream) > 0 {
+		if len(encoded) > TaskEventPayloadLimit && info["upstream_request"] != nil {
 			info["upstream_request"] = json.RawMessage(`{"unavailable":"size_limit_exceeded"}`)
 			payload["admin_info"], err = common.Marshal(info)
 			if err != nil {
@@ -185,7 +228,7 @@ func RecordTaskEventDetail(taskID int64, kind string, timestamp int64, detail an
 				return err
 			}
 		}
-		if len(encoded) > TaskEventPayloadLimit && len(upstream) > 0 {
+		if len(encoded) > TaskEventPayloadLimit && info["upstream_request"] != nil {
 			delete(info, "upstream_request")
 			payload["admin_info"], err = common.Marshal(info)
 			if err != nil {
@@ -194,6 +237,28 @@ func RecordTaskEventDetail(taskID int64, kind string, timestamp int64, detail an
 			encoded, err = common.Marshal(payload)
 			if err != nil {
 				return err
+			}
+		}
+		if len(encoded) > TaskEventPayloadLimit && info["client_response"] != nil {
+			info["client_response"] = json.RawMessage(`{"unavailable":"size_limit_exceeded"}`)
+			payload["admin_info"], err = common.Marshal(info)
+			if err != nil {
+				return err
+			}
+			encoded, err = common.Marshal(payload)
+			if err != nil {
+				return err
+			}
+			if len(encoded) > TaskEventPayloadLimit {
+				delete(info, "client_response")
+				payload["admin_info"], err = common.Marshal(info)
+				if err != nil {
+					return err
+				}
+				encoded, err = common.Marshal(payload)
+				if err != nil {
+					return err
+				}
 			}
 		}
 		if len(encoded) > TaskEventPayloadLimit {
@@ -226,6 +291,7 @@ func (event *TaskEvent) ProjectDetail(admin bool) error {
 		Complete        bool            `json:"complete"`
 		Unavailable     string          `json:"unavailable"`
 		UpstreamRequest json.RawMessage `json:"upstream_request"`
+		ClientResponse  json.RawMessage `json:"client_response"`
 	}
 	if len(info) > 0 {
 		if err := common.Unmarshal(info, &detail); err != nil {
@@ -247,6 +313,14 @@ func (event *TaskEvent) ProjectDetail(admin bool) error {
 			return err
 		}
 		event.UpstreamRequest = string(redacted)
+	}
+	event.ClientResponse = ""
+	if admin && event.Kind == "result" && len(detail.ClientResponse) > 0 {
+		redacted, err := redactTaskEventJSON(detail.ClientResponse)
+		if err != nil {
+			return err
+		}
+		event.ClientResponse = string(redacted)
 	}
 	encoded := detail.Payload
 	if len(encoded) == 0 {

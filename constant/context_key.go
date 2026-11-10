@@ -10,6 +10,7 @@ const (
 	ContextKeyOriginalModel            ContextKey = "original_model"
 	ContextKeyRequestStartTime         ContextKey = "request_start_time"
 	ContextKeyTaskEventUpstreamRequest ContextKey = "task_event_upstream_request"
+	ContextKeyTaskEventResponseTask    ContextKey = "task_event_response_task"
 
 	/* token related keys */
 	ContextKeyTokenUnlimited         ContextKey = "token_unlimited_quota"

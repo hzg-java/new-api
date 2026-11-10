@@ -1,7 +1,6 @@
 package controller
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -465,6 +464,12 @@ func RelayTaskPluginEndpoint(c *gin.Context, fallback gin.HandlerFunc) {
 }
 
 func RelayTaskFetch(c *gin.Context) {
+	capture := &service.TaskResponseCapture{ResponseWriter: c.Writer}
+	c.Writer = capture
+	defer func() {
+		task, _ := common.GetContextKeyType[*model.Task](c, constant.ContextKeyTaskEventResponseTask)
+		capture.RecordFinal(task)
+	}()
 	relayInfo, err := relaycommon.GenRelayInfo(c, types.RelayFormatTask, nil, nil)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, &taskdto.TaskError{
@@ -534,16 +539,15 @@ type taskSubmitAttempt func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSu
 // Embedding preserves Gin's flushing, hijacking and close-notification behavior.
 // The same pointer stays in context keys when a submission context is copied.
 type taskEventResponseCapture struct {
-	gin.ResponseWriter
-	body                            bytes.Buffer
-	task                            *model.Task
-	context                         *gin.Context
-	request, attemptError           json.RawMessage
-	detailKey                       string
-	pending                         []taskSubmissionErrorLog
-	finalErrorLog                   *model.Log
-	finalError                      *types.NewAPIError
-	overflow, writeFailed, recorded bool
+	*service.TaskResponseCapture
+	task                  *model.Task
+	context               *gin.Context
+	request, attemptError json.RawMessage
+	detailKey             string
+	pending               []taskSubmissionErrorLog
+	finalErrorLog         *model.Log
+	finalError            *types.NewAPIError
+	recorded              bool
 }
 
 type taskSubmissionErrorLog struct {
@@ -603,7 +607,7 @@ func (w *taskEventResponseCapture) arm(c *gin.Context, request any) {
 }
 
 func installRelayErrorCapture(c *gin.Context) *taskEventResponseCapture {
-	capture := &taskEventResponseCapture{ResponseWriter: c.Writer, detailKey: "relay_error"}
+	capture := &taskEventResponseCapture{TaskResponseCapture: &service.TaskResponseCapture{ResponseWriter: c.Writer}, detailKey: "relay_error"}
 	capture.arm(c, map[string]any{"unavailable": "unsupported_content_type"})
 	c.Writer = capture
 	return capture
@@ -615,29 +619,17 @@ func installTaskEventResponseCapture(c *gin.Context) *taskEventResponseCapture {
 			return capture
 		}
 	}
-	capture := &taskEventResponseCapture{ResponseWriter: c.Writer}
+	capture := &taskEventResponseCapture{TaskResponseCapture: &service.TaskResponseCapture{ResponseWriter: c.Writer}}
 	c.Writer = capture
 	c.Set("task_event_response_capture", capture)
 	return capture
 }
 
 func (w *taskEventResponseCapture) Write(data []byte) (int, error) {
-	n, err := w.ResponseWriter.Write(data)
-	if err != nil {
-		w.writeFailed = true
-	}
 	if w.detailKey == "relay_error" && w.finalError == nil && w.Status() < http.StatusBadRequest {
-		return n, err
+		return w.ResponseWriter.Write(data)
 	}
-	if !w.overflow {
-		if w.body.Len()+n > model.TaskEventPayloadLimit {
-			w.overflow = true
-			w.body.Reset()
-		} else {
-			_, _ = w.body.Write(data[:n])
-		}
-	}
-	return n, err
+	return w.TaskResponseCapture.Write(data)
 }
 
 func (w *taskEventResponseCapture) WriteString(text string) (int, error) {
@@ -663,21 +655,12 @@ func (w *taskEventResponseCapture) record() {
 		}
 		for _, pending := range w.pending {
 			if pending.log == w.finalErrorLog && failed {
-				response := json.RawMessage(`{"unavailable":"response_not_written"}`)
-				switch {
-				case w.task != nil && w.task.PrivateData.ResultDiscarded:
-					response = json.RawMessage(`{"unavailable":"result_discarded"}`)
-				case w.overflow:
-					response = json.RawMessage(`{"unavailable":"size_limit_exceeded"}`)
-				case w.writeFailed:
-					response = json.RawMessage(`{"unavailable":"write_failed"}`)
-				case w.body.Len() > 0:
-					var raw json.RawMessage
-					if common.Unmarshal(w.body.Bytes(), &raw) == nil {
-						response = safeTaskSubmissionDetail(raw)
-					} else {
-						response = json.RawMessage(`{"unavailable":"non_json_response"}`)
-					}
+				detail := w.Detail(w.task != nil && w.task.PrivateData.ResultDiscarded)
+				response := safeTaskSubmissionDetail(map[string]any{"unavailable": "non_json_response"})
+				if reason, ok := detail["unavailable"]; ok {
+					response = safeTaskSubmissionDetail(map[string]any{"unavailable": reason})
+				} else if body, ok := detail["body"]; ok {
+					response = safeTaskSubmissionDetail(body)
 				}
 				var other map[string]json.RawMessage
 				_ = common.UnmarshalJsonStr(pending.log.Other, &other)
@@ -696,53 +679,7 @@ func (w *taskEventResponseCapture) record() {
 	if w.task == nil {
 		return
 	}
-	detail := map[string]any{"status_code": w.Status(), "content_type": w.Header().Get("Content-Type")}
-	switch {
-	case w.task.PrivateData.ResultDiscarded:
-		detail["unavailable"] = "result_discarded"
-	case w.overflow:
-		detail["unavailable"] = "size_limit_exceeded"
-	case w.writeFailed:
-		detail["unavailable"] = "write_failed"
-	case w.body.Len() == 0:
-		detail["unavailable"] = "response_not_written"
-	case strings.Contains(w.Header().Get("Content-Type"), "text/event-stream"):
-		// Parse each SSE data value so recursive credential redaction applies to JSON events.
-		var events []any
-		for block := range strings.SplitSeq(strings.ReplaceAll(w.body.String(), "\r\n", "\n"), "\n\n") {
-			if strings.TrimSpace(block) == "" {
-				continue
-			}
-			var data []string
-			var eventName string
-			for line := range strings.SplitSeq(block, "\n") {
-				if value, ok := strings.CutPrefix(line, "data:"); ok {
-					data = append(data, strings.TrimPrefix(value, " "))
-				}
-				if value, ok := strings.CutPrefix(line, "event:"); ok {
-					eventName = strings.TrimSpace(value)
-				}
-			}
-			if len(data) == 0 {
-				continue
-			}
-			text := strings.Join(data, "\n")
-			var raw json.RawMessage
-			var value any = text
-			if common.Unmarshal([]byte(text), &raw) == nil {
-				value = raw
-			}
-			events = append(events, map[string]any{"event": eventName, "data": value})
-		}
-		detail["events"] = events
-	default:
-		var raw json.RawMessage
-		if common.Unmarshal(w.body.Bytes(), &raw) == nil {
-			detail["body"] = raw
-		} else {
-			detail["unavailable"] = "non_json_response"
-		}
-	}
+	detail := w.Detail(w.task.PrivateData.ResultDiscarded)
 	if err := model.RecordTaskEventDetail(w.task.ID, "accepted", time.Now().Unix(), detail); err != nil {
 		common.SysError("record task response detail: " + err.Error())
 	}

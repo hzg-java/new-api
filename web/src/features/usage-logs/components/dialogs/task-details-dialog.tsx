@@ -209,6 +209,23 @@ export function TaskTimeline(props: { events: TaskEvent[] }) {
                     />
                   </CodeBlock>
                 ) : null}
+                {isAdmin && event.kind === 'result' && event.client_response ? (
+                  <CodeBlock
+                    code={formatTaskEventPayload(event.client_response)}
+                    language='json'
+                    title={t('Final Client Response')}
+                    enableCollapse={false}
+                    maxExpandedLines={14}
+                    showToolbar
+                    showLineNumbers
+                  >
+                    <CopyButton
+                      value={event.client_response}
+                      className='size-8'
+                      iconClassName='size-3.5'
+                    />
+                  </CodeBlock>
+                ) : null}
               </li>
             )
           })}

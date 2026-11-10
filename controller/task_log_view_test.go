@@ -16,9 +16,12 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
@@ -891,6 +894,190 @@ func TestTaskEventOriginalRequestAndActualResponse(t *testing.T) {
 	})
 }
 
+func TestTaskEventFinalClientResponses(t *testing.T) {
+	db := setupMaterialConcurrentPostgres(t)
+	require.NoError(t, db.AutoMigrate(&model.Task{}, &model.TaskEvent{}, &model.Channel{}))
+	plugin := compilePluginProtocolRetrieveEndpoint(t, "client-response", `
+		export const protocols = {openai_responses: {
+			renderEvents() { throw new Error("unexpected stream"); },
+			renderFinal() { return {output: [{type:"message",role:"assistant",content:[{type:"output_text",text:"platform-final",annotations:[],logprobs:[]}]}]}; }
+		}};
+	`, pluginruntime.Options{})
+	for _, status := range []model.TaskStatus{model.TaskStatusSuccess, model.TaskStatusFailure, model.TaskStatusInProgress} {
+		t.Run(string(status), func(t *testing.T) {
+			task := &model.Task{TaskID: model.GenerateTaskID(), UserId: 71, Platform: constant.TaskPlatform(plugin.Plugin.Meta.Key), Status: status, SubmitTime: 1700000000, FinishTime: 1700000002, FailReason: "provider failed", Properties: model.Properties{OriginModelName: "video-model"}, Data: []byte(`{"upstream":"original-result"}`)}
+			require.NoError(t, db.Create(task).Error)
+			terminal := status == model.TaskStatusSuccess || status == model.TaskStatusFailure
+			if terminal {
+				require.NoError(t, model.RecordTaskEvent(task.ID, "result", task.FinishTime, model.TaskResultEventPayload(task)))
+			}
+			c, recorder := newPluginProtocolRetrieveContext("resp_" + strings.TrimPrefix(task.TaskID, "task_"))
+			retrieveTaskPluginResponse(c, pluginProtocolRetrieveDeps(plugin, task, true, nil))
+			require.Equal(t, http.StatusOK, recorder.Code)
+			events, err := model.GetTaskEvents(task.ID)
+			require.NoError(t, err)
+			if !terminal {
+				assert.Empty(t, events, "in-progress polling must not add events")
+				return
+			}
+			require.Len(t, events, 1)
+			require.NoError(t, events[0].ProjectDetail(true))
+			assert.Contains(t, events[0].Payload, "original-result")
+			encoded, err := common.Marshal(events[0])
+			require.NoError(t, err)
+			var projected struct {
+				ClientResponse string `json:"client_response"`
+			}
+			require.NoError(t, common.Unmarshal(encoded, &projected))
+			require.NotEmpty(t, projected.ClientResponse, "the actual final response must be recorded")
+			var response struct {
+				Body   json.RawMessage `json:"body"`
+				Status int             `json:"status_code"`
+			}
+			require.NoError(t, common.UnmarshalJsonStr(projected.ClientResponse, &response))
+			assert.Equal(t, recorder.Code, response.Status)
+			assert.JSONEq(t, recorder.Body.String(), string(response.Body))
+		})
+	}
+	t.Run("video and native queries preserve exact platform responses", func(t *testing.T) {
+		previousCache := common.MemoryCacheEnabled
+		common.MemoryCacheEnabled = false
+		t.Cleanup(func() { common.MemoryCacheEnabled = previousCache })
+		video, err := pluginruntime.DefaultRegistry.Register(`
+			export const meta={apiVersion:1,key:"client-response-video",name:"client response",version:"1.0.0",author:{name:"test"},fetchMode:"per_task",models:["video-model"],protocols:["openai_video"],routes:[{method:"GET",path:"/client-response/jobs/:task_id",type:"query",render:"query"}]};
+			export function buildSubmitRequest(ctx){return {url:ctx.baseUrl+"/jobs",body:ctx.requestBody};}
+			export function parseSubmitResponse(){return {taskId:"vendor-job",taskData:{}};}
+			export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/jobs/"+ctx.taskId};}
+			export function parseTaskResult(){return {status:"UNKNOWN"};}
+			export function listArtifacts(){return [];}
+			export function buildContentRequest(ctx){return {url:ctx.baseUrl+"/content"};}
+			export const native={query(ctx,task){return {id:task.task_id,kind:"native-client-response",data:task.data};}};
+			export const protocols={openai_video:{decodeRequest(ctx){return {kind:"submit",model:ctx.model,requestBody:ctx.body.value};},render(ctx,task){return {kind:"video-client-response",data:task.data};}}};
+		`, pluginruntime.Options{})
+		require.NoError(t, err)
+		t.Cleanup(func() { pluginruntime.DefaultRegistry.Unregister(video.Meta.Key) })
+		for _, surface := range []string{"video", "native"} {
+			for _, status := range []model.TaskStatus{model.TaskStatusSuccess, model.TaskStatusFailure, model.TaskStatusInProgress} {
+				t.Run(surface+"_"+string(status), func(t *testing.T) {
+					task := &model.Task{TaskID: model.GenerateTaskID(), UserId: 71, Platform: constant.TaskPlatform(video.Meta.Key), Status: status, Properties: model.Properties{OriginModelName: "video-model"}, Data: []byte(`{"id":"vendor-job","api_key":"response-credential-canary","number":0,"enabled":false}`)}
+					require.NoError(t, db.Create(task).Error)
+					recorder := httptest.NewRecorder()
+					router := gin.New()
+					if surface == "video" {
+						router.GET("/v1/videos/:task_id", func(c *gin.Context) {
+							c.Set("id", 71)
+							c.Set("relay_mode", relayconstant.RelayModeVideoFetchByID)
+							RelayTaskFetch(c)
+						})
+						router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/videos/"+task.TaskID, nil))
+					} else {
+						router.GET(video.Meta.Routes[0].Path, func(c *gin.Context) {
+							c.Set("id", 71)
+							c.Set(pluginruntime.ContextKeyPinnedRoute, pluginruntime.PinnedRoute{Plugin: video, Generation: pluginruntime.DefaultRegistry.Generation(), Route: video.Meta.Routes[0]})
+						}, middleware.PrepareTaskPluginRoute())
+						router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/client-response/jobs/"+task.TaskID, nil))
+					}
+					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+					events, err := model.GetTaskEvents(task.ID)
+					require.NoError(t, err)
+					if status == model.TaskStatusInProgress {
+						assert.Empty(t, events)
+						return
+					}
+					require.Len(t, events, 1)
+					assert.NotContains(t, events[0].Payload, "response-credential-canary")
+					admin, ordinary := events[0], events[0]
+					require.NoError(t, admin.ProjectDetail(true))
+					require.NoError(t, ordinary.ProjectDetail(false))
+					assert.Empty(t, ordinary.ClientResponse)
+					expected, err := model.RedactTaskEventDetail(json.RawMessage(recorder.Body.Bytes()))
+					require.NoError(t, err)
+					var captured struct {
+						Body json.RawMessage `json:"body"`
+					}
+					require.NoError(t, common.UnmarshalJsonStr(admin.ClientResponse, &captured))
+					assert.JSONEq(t, string(expected), string(captured.Body))
+					assert.Contains(t, string(captured.Body), surface+"-client-response")
+					assert.NotContains(t, admin.ClientResponse, "response-credential-canary")
+				})
+			}
+		}
+	})
+	t.Run("response snapshots retain exact values with bounded storage", func(t *testing.T) {
+		task := &model.Task{TaskID: model.GenerateTaskID(), UserId: 71, Status: model.TaskStatusSuccess, FinishTime: 1700000002, Data: []byte(`{"upstream":"retained-upstream-result"}`)}
+		require.NoError(t, db.Create(task).Error)
+		require.NoError(t, model.RecordTaskEventDetail(task.ID, "accepted", 1700000001, map[string]any{"body": map[string]any{"id": task.TaskID, "status": "queued"}}))
+		for _, tc := range []struct{ name, body, unavailable string }{
+			{"exact values", `{"id":9007199254740993,"scale":1.2300,"enabled":false,"api_key":"client-response-canary"}`, ""},
+			{"oversize", `{"text":"` + strings.Repeat("x", model.TaskEventPayloadLimit) + `"}`, "size_limit_exceeded"},
+			{"no write", "", "response_not_written"},
+			{"invalid json", "{", "non_json_response"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				capture := &service.TaskResponseCapture{ResponseWriter: c.Writer}
+				c.Writer = capture
+				c.Header("Content-Type", "application/json")
+				if tc.body != "" {
+					_, err := c.Writer.WriteString(tc.body)
+					require.NoError(t, err)
+				}
+				assert.Equal(t, tc.body, recorder.Body.String())
+				capture.RecordFinal(task)
+				require.NoError(t, model.RecordTaskEventDetail(task.ID, "result", task.FinishTime, model.TaskResultEventPayload(task)["admin_info"]))
+				events, err := model.GetTaskEvents(task.ID)
+				require.NoError(t, err)
+				require.Len(t, events, 2)
+				assert.LessOrEqual(t, len(events[1].Payload), model.TaskEventPayloadLimit)
+				require.NoError(t, events[0].ProjectDetail(true))
+				assert.Contains(t, events[0].Payload, "queued")
+				require.NoError(t, events[1].ProjectDetail(true))
+				assert.Contains(t, events[1].Payload, "retained-upstream-result")
+				assert.NotContains(t, events[1].ClientResponse, "client-response-canary")
+				if tc.unavailable != "" {
+					assert.Contains(t, events[1].ClientResponse, tc.unavailable)
+				} else {
+					assert.Contains(t, events[1].ClientResponse, "9007199254740993")
+					assert.Contains(t, events[1].ClientResponse, "1.2300")
+					assert.Contains(t, events[1].ClientResponse, `"enabled":false`)
+					assert.Contains(t, events[1].ClientResponse, "[REDACTED]")
+				}
+			})
+		}
+	})
+	t.Run("submission SSE and overflow share the bounded response capture", func(t *testing.T) {
+		for _, tc := range []struct{ body, reason string }{
+			{"event: result\ndata: {\"text\":\"actual stream\",\"token\":\"stream-canary\",\"number\":9007199254740993}\n\n", ""},
+			{strings.Repeat("x", 61*1024), "size_limit_exceeded"},
+		} {
+			task := &model.Task{TaskID: model.GenerateTaskID(), UserId: 71}
+			require.NoError(t, db.Create(task).Error)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			capture := installTaskEventResponseCapture(c)
+			capture.task = task
+			c.Header("Content-Type", "text/event-stream")
+			_, err := c.Writer.WriteString(tc.body)
+			require.NoError(t, err)
+			c.Writer.Flush()
+			assert.True(t, recorder.Flushed)
+			assert.Equal(t, tc.body, recorder.Body.String())
+			capture.record()
+			events, err := model.GetTaskEvents(task.ID)
+			require.NoError(t, err)
+			require.Len(t, events, 1)
+			require.NoError(t, events[0].ProjectDetail(true))
+			assert.Equal(t, tc.reason, events[0].DetailUnavailable)
+			assert.NotContains(t, events[0].Payload, "stream-canary")
+			if tc.reason == "" {
+				assert.Contains(t, events[0].Payload, "actual stream")
+				assert.Contains(t, events[0].Payload, "9007199254740993")
+			}
+		}
+	})
+}
+
 func TestTaskEventUpstreamRequestProjection(t *testing.T) {
 	for _, admin := range []bool{true, false} {
 		event := model.TaskEvent{Kind: "request", Payload: `{"model":"client-model","admin_info":{"complete":true,"payload":{"model":"client-model","prompt":"original","generate_audio":false},"upstream_request":{"model":"mapped-model","content":[{"type":"image_url","image_url":{"url":"asset://resolved-material"}}],"seed":9007199254740993,"scale":1.2300,"duration":0,"generate_audio":false,"api_key":"credential-canary"}}}`}
@@ -954,12 +1141,18 @@ func TestTaskEventCredentialTextAndEnvelopes(t *testing.T) {
 		map[string]any{"message": "Authorization: Bearer bearer-canary; Basic basic-canary api_key=key-canary x-api-key: header-canary sk-free-canary"},
 		map[string]any{"headers": []any{map[string]any{"name": "Authorization", "value": "Bearer envelope-canary"}, map[string]any{"name": "x-api-key", "value": "envelope-key-canary"}}},
 		map[string]any{"fields": []any{map[string]any{"name": "api_key", "value": []string{"form-canary", "second-canary"}}}},
+		map[string]any{"access": "direct-access-canary", "url": "https://gateway.example/v1/videos/task_local/content?access=artifact-access-canary&width=720"},
 	} {
 		encoded, err := model.RedactTaskEventDetail(value)
 		require.NoError(t, err)
 		assert.NotContains(t, string(encoded), "canary")
 		assert.Contains(t, string(encoded), "[REDACTED]")
 	}
+	stored := model.TaskEvent{Kind: "result", Payload: `{"admin_info":{"complete":true,"payload":{"status":"SUCCESS"},"client_response":{"body":{"url":"https://gateway.example/v1/videos/task_local/content?access=historical-access-canary&width=720"}}}}`}
+	require.NoError(t, stored.ProjectDetail(true))
+	assert.NotContains(t, stored.ClientResponse, "historical-access-canary")
+	assert.Contains(t, stored.ClientResponse, "width=720")
+	assert.Contains(t, stored.ClientResponse, "%5BREDACTED%5D")
 }
 
 func TestTaskEventURLEncodedRequest(t *testing.T) {

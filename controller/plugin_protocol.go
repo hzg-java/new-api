@@ -1001,6 +1001,11 @@ func retrieveTaskPluginResponse(c *gin.Context, deps pluginProtocolBridgeDeps) {
 		writeTaskPluginResponseNotFound(c, responseID, "no_claim")
 		return
 	}
+	if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
+		capture := &service.TaskResponseCapture{ResponseWriter: c.Writer}
+		c.Writer = capture
+		defer capture.RecordFinal(task)
+	}
 
 	generationNumber := uint64(0)
 	if generation != nil {

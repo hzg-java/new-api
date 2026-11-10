@@ -1965,7 +1965,11 @@ func TestDeferredVideoSubmissionReportsMaterialFailure(t *testing.T) {
 	assert.Equal(t, 100000000, token.RemainQuota)
 	assert.Zero(t, token.UsedQuota)
 
-	c.Set("task_request", map[string]any{"model": "async-video", "content": []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": publicMaterialURL}, "role": "reference_image"}}})
+	originalRequest := `{"model":"async-video","prompt":"original client prompt","client_extension":"preserved"}`
+	c.Request = httptest.NewRequest(http.MethodPost, "/tasks", strings.NewReader(originalRequest))
+	c.Request.Header.Set("Content-Type", "application/json")
+	common.CleanupBodyStorage(c)
+	c.Set("task_request", map[string]any{"model": "async-video", "prompt": "normalized provider prompt", "generate_audio": false, "api_key": "upstream-credential-canary", "content": []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": publicMaterialURL}, "role": "reference_image"}}})
 	info.TaskRelayInfo.PublicTaskID = ""
 	info.Billing = nil
 	accepted, taskErr := executeTaskSubmission(c, info)
@@ -1981,6 +1985,59 @@ func TestDeferredVideoSubmissionReportsMaterialFailure(t *testing.T) {
 	assert.Empty(t, submitted.SubmissionStage)
 	assert.Equal(t, 1, uploads)
 	assert.Equal(t, 1, videoCalls)
+	events, err := model.GetTaskEvents(submitted.ID)
+	require.NoError(t, err)
+	require.Len(t, events, 2)
+	assert.NotContains(t, events[0].Payload, "upstream-credential-canary")
+	assert.Equal(t, submitted.SubmitTime, events[0].Timestamp)
+	for _, role := range []int{common.RoleAdminUser, common.RoleCommonUser} {
+		recorder := httptest.NewRecorder()
+		viewer, _ := gin.CreateTestContext(recorder)
+		viewer.Request = httptest.NewRequest(http.MethodGet, "/api/task/events", nil)
+		viewer.Params = gin.Params{{Key: "task_id", Value: strconv.FormatInt(submitted.ID, 10)}}
+		viewer.Set("id", users[1].Id)
+		viewer.Set("role", role)
+		GetDashboardTaskEvents(viewer)
+		require.Equal(t, http.StatusOK, recorder.Code)
+		var response struct {
+			Data []model.TaskEvent `json:"data"`
+		}
+		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+		require.Len(t, response.Data, 2)
+		event := response.Data[0]
+		assert.NotContains(t, recorder.Body.String(), "upstream-credential-canary")
+		if role >= common.RoleAdminUser {
+			assert.JSONEq(t, originalRequest, event.Payload)
+			require.NotEmpty(t, event.UpstreamRequest, "background submission must retain the actual model request")
+			assert.Contains(t, event.UpstreamRequest, "asset://async-asset")
+			assert.Contains(t, event.UpstreamRequest, "normalized provider prompt")
+			assert.Contains(t, event.UpstreamRequest, `"generate_audio":false`)
+			assert.Contains(t, event.UpstreamRequest, "[REDACTED]")
+		} else {
+			assert.Empty(t, event.UpstreamRequest)
+			assert.NotContains(t, recorder.Body.String(), "normalized provider prompt")
+			assert.NotContains(t, recorder.Body.String(), "asset://async-asset")
+		}
+	}
+	t.Run("late client snapshot preserves the upstream request", func(t *testing.T) {
+		require.NoError(t, model.RecordTaskEventDetail(submitted.ID, "request", submitted.SubmitTime, model.TaskEventRequestDetail{Request: json.RawMessage(originalRequest)}))
+		stored, err := model.GetTaskEvents(submitted.ID)
+		require.NoError(t, err)
+		require.NoError(t, stored[0].ProjectDetail(true))
+		assert.JSONEq(t, originalRequest, stored[0].Payload)
+		assert.Contains(t, stored[0].UpstreamRequest, "asset://async-asset")
+	})
+	t.Run("oversized upstream request preserves the original request", func(t *testing.T) {
+		upstream, err := common.Marshal(map[string]any{"prompt": strings.Repeat("u", model.TaskEventPayloadLimit)})
+		require.NoError(t, err)
+		require.NoError(t, model.RecordTaskEventDetail(submitted.ID, "request", submitted.SubmitTime, model.TaskEventRequestDetail{UpstreamRequest: upstream}))
+		stored, err := model.GetTaskEvents(submitted.ID)
+		require.NoError(t, err)
+		assert.LessOrEqual(t, len(stored[0].Payload), model.TaskEventPayloadLimit)
+		require.NoError(t, stored[0].ProjectDetail(true))
+		assert.JSONEq(t, originalRequest, stored[0].Payload)
+		assert.JSONEq(t, `{"unavailable":"size_limit_exceeded"}`, stored[0].UpstreamRequest)
+	})
 	require.NoError(t, runVideoSubmission(t.Context(), &submitted, plugin))
 	assert.Equal(t, 1, videoCalls, "a finished submission must not be replayed")
 	require.NoError(t, db.First(&token, token.Id).Error)
