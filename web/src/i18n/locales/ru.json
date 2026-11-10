@@ -3581,6 +3581,8 @@
     "Model assignments": "Привязка моделей",
     "model billing support": "поддержка биллинга моделей",
     "Model Call Analytics": "Аналитика вызовов моделей",
+    "Model Call Ranking": "Рейтинг моделей по вызовам",
+    "Model Consumption Ranking": "Рейтинг моделей по расходам",
     "Model context usage": "Использование контекста модели",
     "Model deleted": "Модель удалена",
     "Model deleted successfully": "Модель успешно удалена",

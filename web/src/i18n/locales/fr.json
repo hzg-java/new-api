@@ -3581,6 +3581,8 @@
     "Model assignments": "Attribution des modèles",
     "model billing support": "prise en charge de la facturation des modèles",
     "Model Call Analytics": "Analyse des appels de modèles",
+    "Model Call Ranking": "Classement des appels par modèle",
+    "Model Consumption Ranking": "Classement des dépenses par modèle",
     "Model context usage": "Utilisation du contexte du modèle",
     "Model deleted": "Modèle supprimé",
     "Model deleted successfully": "Modèle supprimé avec succès",

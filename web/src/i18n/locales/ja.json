@@ -3581,6 +3581,8 @@
     "Model assignments": "モデルの割り当て",
     "model billing support": "モデル課金対応",
     "Model Call Analytics": "モデル呼び出し分析",
+    "Model Call Ranking": "モデル別呼び出しランキング",
+    "Model Consumption Ranking": "モデル別消費額ランキング",
     "Model context usage": "モデルのコンテキスト使用量",
     "Model deleted": "モデルが削除されました",
     "Model deleted successfully": "モデルが正常に削除されました",

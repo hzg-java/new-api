@@ -3581,6 +3581,8 @@
     "Model assignments": "模型归属",
     "model billing support": "模型计费支持",
     "Model Call Analytics": "模型调用分析",
+    "Model Call Ranking": "模型调用排行",
+    "Model Consumption Ranking": "模型消费排行",
     "Model context usage": "模型上下文用量",
     "Model deleted": "模型已删除",
     "Model deleted successfully": "模型删除成功",

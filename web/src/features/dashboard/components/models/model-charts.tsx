@@ -37,6 +37,8 @@ import { useThemeRadiusPx } from '@/lib/theme-radius'
 import type { TimeGranularity } from '@/lib/time'
 import { VCHART_OPTION } from '@/lib/vchart'
 
+import { ModelRanking } from './model-ranking'
+
 let themeManagerPromise: Promise<
   (typeof import('@visactor/vchart'))['ThemeManager']
 > | null = null
@@ -151,18 +153,25 @@ export function ModelCharts(props: ModelChartsProps) {
         </div>
       </div>
 
-      <div className='h-[300px] p-1.5 sm:h-96 sm:p-2'>
-        {themeReady && spec && (
-          <VChart
-            key={chartKey}
-            spec={{
-              ...spec,
-              theme: resolvedTheme === 'dark' ? 'dark' : 'light',
-              background: 'transparent',
-            }}
-            option={VCHART_OPTION}
-          />
-        )}
+      <div className='grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_20rem]'>
+        <div className='h-[300px] min-w-0 p-1.5 sm:h-96 sm:p-2'>
+          {themeReady && spec && (
+            <VChart
+              key={chartKey}
+              spec={{
+                ...spec,
+                theme: resolvedTheme === 'dark' ? 'dark' : 'light',
+                background: 'transparent',
+              }}
+              option={VCHART_OPTION}
+            />
+          )}
+        </div>
+        <ModelRanking
+          items={chartData.callRanking}
+          metric='calls'
+          loading={props.loading}
+        />
       </div>
     </div>
   )

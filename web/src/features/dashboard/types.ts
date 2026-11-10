@@ -236,12 +236,20 @@ export type PingStatusMap = Record<string, PingStatus>
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type VChartSpec = Record<string, any>
 
+export interface ModelChartRankingItem {
+  model: string
+  value: number
+  color: string
+}
+
 export interface ProcessedChartData {
   spec_pie: VChartSpec
   spec_line: VChartSpec
   spec_area: VChartSpec
   spec_model_line: VChartSpec
   spec_rank_bar: VChartSpec
+  quotaRanking: ModelChartRankingItem[]
+  callRanking: ModelChartRankingItem[]
   totalQuotaDisplay: string
   totalCountDisplay: string
 }
