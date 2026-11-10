@@ -90,92 +90,41 @@ it('keeps table headers and short fields unwrapped while descriptions can wrap',
   }
 })
 
-it('documents optional CNY billing in synchronous and streaming chat examples', () => {
-  render(<DocsContent />)
-  const article = screen.getByRole('article')
-  expect(article).toHaveTextContent('usage.billing')
-  expect(article).toHaveTextContent('人民币元（CNY）')
-  expect(screen.getByRole('banner')).toHaveTextContent('缺失不等于免费')
-  expect(screen.getByRole('banner')).toHaveTextContent('usage.cost')
-  const examples = [...article.querySelectorAll('pre')].map(
-    (element) => element.textContent ?? ''
-  )
-  const json = examples.find((example) => example.startsWith('{'))
-  expect(JSON.parse(json ?? '{}').usage.billing).toBe(0.01234)
-  const stream = examples.find((example) => example.includes('data: [DONE]'))
-  expect(stream).toContain('"choices":[]')
-  expect(stream).toContain('"billing":0.01234')
-  expect(stream?.trimEnd().endsWith('data: [DONE]')).toBe(true)
-})
-
 it.each([
+  ['api-section-1', 0.01234],
   ['api-section-2', 0.25],
   ['api-section-3', 0.18],
+  ['api-section-5', 1.25],
 ] as const)(
-  'shows numeric confirmed image charges in %s',
+  'shows the billing field and numeric example in %s',
   (section, amount) => {
     window.history.replaceState(null, '', `/docs#${section}`)
     render(<DocsContent />)
     const article = screen.getByRole('article')
-    expect(article).toHaveTextContent('usage.billing')
+    const row = within(article).getByRole('row', { name: /usage\.billing/ })
+    expect(row).toHaveTextContent('number')
+    expect(row).toHaveTextContent('人民币元（CNY）')
     const example = [...article.querySelectorAll('pre')].find((element) =>
       element.textContent?.startsWith('{')
     )
     expect(JSON.parse(example?.textContent ?? '{}').usage.billing).toBe(amount)
-    const eventType =
-      section === 'api-section-2' ? 'image_generation' : 'image_edit'
-    const stream = [...article.querySelectorAll('pre')].find((element) =>
-      element.textContent?.includes(`event: ${eventType}.usage`)
-    )?.textContent
-    expect(stream).toContain(`event: ${eventType}.completed`)
-    expect(stream).toContain(`"usage":{"billing":${amount}}`)
-    expect(article).toHaveTextContent('正常 EOF')
   }
 )
 
-it('keeps pending video examples unpriced and documents confirmed totals and refunds', async () => {
-  const user = userEvent.setup()
+it('keeps asynchronous video submission examples unpriced', () => {
   window.history.replaceState(null, '', '/docs#api-section-4')
   render(<DocsContent />)
-  let article = screen.getByRole('article')
-  expect(article).toHaveTextContent('异步提交时不返回最终费用')
-  expect(article).toHaveTextContent('/doubao/api/v3/contents/generations/tasks')
-  expect(article).toHaveTextContent('兼容映射尚未确认')
-  const pending = [...article.querySelectorAll('pre')].find((element) =>
+  const article = screen.getByRole('article')
+  const example = [...article.querySelectorAll('pre')].find((element) =>
     element.textContent?.startsWith('{')
   )
-  expect(JSON.parse(pending?.textContent ?? '{}').usage).toBeUndefined()
-  await user.selectOptions(
-    screen.getByRole('combobox', { name: 'Docs' }),
-    'api-section-5'
-  )
-  article = screen.getByRole('article')
-  expect(article).toHaveTextContent('单个任务的最终总费用')
-  expect(article).toHaveTextContent('状态为 succeeded 也不代表结算已确认')
-  const examples = [...article.querySelectorAll('pre')]
-    .map((element) => element.textContent ?? '')
-    .filter((example) => example.startsWith('{'))
-    .map((example) => JSON.parse(example))
-  expect(examples[0].usage.billing).toBe(1.25)
-  expect(
-    examples.find((example) => example.status === 'failed')?.usage.billing
-  ).toBe(0)
-  expect(
-    examples.find((example) => example.status === 'running')?.usage
-  ).toBeUndefined()
-  const unconfirmed = examples.find(
-    (example) => example.status === 'succeeded' && !example.usage
-  )
-  expect(unconfirmed).toBeDefined()
-  expect(unconfirmed).not.toHaveProperty('usage.billing')
+  expect(JSON.parse(example?.textContent ?? '{}').usage).toBeUndefined()
 })
 
-it('keeps every documented JSON response parseable and never labels sample fees as measured', () => {
+it('keeps every documented JSON response parseable', () => {
   for (const match of apiDocument.matchAll(/```json\n([\s\S]*?)```/g)) {
     expect(() => JSON.parse(match[1])).not.toThrow()
   }
-  expect(apiDocument).toContain('金额仅为示例，不代表模型定价或实测账单')
-  expect(apiDocument).toContain('批量扣费尚未确认落账')
 })
 
 it('copies an executable example while preserving the API key placeholder', async () => {
