@@ -14,11 +14,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/netip"
 	"net/url"
 	"runtime"
 	"slices"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -96,6 +97,133 @@ type MobileCloudMaterialClient struct {
 	httpClient *http.Client
 	now        func() time.Time
 	nonce      func() string
+}
+
+type mobileCloudMaterialTraceKey struct{}
+
+type mobileCloudMaterialTrace struct {
+	mu                                                    sync.Mutex
+	started                                               time.Time
+	credentialInfo                                        string
+	diagnosticID                                          string
+	proxy, dns, tcp, peerIP, tls, requestWrite            string
+	proxyStatus                                           int
+	httpsProxy                                            bool
+	proxyTLS                                              string
+	tlsVersion, proxyTLSVersion                           uint16
+	dnsMS, tcpMS, tlsMS, proxyTLSMS, writeMS, firstByteMS int64
+}
+
+func (d *mobileCloudMaterialTrace) clientTrace() *httptrace.ClientTrace {
+	return &httptrace.ClientTrace{
+		DNSStart: func(httptrace.DNSStartInfo) {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			d.dns = "started"
+		},
+		DNSDone: func(info httptrace.DNSDoneInfo) {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			d.dns, d.dnsMS = "ok", time.Since(d.started).Milliseconds()
+			if info.Err != nil {
+				d.dns = "error"
+			}
+		},
+		ConnectStart: func(_, _ string) {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			if d.tcp == "not_started" {
+				d.tcp = "started"
+			}
+		},
+		ConnectDone: func(_, addr string, err error) {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			if d.tcp == "ok" {
+				return
+			}
+			d.tcp, d.tcpMS = "error", time.Since(d.started).Milliseconds()
+			if err == nil {
+				d.tcp = "ok"
+				if peer, err := netip.ParseAddrPort(addr); err == nil {
+					d.peerIP = peer.Addr().WithZone("").String()
+				}
+			}
+		},
+		GotConn: func(info httptrace.GotConnInfo) {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			if peer, err := netip.ParseAddrPort(info.Conn.RemoteAddr().String()); err == nil {
+				d.peerIP = peer.Addr().WithZone("").String()
+			}
+		},
+		TLSHandshakeStart: func() {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			if d.httpsProxy && d.proxyStatus == 0 {
+				d.proxyTLS = "started"
+				return
+			}
+			d.tls = "started"
+		},
+		TLSHandshakeDone: func(state tls.ConnectionState, err error) {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			result := "ok"
+			if err != nil {
+				result = "error"
+			}
+			if d.httpsProxy && d.proxyStatus == 0 {
+				d.proxyTLS, d.proxyTLSMS, d.proxyTLSVersion = result, time.Since(d.started).Milliseconds(), state.Version
+				return
+			}
+			d.tls, d.tlsMS, d.tlsVersion = result, time.Since(d.started).Milliseconds(), state.Version
+		},
+		WroteHeaders: func() {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			d.requestWrite = "started"
+		},
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			d.requestWrite, d.writeMS = "ok", time.Since(d.started).Milliseconds()
+			if info.Err != nil {
+				d.requestWrite = "error"
+			}
+		},
+		GotFirstResponseByte: func() {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			d.firstByteMS = time.Since(d.started).Milliseconds()
+		},
+	}
+}
+
+func (d *mobileCloudMaterialTrace) log(method, path, outcome string, status int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	route := "unknown"
+	for _, prefix := range []string{"/asset-group", "/asset", "/real-person-auth"} {
+		if path == prefix || path == prefix+"/query" {
+			route = path
+			break
+		}
+		if strings.HasPrefix(path, prefix+"/") {
+			route = prefix + "/:id"
+			break
+		}
+	}
+	peerRole := "unknown"
+	if d.proxy == "direct" {
+		peerRole = "upstream"
+	} else if d.proxy == "enabled" {
+		peerRole = "proxy"
+	}
+	common.SysLog(fmt.Sprintf("mobile_cloud_material_request diagnostic_id=%s method=%s route=%q outcome=%s proxy=%s proxy_connect_status=%d dns=%s dns_done_after_ms=%d tcp=%s tcp_done_after_ms=%d peer_ip=%s peer_role=%s proxy_tls=%s proxy_tls_version=%s proxy_tls_done_after_ms=%d upstream_tls=%s upstream_tls_version=%s upstream_tls_done_after_ms=%d request_write=%s write_done_after_ms=%d first_byte_after_ms=%d http_status=%d elapsed_ms=%d %s",
+		d.diagnosticID, method, route, outcome, d.proxy, d.proxyStatus, d.dns, d.dnsMS, d.tcp, d.tcpMS, d.peerIP, peerRole,
+		d.proxyTLS, strings.ReplaceAll(tls.VersionName(d.proxyTLSVersion), " ", ""), d.proxyTLSMS,
+		d.tls, strings.ReplaceAll(tls.VersionName(d.tlsVersion), " ", ""), d.tlsMS, d.requestWrite, d.writeMS, d.firstByteMS, status, time.Since(d.started).Milliseconds(), d.credentialInfo))
 }
 
 type MobileCloudCreateAssetInput struct {
@@ -180,7 +308,33 @@ func NewMobileCloudMaterialClient(endpoint, accessKey, secretKey, poolID string)
 	transport.DisableKeepAlives = true
 	transport.Protocols = new(http.Protocols)
 	transport.Protocols.SetHTTP1(true)
+	proxy := transport.Proxy
+	transport.Proxy = func(req *http.Request) (*url.URL, error) {
+		var proxyURL *url.URL
+		var err error
+		if proxy != nil {
+			proxyURL, err = proxy(req)
+		}
+		if trace, ok := req.Context().Value(mobileCloudMaterialTraceKey{}).(*mobileCloudMaterialTrace); ok {
+			trace.mu.Lock()
+			trace.proxy = "direct"
+			if proxyURL != nil {
+				trace.proxy = "enabled"
+				trace.httpsProxy = proxyURL.Scheme == "https"
+			}
+			if err != nil {
+				trace.proxy = "error"
+			}
+			trace.mu.Unlock()
+		}
+		return proxyURL, err
+	}
 	transport.OnProxyConnectResponse = func(ctx context.Context, proxyURL *url.URL, req *http.Request, resp *http.Response) error {
+		if trace, ok := ctx.Value(mobileCloudMaterialTraceKey{}).(*mobileCloudMaterialTrace); ok {
+			trace.mu.Lock()
+			trace.proxy, trace.proxyStatus = "enabled", resp.StatusCode
+			trace.mu.Unlock()
+		}
 		if resp.StatusCode != http.StatusOK {
 			return &mobileCloudMaterialProxyError{statusCode: resp.StatusCode}
 		}
@@ -234,22 +388,38 @@ func (c *MobileCloudMaterialClient) request(ctx context.Context, method, path st
 	if input != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	var tlsHandshakeFailed atomic.Bool
-	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
-		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
-			if err != nil {
-				tlsHandshakeFailed.Store(true)
-			}
-		},
-	}))
+	maskedAK := "********"
+	if len(c.accessKey) > 8 {
+		maskedAK += c.accessKey[len(c.accessKey)-4:]
+	}
+	diagnosticID, _ := ctx.Value(materialDiagnosticIDKey{}).(string)
+	if diagnosticID == "" {
+		diagnosticID = common.GetUUID()
+	}
+	trace := &mobileCloudMaterialTrace{
+		diagnosticID: diagnosticID,
+		started:      time.Now(), proxy: "unknown", dns: "not_started", tcp: "not_started", peerIP: "unknown", tls: "not_started", proxyTLS: "not_started", requestWrite: "not_started",
+		dnsMS: -1, tcpMS: -1, tlsMS: -1, proxyTLSMS: -1, writeMS: -1, firstByteMS: -1,
+		credentialInfo: fmt.Sprintf("ak_masked=%q ak_bytes=%d sk_bytes=%d ak_trimmed=%t sk_trimmed=%t pool_bytes=%d pool_trimmed=%t signed_at=%s signature_method=HmacSHA256 signature_version=V2.0",
+			maskedAK, len(c.accessKey), len(c.secretKey), c.accessKey == strings.TrimSpace(c.accessKey), c.secretKey == strings.TrimSpace(c.secretKey), len(c.poolID), c.poolID == strings.TrimSpace(c.poolID), query.Get("Timestamp")),
+	}
+	outcome, status := "transport_error", 0
+	defer func() { trace.log(method, path, outcome, status) }()
+	ctx = context.WithValue(req.Context(), mobileCloudMaterialTraceKey{}, trace)
+	req = req.WithContext(httptrace.WithClientTrace(ctx, trace.clientTrace()))
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return mobileCloudMaterialConnectionError(err, tlsHandshakeFailed.Load())
+		trace.mu.Lock()
+		tlsHandshakeFailed := trace.tls == "error" || trace.proxyTLS == "error"
+		trace.mu.Unlock()
+		return mobileCloudMaterialConnectionError(err, tlsHandshakeFailed)
 	}
 	defer resp.Body.Close()
+	status = resp.StatusCode
 	const maxResponseBytes = 4 << 20
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
+		outcome = "response_read_error"
 		if errors.Is(err, context.Canceled) {
 			return fmt.Errorf("mobile cloud material response canceled: %w", context.Canceled)
 		}
@@ -258,6 +428,7 @@ func (c *MobileCloudMaterialClient) request(ctx context.Context, method, path st
 		}
 		return errors.New("mobile cloud material upstream response could not be read")
 	}
+	outcome = "invalid_response"
 	if len(data) > maxResponseBytes {
 		return errors.New("mobile cloud material upstream response exceeds size limit")
 	}
@@ -269,6 +440,7 @@ func (c *MobileCloudMaterialClient) request(ctx context.Context, method, path st
 	decodeErr := common.Unmarshal(data, &envelope)
 	httpFailed := resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices
 	if httpFailed || decodeErr == nil && envelope.State != "OK" {
+		outcome = "upstream_rejected"
 		message := "mobile cloud material upstream rejected the request"
 		if httpFailed {
 			message = fmt.Sprintf("mobile cloud material upstream HTTP status %d", resp.StatusCode)
@@ -301,6 +473,7 @@ func (c *MobileCloudMaterialClient) request(ctx context.Context, method, path st
 	if err := common.Unmarshal(envelope.Body, output); err != nil {
 		return errors.New("mobile cloud material upstream response body is invalid")
 	}
+	outcome = "completed"
 	return nil
 }
 

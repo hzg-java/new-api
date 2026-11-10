@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -10,15 +11,18 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -237,7 +241,336 @@ func TestMobileCloudMaterialConnectionFailures(t *testing.T) {
 	}
 }
 
+type mobileCloudMaterialLogBuffer struct {
+	mu sync.Mutex
+	bytes.Buffer
+}
+
+func (b *mobileCloudMaterialLogBuffer) Write(data []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.Write(data)
+}
+
+func (b *mobileCloudMaterialLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.String()
+}
+
+func captureMobileCloudMaterialLogs(t *testing.T) *mobileCloudMaterialLogBuffer {
+	t.Helper()
+	buffer := &mobileCloudMaterialLogBuffer{}
+	common.LogWriterMu.Lock()
+	previousWriter, previousErrorWriter := gin.DefaultWriter, gin.DefaultErrorWriter
+	gin.DefaultWriter, gin.DefaultErrorWriter = buffer, buffer
+	common.LogWriterMu.Unlock()
+	t.Cleanup(func() {
+		common.LogWriterMu.Lock()
+		gin.DefaultWriter, gin.DefaultErrorWriter = previousWriter, previousErrorWriter
+		common.LogWriterMu.Unlock()
+	})
+	return buffer
+}
+
+func TestMobileCloudMaterialStageDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		stage    string
+		cause    error
+		response *http.Response
+		expected []string
+	}{
+		{
+			name: "DNS failure", stage: "dns", cause: &net.DNSError{Err: "test-ak Signature=secret-signature", Name: "private.example"},
+			expected: []string{"outcome=transport_error", "dns=error", "upstream_tls=not_started", "request_write=not_started", "first_byte_after_ms=-1", "http_status=0"},
+		},
+		{
+			name: "TCP failure", stage: "tcp", cause: &net.OpError{Op: "dial", Err: errors.New("proxy-password private.example")},
+			expected: []string{"outcome=transport_error", "dns=ok", "tcp=error", "peer_ip=unknown", "upstream_tls=not_started", "request_write=not_started"},
+		},
+		{
+			name: "TLS EOF", stage: "tls", cause: io.EOF,
+			expected: []string{"outcome=transport_error", "dns=ok", "tcp=ok", "peer_ip=192.0.2.10", "upstream_tls=error", "request_write=not_started", "first_byte_after_ms=-1"},
+		},
+		{
+			name: "EOF after request write", stage: "write", cause: io.EOF,
+			expected: []string{"outcome=transport_error", "upstream_tls=ok", "upstream_tls_version=TLS1.3", "request_write=ok", "first_byte_after_ms=-1"},
+		},
+		{
+			name: "write failure", stage: "write", cause: errors.New("test-ak test-sk private-token"),
+			expected: []string{"outcome=transport_error", "upstream_tls=ok", "request_write=error", "first_byte_after_ms=-1"},
+		},
+		{
+			name: "body failure", stage: "response",
+			response: &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(mobileCloudMaterialReadError{errors.New("test-sk private-token")})},
+			expected: []string{"outcome=response_read_error", "upstream_tls=ok", "request_write=ok", "http_status=200"},
+		},
+		{
+			name: "upstream rejection", stage: "response",
+			response: &http.Response{StatusCode: http.StatusForbidden, Body: io.NopCloser(strings.NewReader(`{"state":"ERROR","errorMessage":"test-ak test-sk private-token"}`))},
+			expected: []string{"outcome=upstream_rejected", "http_status=403"},
+		},
+		{
+			name: "canceled", cause: context.Canceled,
+			expected: []string{"outcome=transport_error", "dns=not_started", "tcp=not_started", "upstream_tls=not_started", "request_write=not_started"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buffer := captureMobileCloudMaterialLogs(t)
+			client, err := NewMobileCloudMaterialClient("https://private.example", "test-ak", "test-sk", "test-pool")
+			require.NoError(t, err)
+			calls := 0
+			client.httpClient.Transport = mobileCloudMaterialRoundTripper(func(r *http.Request) (*http.Response, error) {
+				calls++
+				trace := httptrace.ContextClientTrace(r.Context())
+				require.NotNil(t, trace)
+				if trace.DNSStart != nil && tc.stage != "" {
+					trace.DNSStart(httptrace.DNSStartInfo{Host: "private.example"})
+				}
+				if trace.DNSDone != nil && tc.stage != "" {
+					var dnsErr error
+					if tc.stage == "dns" {
+						dnsErr = tc.cause
+					}
+					trace.DNSDone(httptrace.DNSDoneInfo{Addrs: []net.IPAddr{{IP: net.ParseIP("192.0.2.10")}}, Err: dnsErr})
+				}
+				if tc.stage == "tcp" || tc.stage == "tls" || tc.stage == "write" || tc.stage == "response" {
+					if trace.ConnectStart != nil {
+						trace.ConnectStart("tcp", "192.0.2.10:443")
+					}
+					if trace.ConnectDone != nil {
+						var connectErr error
+						if tc.stage == "tcp" {
+							connectErr = tc.cause
+						}
+						trace.ConnectDone("tcp", "192.0.2.10:443", connectErr)
+					}
+				}
+				if tc.stage == "tls" || tc.stage == "write" || tc.stage == "response" {
+					if trace.TLSHandshakeStart != nil {
+						trace.TLSHandshakeStart()
+					}
+					var tlsErr error
+					if tc.stage == "tls" {
+						tlsErr = tc.cause
+					}
+					trace.TLSHandshakeDone(tls.ConnectionState{Version: tls.VersionTLS13}, tlsErr)
+				}
+				if trace.WroteRequest != nil && (tc.stage == "write" || tc.stage == "response") {
+					var writeErr error
+					if tc.name == "write failure" {
+						writeErr = tc.cause
+					}
+					trace.WroteRequest(httptrace.WroteRequestInfo{Err: writeErr})
+				}
+				if trace.GotFirstResponseByte != nil && tc.stage == "response" {
+					trace.GotFirstResponseByte()
+				}
+				return tc.response, tc.cause
+			})
+			_, err = client.CreateAsset(t.Context(), MobileCloudCreateAssetInput{GroupID: "private-group-id", Name: "private-asset-name", URL: "https://source.example/private.png?token=private-token", Type: "Image"})
+			require.Error(t, err)
+			assert.Equal(t, 1, calls, "diagnostics must not replay requests")
+			logs := buffer.String()
+			assert.Equal(t, 1, strings.Count(logs, "mobile_cloud_material_request"))
+			assert.Regexp(t, `diagnostic_id=[a-f0-9]{32}`, logs)
+			assert.Contains(t, logs, `method=POST route="/asset"`)
+			assert.Regexp(t, `elapsed_ms=\d+`, logs)
+			for _, expected := range tc.expected {
+				assert.Contains(t, logs, expected)
+			}
+			if tc.stage == "response" {
+				assert.Regexp(t, `first_byte_after_ms=\d+`, logs)
+			}
+			for _, private := range []string{"test-ak", "test-sk", "test-pool", "Signature", "secret-signature", "private-token", "private.example", "source.example", "private-group-id", "private-asset-name"} {
+				assert.NotContains(t, logs, private)
+			}
+		})
+	}
+}
+
+func TestMobileCloudMaterialCredentialDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name, accessKey, secretKey, poolID, masked string
+		trimmed                                    bool
+	}{
+		{"configured credentials", "private-access-key-4321", "private-secret-key-8765", "private-pool", "********4321", true},
+		{"short credentials", "ak-1", "sk-2", "pl-3", "********", true},
+		{"outer whitespace", " private-access-key-4321 ", " private-secret-key-8765 ", " private-pool ", "********321 ", false},
+		{"control characters", "private-access-key-\r\n\t", "private-secret-key-\r\n\t", "private-pool", "********-\r\n\t", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buffer := captureMobileCloudMaterialLogs(t)
+			t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY", "private-encryption-master-key")
+			client, err := NewMobileCloudMaterialClient("https://private.example", tc.accessKey, tc.secretKey, tc.poolID)
+			require.NoError(t, err)
+			client.now = func() time.Time { return time.Date(2026, 11, 10, 3, 4, 5, 0, time.UTC) }
+			client.httpClient.Transport = mobileCloudMaterialRoundTripper(func(*http.Request) (*http.Response, error) { return nil, io.EOF })
+			_, err = client.CreateAssetGroup(t.Context(), "private-group", nil)
+			require.Error(t, err)
+			logs := buffer.String()
+			assert.Contains(t, logs, fmt.Sprintf("ak_masked=%q", tc.masked))
+			assert.Contains(t, logs, fmt.Sprintf("ak_bytes=%d sk_bytes=%d", len(tc.accessKey), len(tc.secretKey)))
+			assert.Contains(t, logs, fmt.Sprintf("ak_trimmed=%t sk_trimmed=%t", tc.trimmed, tc.trimmed))
+			assert.Contains(t, logs, fmt.Sprintf("pool_bytes=%d pool_trimmed=%t", len(tc.poolID), tc.poolID == strings.TrimSpace(tc.poolID)))
+			assert.Contains(t, logs, "signed_at=2026-11-10T11:04:05Z signature_method=HmacSHA256 signature_version=V2.0")
+			assert.Equal(t, 1, strings.Count(logs, "\n"), "credential fragments must not inject log entries")
+			for _, secret := range []string{tc.accessKey, tc.secretKey, tc.poolID, "private-encryption-master-key", "private.example", "private-group", "Signature="} {
+				assert.NotContains(t, logs, secret)
+			}
+		})
+	}
+}
+
+func TestMobileCloudMaterialStageDiagnosticsSuccess(t *testing.T) {
+	buffer := captureMobileCloudMaterialLogs(t)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"state":"OK","body":{"assetId":"private-asset-id","assetUrl":"https://private.example/result?token=response-secret"}}`)
+	}))
+	defer server.Close()
+	client, err := NewMobileCloudMaterialClient(server.URL, "test-ak", "test-sk", "test-pool")
+	require.NoError(t, err)
+	transport := client.httpClient.Transport.(*http.Transport)
+	transport.TLSClientConfig.RootCAs = server.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
+	for range 2 {
+		asset, err := client.GetAsset(t.Context(), "private-asset-id")
+		require.NoError(t, err)
+		assert.Equal(t, "private-asset-id", asset.ID)
+	}
+	logs := buffer.String()
+	assert.Equal(t, 2, strings.Count(logs, "mobile_cloud_material_request"))
+	assert.Contains(t, logs, `method=GET route="/asset/:id"`)
+	assert.Contains(t, logs, "proxy=direct")
+	assert.Contains(t, logs, "tcp=ok")
+	assert.Contains(t, logs, "peer_ip=127.0.0.1")
+	assert.Contains(t, logs, "upstream_tls=ok")
+	assert.Contains(t, logs, "request_write=ok")
+	assert.Contains(t, logs, "http_status=200")
+	assert.Contains(t, logs, "outcome=completed")
+	assert.Regexp(t, `upstream_tls_done_after_ms=\d+`, logs)
+	assert.Regexp(t, `write_done_after_ms=\d+`, logs)
+	assert.Regexp(t, `first_byte_after_ms=\d+`, logs)
+	ids := make(map[string]bool)
+	for _, field := range strings.Fields(logs) {
+		if strings.HasPrefix(field, "diagnostic_id=") {
+			assert.False(t, ids[field], "each request must have a distinct diagnostic ID")
+			ids[field] = true
+		}
+	}
+	assert.Len(t, ids, 2)
+	for _, private := range []string{"test-ak", "test-sk", "test-pool", "Signature", "private-asset-id", "private.example", "response-secret"} {
+		assert.NotContains(t, logs, private)
+	}
+}
+
+func TestMobileCloudMaterialStageDiagnosticsProxySelection(t *testing.T) {
+	for _, tc := range []struct {
+		name, expectedProxy, expectedAddress string
+		useProxy, proxyError                 bool
+	}{
+		{name: "direct", expectedProxy: "direct", expectedAddress: "private.example:443"},
+		{name: "proxy", expectedProxy: "enabled", expectedAddress: "proxy.example:8080", useProxy: true},
+		{name: "proxy selection error", expectedProxy: "error", proxyError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buffer := captureMobileCloudMaterialLogs(t)
+			previous := http.DefaultTransport
+			base := previous.(*http.Transport).Clone()
+			base.Proxy = func(*http.Request) (*url.URL, error) {
+				if tc.proxyError {
+					return nil, errors.New("proxy-password Signature=proxy-secret")
+				}
+				if tc.useProxy {
+					return &url.URL{Scheme: "http", Host: "proxy.example:8080", User: url.UserPassword("proxy-user", "proxy-password")}, nil
+				}
+				return nil, nil
+			}
+			http.DefaultTransport = base
+			t.Cleanup(func() { http.DefaultTransport = previous })
+			client, err := NewMobileCloudMaterialClient("https://private.example", "test-ak", "test-sk", "test-pool")
+			require.NoError(t, err)
+			var dialAddress string
+			client.httpClient.Transport.(*http.Transport).DialContext = func(_ context.Context, _, addr string) (net.Conn, error) {
+				dialAddress = addr
+				return nil, errors.New("test-ak test-sk proxy-password")
+			}
+			_, err = client.CreateAssetGroup(t.Context(), "private-group-name", nil)
+			require.Error(t, err)
+			assert.Equal(t, tc.expectedAddress, dialAddress)
+			logs := buffer.String()
+			assert.Contains(t, logs, "proxy="+tc.expectedProxy+" ")
+			for _, private := range []string{"private.example", "proxy.example", "proxy-user", "proxy-password", "proxy-secret", "test-ak", "test-sk", "test-pool", "Signature", "private-group-name"} {
+				assert.NotContains(t, logs, private)
+			}
+		})
+	}
+}
+
+func TestMobileCloudMaterialStageDiagnosticsHTTPSProxy(t *testing.T) {
+	buffer := captureMobileCloudMaterialLogs(t)
+	proxy := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodConnect, r.Method)
+		w.WriteHeader(http.StatusProxyAuthRequired)
+	}))
+	defer proxy.Close()
+	proxyURL, err := url.Parse(proxy.URL)
+	require.NoError(t, err)
+	proxyURL.User = url.UserPassword("proxy-user", "proxy-password")
+	previous := http.DefaultTransport
+	base := previous.(*http.Transport).Clone()
+	base.Proxy = http.ProxyURL(proxyURL)
+	http.DefaultTransport = base
+	t.Cleanup(func() { http.DefaultTransport = previous })
+	client, err := NewMobileCloudMaterialClient("https://private.example", "test-ak", "test-sk", "test-pool")
+	require.NoError(t, err)
+	client.httpClient.Transport.(*http.Transport).TLSClientConfig.RootCAs = proxy.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
+	_, err = client.CreateAssetGroup(t.Context(), "private-name", nil)
+	require.Error(t, err)
+	logs := buffer.String()
+	assert.Contains(t, logs, "proxy=enabled proxy_connect_status=407")
+	assert.Contains(t, logs, "peer_role=proxy")
+	assert.Contains(t, logs, "proxy_tls=ok")
+	assert.Contains(t, logs, "upstream_tls=not_started")
+	assert.Contains(t, logs, "request_write=not_started")
+	for _, private := range []string{"proxy-user", "proxy-password", "private.example", "private-name", "test-ak", "test-sk", "test-pool", "Signature"} {
+		assert.NotContains(t, logs, private)
+	}
+}
+
+func TestMobileCloudMaterialStageDiagnosticsLateCallbacks(t *testing.T) {
+	buffer := captureMobileCloudMaterialLogs(t)
+	client, err := NewMobileCloudMaterialClient("https://private.example", "test-ak", "test-sk", "test-pool")
+	require.NoError(t, err)
+	release, finished := make(chan struct{}), make(chan struct{})
+	client.httpClient.Transport = mobileCloudMaterialRoundTripper(func(r *http.Request) (*http.Response, error) {
+		trace := httptrace.ContextClientTrace(r.Context())
+		trace.DNSStart(httptrace.DNSStartInfo{Host: "private.example"})
+		go func() {
+			defer close(finished)
+			<-release
+			trace.DNSDone(httptrace.DNSDoneInfo{Err: errors.New("test-ak test-sk private-token")})
+			trace.ConnectDone("tcp", "192.0.2.10:443", nil)
+			trace.WroteRequest(httptrace.WroteRequestInfo{Err: errors.New("Signature=private-signature")})
+		}()
+		return nil, context.Canceled
+	})
+	_, err = client.GetAsset(t.Context(), "private-asset-id")
+	assert.ErrorIs(t, err, context.Canceled)
+	before := buffer.String()
+	close(release)
+	<-finished
+	assert.Equal(t, before, buffer.String(), "late callbacks must not emit another or credential-bearing log")
+	assert.Equal(t, 1, strings.Count(before, "mobile_cloud_material_request"))
+	assert.Contains(t, before, "dns=started")
+	assert.Contains(t, before, "dns_done_after_ms=-1")
+	for _, private := range []string{"test-ak", "test-sk", "test-pool", "private-token", "Signature", "private-signature", "private.example", "private-asset-id"} {
+		assert.NotContains(t, before, private)
+	}
+}
+
 func TestMobileCloudMaterialTLSHandshakeFailure(t *testing.T) {
+	buffer := captureMobileCloudMaterialLogs(t)
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Error("an incompatible TLS handshake must not send the material request")
 	}))
@@ -249,9 +582,13 @@ func TestMobileCloudMaterialTLSHandshakeFailure(t *testing.T) {
 	client.httpClient.Transport.(*http.Transport).TLSClientConfig.MaxVersion = tls.VersionTLS12
 	_, err = client.CreateAssetGroup(t.Context(), "group", nil)
 	assert.EqualError(t, err, "mobile cloud material upstream connection failed: TLS handshake failed")
+	assert.Contains(t, buffer.String(), "upstream_tls=error")
+	assert.Contains(t, buffer.String(), "request_write=not_started")
+	assert.Contains(t, buffer.String(), "first_byte_after_ms=-1")
 }
 
 func TestMobileCloudMaterialProxyRejection(t *testing.T) {
+	buffer := captureMobileCloudMaterialLogs(t)
 	calls := 0
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -270,52 +607,96 @@ func TestMobileCloudMaterialProxyRejection(t *testing.T) {
 	assert.Equal(t, 1, calls)
 	assert.NotContains(t, err.Error(), proxy.URL)
 	assert.NotContains(t, err.Error(), "proxy-password")
+	logs := buffer.String()
+	assert.Contains(t, logs, "proxy=enabled proxy_connect_status=407")
+	assert.Contains(t, logs, "upstream_tls=not_started")
+	assert.Contains(t, logs, "request_write=not_started")
+	for _, private := range []string{"proxy-user", "proxy-password", proxy.URL, "test-ak", "test-sk", "test-pool", "Signature", "private.example"} {
+		assert.NotContains(t, logs, private)
+	}
 }
 
 func TestMobileCloudMaterialProxyTunnel(t *testing.T) {
-	upstreamCalls := 0
-	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamCalls++
-		assert.Empty(t, r.Header.Get("Proxy-Authorization"))
-		assert.Equal(t, "test-ak", r.URL.Query().Get("AccessKey"))
-		_, _ = io.WriteString(w, `{"state":"OK","body":{"groupId":"group-1","groupName":"group","groupType":"AIGC"}}`)
-	}))
-	defer upstream.Close()
-	proxyCalls := 0
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		proxyCalls++
-		assert.Equal(t, http.MethodConnect, r.Method)
-		target, err := net.Dial("tcp", upstream.Listener.Addr().String())
-		require.NoError(t, err)
-		defer target.Close()
-		conn, _, err := w.(http.Hijacker).Hijack()
-		require.NoError(t, err)
-		defer conn.Close()
-		_, err = io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
-		require.NoError(t, err)
-		done := make(chan struct{})
-		go func() {
-			_, _ = io.Copy(target, conn)
-			_ = target.Close()
-			close(done)
-		}()
-		_, _ = io.Copy(conn, target)
-		_ = conn.Close()
-		<-done
-	}))
-	defer proxy.Close()
-	client, err := NewMobileCloudMaterialClient(upstream.URL, "test-ak", "test-sk", "test-pool")
-	require.NoError(t, err)
-	proxyURL, err := url.Parse(proxy.URL)
-	require.NoError(t, err)
-	transport := client.httpClient.Transport.(*http.Transport)
-	transport.Proxy = http.ProxyURL(proxyURL)
-	transport.TLSClientConfig.RootCAs = upstream.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
-	group, err := client.CreateAssetGroup(t.Context(), "group", nil)
-	require.NoError(t, err)
-	assert.Equal(t, "group-1", group.ID)
-	assert.Equal(t, 1, proxyCalls)
-	assert.Equal(t, 1, upstreamCalls)
+	for _, scheme := range []string{"http", "https"} {
+		t.Run(scheme, func(t *testing.T) {
+			buffer := captureMobileCloudMaterialLogs(t)
+			upstreamCalls := 0
+			upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamCalls++
+				assert.Empty(t, r.Header.Get("Proxy-Authorization"))
+				assert.Equal(t, "test-ak", r.URL.Query().Get("AccessKey"))
+				_, _ = io.WriteString(w, `{"state":"OK","body":{"groupId":"group-1","groupName":"group","groupType":"AIGC"}}`)
+			}))
+			upstream.TLS = &tls.Config{MinVersion: tls.VersionTLS13}
+			upstream.StartTLS()
+			defer upstream.Close()
+			proxyCalls := 0
+			proxy := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				proxyCalls++
+				assert.Equal(t, http.MethodConnect, r.Method)
+				target, err := net.Dial("tcp", upstream.Listener.Addr().String())
+				require.NoError(t, err)
+				defer target.Close()
+				conn, _, err := w.(http.Hijacker).Hijack()
+				require.NoError(t, err)
+				defer conn.Close()
+				_, err = io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
+				require.NoError(t, err)
+				done := make(chan struct{})
+				go func() {
+					_, _ = io.Copy(target, conn)
+					_ = target.Close()
+					close(done)
+				}()
+				_, _ = io.Copy(conn, target)
+				_ = conn.Close()
+				<-done
+			}))
+			if scheme == "https" {
+				proxy.TLS = &tls.Config{MaxVersion: tls.VersionTLS12}
+				proxy.StartTLS()
+			} else {
+				proxy.Start()
+			}
+			defer proxy.Close()
+			proxyURL, err := url.Parse(proxy.URL)
+			require.NoError(t, err)
+			proxyURL.User = url.UserPassword("proxy-user", "proxy-password")
+			previous := http.DefaultTransport
+			base := previous.(*http.Transport).Clone()
+			base.Proxy = http.ProxyURL(proxyURL)
+			http.DefaultTransport = base
+			t.Cleanup(func() { http.DefaultTransport = previous })
+			client, err := NewMobileCloudMaterialClient(upstream.URL, "test-ak", "test-sk", "test-pool")
+			require.NoError(t, err)
+			roots := x509.NewCertPool()
+			roots.AddCert(upstream.Certificate())
+			if scheme == "https" {
+				roots.AddCert(proxy.Certificate())
+			}
+			client.httpClient.Transport.(*http.Transport).TLSClientConfig.RootCAs = roots
+			group, err := client.CreateAssetGroup(t.Context(), "group", nil)
+			require.NoError(t, err)
+			assert.Equal(t, "group-1", group.ID)
+			assert.Equal(t, 1, proxyCalls)
+			assert.Equal(t, 1, upstreamCalls)
+			logs := buffer.String()
+			assert.Contains(t, logs, "proxy=enabled proxy_connect_status=200")
+			assert.Contains(t, logs, "peer_role=proxy")
+			assert.Contains(t, logs, "upstream_tls=ok")
+			assert.Contains(t, logs, "upstream_tls_version=TLS1.3")
+			if scheme == "https" {
+				assert.Contains(t, logs, "proxy_tls=ok")
+				assert.Contains(t, logs, "proxy_tls_version=TLS1.2")
+			} else {
+				assert.Contains(t, logs, "proxy_tls=not_started")
+			}
+			assert.Contains(t, logs, "outcome=completed")
+			for _, private := range []string{"proxy-user", "proxy-password", "test-ak", "test-sk", "test-pool", "Signature", "group-1"} {
+				assert.NotContains(t, logs, private)
+			}
+		})
+	}
 }
 
 func TestMobileCloudMaterialFailureReason(t *testing.T) {
@@ -405,6 +786,7 @@ func TestMobileCloudMaterialResponseSizeBoundary(t *testing.T) {
 }
 
 func TestMobileCloudMaterialMutationTransport(t *testing.T) {
+	buffer := captureMobileCloudMaterialLogs(t)
 	var protocols []string
 	var connections []string
 	calls := 0
@@ -442,6 +824,13 @@ func TestMobileCloudMaterialMutationTransport(t *testing.T) {
 	require.Len(t, connections, 2)
 	assert.NotEqual(t, connections[0], connections[1], "mutations must not reuse a connection that can be replayed")
 	assert.Equal(t, []string{"HTTP/1.1", "HTTP/1.1"}, protocols)
+	lines := strings.Split(strings.TrimSpace(buffer.String()), "\n")
+	require.Len(t, lines, 2)
+	assert.Contains(t, lines[1], "outcome=transport_error")
+	assert.Contains(t, lines[1], "upstream_tls=ok")
+	assert.Contains(t, lines[1], "request_write=ok")
+	assert.Contains(t, lines[1], "first_byte_after_ms=-1")
+	assert.Contains(t, lines[1], "http_status=0")
 }
 
 func TestMobileCloudMaterialMalformedResults(t *testing.T) {

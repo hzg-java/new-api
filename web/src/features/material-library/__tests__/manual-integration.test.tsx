@@ -165,6 +165,40 @@ it('fails an offline execution immediately without queuing it for reconnection',
   expect(screen.getByRole('button', { name: 'Execute' })).toBeEnabled()
 })
 
+it.each([true, false])(
+  'shows and copies diagnostic_id for an upstream result with success=%s',
+  async (success) => {
+    const user = userEvent.setup()
+    const writeText = vi
+      .spyOn(navigator.clipboard, 'writeText')
+      .mockResolvedValue()
+    const diagnosticId = '0123456789abcdef0123456789abcdef'
+    vi.mocked(api.post).mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          diagnostic_id: diagnosticId,
+          provider: 'mobile_cloud',
+          channel_id: 42,
+          channel_name: 'Saved channel',
+          operation: 'list_groups',
+          success,
+          elapsed_ms: 4,
+          message: success ? undefined : 'Connection closed before response',
+        },
+      },
+    })
+    renderTest()
+    await user.click(screen.getByRole('button', { name: 'Execute' }))
+    expect(await screen.findByText(diagnosticId)).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Copy Diagnostic ID' }))
+    expect(writeText).toHaveBeenLastCalledWith(diagnosticId)
+    await user.clear(screen.getByLabelText('pageNo'))
+    expect(screen.queryByText(diagnosticId)).not.toBeInTheDocument()
+    expect(api.post).toHaveBeenCalledTimes(1)
+  }
+)
+
 it('offers ten manual operations without credentials, automatic calls or legacy query buttons', async () => {
   renderTest()
   expect(

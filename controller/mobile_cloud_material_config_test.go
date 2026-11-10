@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -17,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -545,6 +547,16 @@ func TestMobileCloudMaterialConfig(t *testing.T) {
 }
 
 func TestMaterialIntegrationQueryTests(t *testing.T) {
+	var logs bytes.Buffer
+	common.LogWriterMu.Lock()
+	previousWriter := gin.DefaultWriter
+	gin.DefaultWriter = &logs
+	common.LogWriterMu.Unlock()
+	t.Cleanup(func() {
+		common.LogWriterMu.Lock()
+		gin.DefaultWriter = previousWriter
+		common.LogWriterMu.Unlock()
+	})
 	db, users := setupAdminMaterialPostgres(t)
 	t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
 	require.NoError(t, db.Where("key IN ?", []string{model.MobileCloudMaterialConfigOption, model.TopenRouterMaterialConfigOption}).Delete(&model.Option{}).Error)
@@ -552,6 +564,12 @@ func TestMaterialIntegrationQueryTests(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		assert.Equal(t, http.MethodPost, r.Method)
+		if mode == "EOF" {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			require.NoError(t, err)
+			_ = conn.Close()
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		if mode == "failure" {
 			w.WriteHeader(http.StatusForbidden)
@@ -610,18 +628,28 @@ func TestMaterialIntegrationQueryTests(t *testing.T) {
 	require.NoError(t, service.SaveTopenRouterMaterialConfiguration(service.TopenRouterMaterialConfiguration{ChannelID: channels[1].Id, Endpoint: server.URL, Token: "test-token"}))
 	var before []model.Option
 	require.NoError(t, db.Where("key IN ?", []string{model.MobileCloudMaterialConfigOption, model.TopenRouterMaterialConfigOption}).Order("key").Find(&before).Error)
+	diagnosticIDs := make(map[string]bool)
 	for index, provider := range []string{"mobile-cloud", "topenrouter"} {
 		path := "/api/material/" + provider + "/test"
 		for _, operation := range []string{"list_groups", "list_assets"} {
 			previousCalls := calls
+			logs.Reset()
 			response := requestAdminMaterial(t, router, &users[0], http.MethodPost, path, fmt.Sprintf(`{"operation":%q,"parameters":{"pageNo":1,"pageSize":1%s}}`, operation, map[string]string{"mobile-cloud": `,"groupType":"AIGC"`}[provider]), http.StatusOK, true)
 			var result struct {
-				ChannelID int    `json:"channel_id"`
-				Success   bool   `json:"success"`
-				Operation string `json:"operation"`
-				Total     *int64 `json:"total"`
+				DiagnosticID string `json:"diagnostic_id"`
+				ChannelID    int    `json:"channel_id"`
+				Success      bool   `json:"success"`
+				Operation    string `json:"operation"`
+				Total        *int64 `json:"total"`
 			}
 			require.NoError(t, common.Unmarshal(response.Data, &result))
+			require.Regexp(t, `^[a-f0-9]{32}$`, result.DiagnosticID)
+			assert.False(t, diagnosticIDs[result.DiagnosticID])
+			diagnosticIDs[result.DiagnosticID] = true
+			assert.Contains(t, logs.String(), "material_integration_test diagnostic_id="+result.DiagnosticID+" ")
+			if provider == "mobile-cloud" {
+				assert.Contains(t, logs.String(), "mobile_cloud_material_request diagnostic_id="+result.DiagnosticID+" ")
+			}
 			assert.True(t, result.Success)
 			assert.Equal(t, channels[index].Id, result.ChannelID)
 			assert.Equal(t, operation, result.Operation)
@@ -633,13 +661,21 @@ func TestMaterialIntegrationQueryTests(t *testing.T) {
 			}
 		}
 		previousCalls := calls
-		for _, body := range []string{`{}`, `{"operation":"create_group"}`, `{"operation":"delete_asset"}`, `{"operation":"list_groups"} {}`, `{"operation":"list_groups","endpoint":"https://other.example","token":"injected"}`} {
+		for _, body := range []string{`{}`, `{"operation":"create_group"}`, `{"operation":"delete_asset"}`, `{"operation":"list_groups"} {}`, `{"operation":"list_groups","endpoint":"https://other.example","token":"injected"}`, `{"operation":"list_groups","parameters":{"pageNo":1,"pageSize":1},"diagnostic_id":"client-supplied"}`} {
 			requestAdminMaterial(t, router, &users[0], http.MethodPost, path, body, http.StatusBadRequest, false)
 		}
 		assert.Equal(t, previousCalls, calls)
 	}
 	mode = "failure"
+	logs.Reset()
 	response := requestAdminMaterial(t, router, &users[0], http.MethodPost, "/api/material/mobile-cloud/test", `{"operation":"list_groups","parameters":{"pageNo":1,"pageSize":1}}`, http.StatusOK, true)
+	var failedResult struct {
+		DiagnosticID string `json:"diagnostic_id"`
+	}
+	require.NoError(t, common.Unmarshal(response.Data, &failedResult))
+	require.Regexp(t, `^[a-f0-9]{32}$`, failedResult.DiagnosticID)
+	assert.Contains(t, logs.String(), "mobile_cloud_material_request diagnostic_id="+failedResult.DiagnosticID+" ")
+	assert.Contains(t, logs.String(), "material_integration_test diagnostic_id="+failedResult.DiagnosticID+" ")
 	assert.Contains(t, string(response.Data), "Invalid signature")
 	assert.Contains(t, string(response.Data), `"success":false`)
 	for _, secret := range []string{"private.example", "private-signature", "private-token", "test-ak", "test-sk"} {
@@ -651,6 +687,16 @@ func TestMaterialIntegrationQueryTests(t *testing.T) {
 	for _, secret := range []string{"test-token", "private.example", "private-signature"} {
 		assert.NotContains(t, string(response.Data), secret)
 	}
+	mode = "EOF"
+	logs.Reset()
+	previousCalls := calls
+	response = requestAdminMaterial(t, router, &users[0], http.MethodPost, "/api/material/mobile-cloud/test", `{"operation":"list_groups","parameters":{"pageNo":1,"pageSize":1}}`, http.StatusOK, true)
+	require.NoError(t, common.Unmarshal(response.Data, &failedResult))
+	require.Regexp(t, `^[a-f0-9]{32}$`, failedResult.DiagnosticID)
+	assert.Contains(t, string(response.Data), `"success":false`)
+	assert.Contains(t, logs.String(), "mobile_cloud_material_request diagnostic_id="+failedResult.DiagnosticID+" ")
+	assert.Contains(t, logs.String(), "material_integration_test diagnostic_id="+failedResult.DiagnosticID+" ")
+	assert.Equal(t, previousCalls+1, calls, "diagnostic IDs must not cause retries")
 	mode = "secret"
 	response = requestAdminMaterial(t, router, &users[0], http.MethodPost, "/api/material/mobile-cloud/test", `{"operation":"list_assets","parameters":{"pageNo":1,"pageSize":1,"groupType":"AIGC"}}`, http.StatusOK, true)
 	for _, secret := range []string{"private-signature", "test-ak", "test-sk", "test-pool"} {
@@ -661,7 +707,7 @@ func TestMaterialIntegrationQueryTests(t *testing.T) {
 	assert.Contains(t, string(response.Data), "Invalid signature")
 	assert.NotContains(t, string(response.Data), "private-signature")
 	assert.NotContains(t, string(response.Data), "https://[bad")
-	previousCalls := calls
+	previousCalls = calls
 	for _, provider := range []string{"mobile-cloud", "topenrouter"} {
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()

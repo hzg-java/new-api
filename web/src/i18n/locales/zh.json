@@ -1876,6 +1876,7 @@
     "Deterministic sampling seed (best-effort)": "尽量保证可复现的采样种子",
     "Developer Friendly": "开发者友好",
     "Device Type Preference": "设备类型偏好",
+    "Diagnostic ID": "诊断 ID",
     "Dify": "Dify",
     "Dify channels only support chatflow and agent, and agent does not support images": "Dify 渠道仅支持 chatflow 和 agent，agent 不支持图像",
     "Digest:": "摘要：",

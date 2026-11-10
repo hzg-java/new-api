@@ -261,6 +261,7 @@ export type MaterialTestRequest = {
 }
 
 export type MaterialTestResult = {
+  diagnostic_id: string
   provider: MaterialIntegrationProvider
   channel_id: number
   channel_name: string

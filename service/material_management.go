@@ -32,16 +32,19 @@ type MaterialChannel struct {
 	Client      MaterialManagementProvider
 }
 
+type materialDiagnosticIDKey struct{}
+
 type MaterialIntegrationTestResult struct {
-	Provider    string `json:"provider"`
-	ChannelID   int    `json:"channel_id"`
-	ChannelName string `json:"channel_name"`
-	Operation   string `json:"operation"`
-	Success     bool   `json:"success"`
-	ElapsedMS   int64  `json:"elapsed_ms"`
-	Total       *int64 `json:"total,omitempty"`
-	Message     string `json:"message,omitempty"`
-	Response    any    `json:"response,omitempty"`
+	DiagnosticID string `json:"diagnostic_id"`
+	Provider     string `json:"provider"`
+	ChannelID    int    `json:"channel_id"`
+	ChannelName  string `json:"channel_name"`
+	Operation    string `json:"operation"`
+	Success      bool   `json:"success"`
+	ElapsedMS    int64  `json:"elapsed_ms"`
+	Total        *int64 `json:"total,omitempty"`
+	Message      string `json:"message,omitempty"`
+	Response     any    `json:"response,omitempty"`
 }
 
 type MaterialIntegrationTestParameters struct {
@@ -246,7 +249,11 @@ func TestMaterialIntegration(ctx context.Context, provider string, input Materia
 		}
 		secrets = []string{config.Token}
 	}
-	result := &MaterialIntegrationTestResult{Provider: target.Provider, ChannelID: target.ChannelID, ChannelName: target.ChannelName, Operation: input.Operation}
+	result := &MaterialIntegrationTestResult{DiagnosticID: common.GetUUID(), Provider: target.Provider, ChannelID: target.ChannelID, ChannelName: target.ChannelName, Operation: input.Operation}
+	ctx = context.WithValue(ctx, materialDiagnosticIDKey{}, result.DiagnosticID)
+	defer func() {
+		common.SysLog(fmt.Sprintf("material_integration_test diagnostic_id=%s provider=%s channel_id=%d operation=%s success=%t elapsed_ms=%d", result.DiagnosticID, result.Provider, result.ChannelID, result.Operation, result.Success, result.ElapsedMS))
+	}()
 	started := time.Now()
 	p := input.Parameters
 	var response any

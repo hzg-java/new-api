@@ -81,6 +81,12 @@ export function MaterialTestResultView(props: {
                       })}
                     </p>
                   )}
+                  {result.diagnostic_id && (
+                    <CopyableMaterialValue
+                      label={t('Diagnostic ID')}
+                      value={result.diagnostic_id}
+                    />
+                  )}
                   {result.message && (
                     <p>{getServerErrorMessage({ message: result.message })}</p>
                   )}

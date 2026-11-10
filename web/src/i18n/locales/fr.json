@@ -1876,6 +1876,7 @@
     "Deterministic sampling seed (best-effort)": "Graine d'échantillonnage déterministe (meilleur effort)",
     "Developer Friendly": "Convivial pour les développeurs",
     "Device Type Preference": "Préférence de type d'appareil",
+    "Diagnostic ID": "ID de diagnostic",
     "Dify": "Dify",
     "Dify channels only support chatflow and agent, and agent does not support images": "Les canaux Dify ne prennent en charge que les chatflow et les agents, et les agents ne prennent pas en charge les images",
     "Digest:": "Digest :",
