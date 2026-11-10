@@ -368,19 +368,19 @@ func runVideoSubmission(parent context.Context, task *model.Task, plugin *plugin
 }
 
 func failVideoSubmission(ctx context.Context, task *model.Task, owner string, taskErr *dto.TaskError) error {
-	message := taskErr.Message
-	if taskErr.Code != "material_preparation_failed" {
-		message = kittypes.NewError(errors.New("Video task submission failed"), kittypes.ErrorCodeBadResponse, kittypes.ErrOptionWithUpstreamResponse(kittypes.OpenAIError{Message: message})).ToOpenAIRelayError().Message
+	reason := kittypes.NewError(errors.New("Video task submission failed"), kittypes.ErrorCodeBadResponse, kittypes.ErrOptionWithUpstreamResponse(kittypes.OpenAIError{Message: taskErr.Message})).ToOpenAIRelayError().Message
+	logger.LogWarn(ctx, "video_submission task_id=%q channel_id=%d code=%q reason=%q", task.TaskID, task.ChannelId, taskErr.Code, reason)
+	message := service.VideoSubmissionFailureMessage(taskErr.Code)
+	if taskErr.StatusCode == http.StatusUnauthorized || taskErr.StatusCode == http.StatusForbidden {
+		message = service.VideoSubmissionFailureMessage("material_configuration_failed")
 	}
 	var materials []service.MaterialPreparationIssue
-	if issues, ok := taskErr.Data.([]service.MaterialPreparationIssue); ok {
-		materials = append(materials, issues...)
-		for i := range materials {
-			materials[i].Reason = kittypes.NewError(errors.New("Material preparation failed"), kittypes.ErrorCodeBadResponse, kittypes.ErrOptionWithUpstreamResponse(kittypes.OpenAIError{Message: materials[i].Reason})).ToOpenAIRelayError().Message
+	if taskErr.Code == "material_preparation_failed" {
+		if issues, ok := taskErr.Data.([]service.MaterialPreparationIssue); ok && len(issues) > 0 {
+			message, materials = service.VideoMaterialFailure(issues)
+		} else {
+			message = service.VideoSubmissionFailureMessage("material_configuration_failed")
 		}
-	}
-	if strings.TrimSpace(message) == "" {
-		message = "Video task submission failed"
 	}
 	task.Status, task.Progress, task.FailReason = model.TaskStatusFailure, "100%", message
 	task.FinishTime = common.GetTimestamp()

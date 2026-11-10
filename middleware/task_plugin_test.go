@@ -1281,6 +1281,37 @@ export const native = {error: function(ctx, error) {
 	assert.NotContains(t, recorder.Body.String(), "password")
 }
 
+func TestRespondTaskPluginErrorPreservesVideoFailureMessage(t *testing.T) {
+	plugin := compileTaskRoutePlugin(t, genericTaskPluginSource+`
+export const native = {error: function(ctx, error) { return {message: error.message, retryable: error.retryable}; }};`)
+	for _, tc := range []struct {
+		message, want string
+		noRetry       bool
+	}{
+		{"视频提交结果暂无法确认，请勿重复提交", "视频提交结果暂无法确认，请勿重复提交", true},
+		{"视频服务异常，请联系管理员", "视频服务异常，请联系管理员", true},
+		{"视频请求处理失败，请联系管理员", "视频请求处理失败，请联系管理员", true},
+		{"视频提交结果暂无法确认，请勿重复提交", "Task request failed", false},
+		{"https://private.example/?token=secret", "Task request failed", true},
+	} {
+		t.Run(tc.message, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/vendor/failure", nil)
+			c.Set(jsplugin.ContextKeyPinnedRoute, jsplugin.PinnedRoute{Plugin: plugin})
+			c.Set(jsplugin.ContextKeyRouteRequest, jsplugin.RouteRequestContext{Path: "/vendor/failure", Method: http.MethodPost})
+			require.True(t, RespondTaskPluginError(c, &dto.TaskError{Code: "do_request_failed", Message: tc.message, StatusCode: http.StatusBadGateway, NoRetry: tc.noRetry}))
+			var body struct {
+				Message   string `json:"message"`
+				Retryable bool   `json:"retryable"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &body))
+			assert.Equal(t, tc.want, body.Message)
+			assert.Equal(t, tc.want == "Task request failed", body.Retryable)
+		})
+	}
+}
+
 func TestRespondTaskPluginErrorPreservesMaterialPreparationIssues(t *testing.T) {
 	for _, testCase := range []struct {
 		name       string
@@ -1289,7 +1320,7 @@ func TestRespondTaskPluginErrorPreservesMaterialPreparationIssues(t *testing.T) 
 	}{
 		{
 			name:       "native error succeeds",
-			renderHook: `export const native = {error: function(ctx, error) { return {code: error.code, data: error.data, native: true}; }};`,
+			renderHook: `export const native = {error: function(ctx, error) { return {code: error.code, message: error.message, data: error.data, native: true}; }};`,
 			wantNative: true,
 		},
 		{name: "missing hook fallback"},
@@ -1318,17 +1349,21 @@ func TestRespondTaskPluginErrorPreservesMaterialPreparationIssues(t *testing.T) 
 			assert.True(t, handled)
 			assert.Equal(t, http.StatusBadRequest, recorder.Code)
 			var body struct {
-				Code   string                             `json:"code"`
-				Data   []service.MaterialPreparationIssue `json:"data"`
-				Native bool                               `json:"native"`
+				Code    string                             `json:"code"`
+				Message string                             `json:"message"`
+				Data    []service.MaterialPreparationIssue `json:"data"`
+				Native  bool                               `json:"native"`
 			}
 			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &body))
 			assert.Equal(t, "material_preparation_failed", body.Code)
+			assert.Equal(t, "视频请求处理失败，请联系管理员；参考图片（第 5 项）格式不支持，请更换图片", body.Message)
 			assert.Equal(t, testCase.wantNative, body.Native)
 			assert.Equal(t, []service.MaterialPreparationIssue{
-				{Index: 1, Field: "content[1].image_url.url", Usage: "reference_image", MaterialID: "material-pending", Status: "pending", Reason: "Material is not prepared in the selected resource space"},
-				{Index: 4, Field: "content[4].image_url.url", Usage: "first_frame", MaterialID: "material-rejected", Status: "failed", Reason: "Image format unsupported: https://***.com/***?token=*** Authorization: ***"},
+				{Index: 1, Field: "content[1].image_url.url", Usage: "reference_image", Status: "pending", Reason: "视频请求处理失败，请联系管理员"},
+				{Index: 4, Field: "content[4].image_url.url", Usage: "first_frame", Status: "failed", Reason: "参考图片格式不支持，请更换图片"},
 			}, body.Data)
+			assert.NotContains(t, recorder.Body.String(), "material-pending")
+			assert.NotContains(t, recorder.Body.String(), "material-rejected")
 			assert.Contains(t, issues[1].Reason, "signed-secret", "sanitization must not mutate the original issues")
 			assert.NotContains(t, recorder.Body.String(), "cdn.example.com")
 			assert.NotContains(t, recorder.Body.String(), "signed-secret")

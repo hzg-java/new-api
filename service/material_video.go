@@ -6,11 +6,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"gorm.io/gorm"
 )
 
@@ -19,6 +21,60 @@ type MaterialImageInput struct {
 	Source string
 	Field  string
 	Usage  string
+}
+
+func VideoMaterialFailure(issues []MaterialPreparationIssue) (string, []MaterialPreparationIssue) {
+	var public []MaterialPreparationIssue
+	messages := make([]string, 0, len(issues))
+	for _, issue := range issues {
+		reason := types.NewError(errors.New("Material preparation failed"), types.ErrorCodeBadResponse,
+			types.ErrOptionWithUpstreamResponse(types.OpenAIError{Message: issue.Reason})).ToOpenAIRelayError().Message
+		reason = strings.ToLower(topenRouterMaterialReasonURL.ReplaceAllString(reason, ""))
+		message := "视频请求处理失败，请联系管理员"
+		imageSpecific := false
+		switch {
+		case strings.Contains(reason, "not configured"), strings.Contains(reason, "unauthorized"), strings.Contains(reason, "forbidden"), strings.Contains(reason, "accessdenied"), strings.Contains(reason, "authenticationfailed"), strings.Contains(reason, "http status 401"), strings.Contains(reason, "http status 403"), strings.Contains(reason, "视频服务异常"):
+			message = "视频服务异常，请联系管理员"
+		case strings.Contains(reason, "sensitive"), strings.Contains(reason, "content review"), strings.Contains(reason, "moderation"), strings.Contains(reason, "未通过审核"), strings.Contains(reason, "审核不通过"):
+			message, imageSpecific = "参考图片未通过审核，请更换图片", true
+		case strings.Contains(reason, "unsupported image format"), strings.Contains(reason, "image format unsupported"), strings.Contains(reason, "格式不支持"):
+			message, imageSpecific = "参考图片格式不支持，请更换图片", true
+		case strings.Contains(reason, "timed out"), strings.Contains(reason, "timeout"), strings.Contains(reason, "wait ended"), strings.Contains(reason, "处理超时"):
+			message = "参考图片处理超时，请稍后重试"
+		case strings.Contains(reason, "download image"), strings.Contains(reason, "image download"), strings.Contains(reason, "image url"), strings.Contains(reason, "public https"), strings.Contains(reason, "无法读取"):
+			message, imageSpecific = "参考图片无法读取，请检查图片地址", true
+		case strings.Contains(reason, "material reference"), strings.Contains(reason, "material deletion"), strings.Contains(reason, "material is unavailable or its source changed"), strings.Contains(reason, "参考图片不可用"):
+			message, imageSpecific = "参考图片不可用，请更换图片", true
+		}
+		issue.MaterialID, issue.Reason = "", message
+		public = append(public, issue)
+		if imageSpecific {
+			// Index addresses the original content array, which can also contain text.
+			message = strings.Replace(message, "参考图片", fmt.Sprintf("参考图片（第 %d 项）", issue.Index+1), 1)
+		}
+		if !slices.Contains(messages, message) {
+			messages = append(messages, message)
+		}
+	}
+	if len(messages) == 0 {
+		return "视频请求处理失败，请联系管理员", public
+	}
+	return strings.Join(messages, "；"), public
+}
+
+func VideoSubmissionFailureMessage(code string) string {
+	switch code {
+	case "material_configuration_failed", "material_configuration_changed", "task_channel_changed", "task_channel_unavailable", "task_plugin_changed", "task_plugin_unavailable":
+		return "视频服务异常，请联系管理员"
+	case "material_preparation_timeout":
+		return "参考图片处理超时，请稍后重试"
+	case "task_submission_unknown", "task_submission_interrupted", "task_submission_timeout":
+		return "视频提交结果暂无法确认，请勿重复提交"
+	case "task_timeout":
+		return "视频任务超时，请联系管理员"
+	default:
+		return "视频请求处理失败，请联系管理员"
+	}
 }
 
 func PrepareVideoMaterials(ctx context.Context, userID int, channel MaterialChannel, inputs []MaterialImageInput) ([]string, []MaterialPreparationIssue, error) {

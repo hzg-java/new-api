@@ -22,6 +22,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
+	kittypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -347,14 +348,15 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (_ *TaskSubmit
 		case constant.TaskActionImageToVideo, constant.TaskActionTextToVideo, constant.TaskActionFirstTailToVideo, constant.TaskActionReferenceToVideo:
 			fingerprint, err = service.VideoMaterialIntegrationFingerprint(info.ChannelId)
 			if err != nil {
-				return nil, service.TaskErrorWrapperLocal(err, "material_configuration_failed", http.StatusBadRequest)
+				logger.LogWarn(c, "video material configuration unavailable: channel_id=%d", info.ChannelId)
+				return nil, service.TaskErrorWrapperLocal(errors.New(service.VideoSubmissionFailureMessage("material_configuration_failed")), "material_configuration_failed", http.StatusBadRequest)
 			}
 			if fingerprint != "" {
 				validator, ok := adaptor.(interface {
 					ValidateDeferredMaterialRequest(*gin.Context, *relaycommon.RelayInfo) error
 				})
 				if !ok {
-					return nil, service.TaskErrorWrapperLocal(errors.New("video channel does not support material preparation"), "material_configuration_failed", http.StatusBadRequest)
+					return nil, service.TaskErrorWrapperLocal(errors.New(service.VideoSubmissionFailureMessage("material_configuration_failed")), "material_configuration_failed", http.StatusBadRequest)
 				}
 				if err := validator.ValidateDeferredMaterialRequest(c, info); err != nil {
 					return nil, service.TaskErrorWrapperLocal(err, "video_material_invalid", http.StatusBadRequest)
@@ -363,7 +365,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (_ *TaskSubmit
 		}
 	}
 	if fingerprint != "" && info.Billing != nil {
-		return nil, &dto.TaskError{Code: "video_submission_channel_changed", Message: "The retry selected a material-managed video channel; submit a new request", StatusCode: http.StatusConflict, LocalError: true, NoRetry: true}
+		return nil, &dto.TaskError{Code: "video_submission_channel_changed", Message: "视频服务已变更，请重新提交", StatusCode: http.StatusConflict, LocalError: true, NoRetry: true}
 	}
 	if fingerprint != "" {
 		if info.QuotaClamp != nil {
@@ -411,8 +413,20 @@ func submitPreparedTask(c *gin.Context, info *relaycommon.RelayInfo, platform co
 	// A lost response cannot prove that a reserved video submission was rejected.
 	if materialReserved {
 		defer func() {
-			if finalTaskErr != nil {
-				finalTaskErr.NoRetry = true
+			if finalTaskErr == nil {
+				return
+			}
+			reason := kittypes.NewError(errors.New("Video task submission failed"), kittypes.ErrorCodeBadResponse, kittypes.ErrOptionWithUpstreamResponse(kittypes.OpenAIError{Message: finalTaskErr.Message})).ToOpenAIRelayError().Message
+			logger.LogWarn(c, "video_submission task_id=%q channel_id=%d code=%q reason=%q", info.PublicTaskID, info.ChannelId, finalTaskErr.Code, reason)
+			finalTaskErr.NoRetry = true
+			switch finalTaskErr.Code {
+			case "do_request_failed", "read_response_body_failed", "plugin_submit_response_failed", "plugin_submit_response_invalid":
+				finalTaskErr.Message = service.VideoSubmissionFailureMessage("task_submission_unknown")
+			default:
+				finalTaskErr.Message = service.VideoSubmissionFailureMessage(finalTaskErr.Code)
+				if finalTaskErr.StatusCode == http.StatusUnauthorized || finalTaskErr.StatusCode == http.StatusForbidden {
+					finalTaskErr.Message = service.VideoSubmissionFailureMessage("material_configuration_failed")
+				}
 			}
 		}()
 	}

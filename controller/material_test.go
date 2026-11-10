@@ -1677,10 +1677,12 @@ func TestMobileCloudVideoSubmitMaterialGate(t *testing.T) {
 			} else if tc.status == 0 {
 				require.NotNil(t, taskErr)
 				assert.Equal(t, "do_request_failed", taskErr.Code)
+				assert.Equal(t, "视频提交结果暂无法确认，请勿重复提交", taskErr.Message)
 				assert.True(t, taskErr.NoRetry, "a request accepted without a response must never be automatically replayed")
 			} else {
 				require.NotNil(t, taskErr)
 				assert.Equal(t, "fail_to_fetch_task", taskErr.Code)
+				assert.Equal(t, "视频请求处理失败，请联系管理员", taskErr.Message)
 			}
 			require.Len(t, submitted, before+1)
 			content := submitted[before]["content"].([]any)
@@ -1835,7 +1837,8 @@ func TestMobileCloudVideoSubmitMaterialGate(t *testing.T) {
 		assert.Equal(t, 1, billing.refunds)
 		issues, ok := taskErr.Data.([]service.MaterialPreparationIssue)
 		require.True(t, ok)
-		assert.Equal(t, []service.MaterialPreparationIssue{{Index: 2, MaterialID: failed.MaterialID, Field: "content[2].image_url.url", Usage: "last_frame", Status: "failed", Reason: "Unsupported image format"}}, issues)
+		assert.Equal(t, "参考图片（第 3 项）格式不支持，请更换图片", taskErr.Message)
+		assert.Equal(t, []service.MaterialPreparationIssue{{Index: 2, Field: "content[2].image_url.url", Usage: "last_frame", Status: "failed", Reason: "参考图片格式不支持，请更换图片"}}, issues)
 		assert.Equal(t, publicMaterialURL, request["content"].([]any)[0].(map[string]any)["image_url"].(map[string]any)["url"], "a partial batch must not rewrite the original request")
 	})
 }
@@ -1852,9 +1855,14 @@ func TestDeferredVideoSubmissionReportsMaterialFailure(t *testing.T) {
 		require.NoError(t, db.Create(&users[i]).Error)
 	}
 	t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
-	videoCalls := 0
+	videoCalls, videoStatus := 0, http.StatusOK
 	videoServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		videoCalls++
+		if videoStatus != http.StatusOK {
+			w.WriteHeader(videoStatus)
+			_, _ = w.Write([]byte(`{"error":"not configured"}`))
+			return
+		}
 		var body map[string]any
 		if assert.NoError(t, common.DecodeJson(r.Body, &body)) {
 			content := body["content"].([]any)
@@ -1933,8 +1941,7 @@ func TestDeferredVideoSubmissionReportsMaterialFailure(t *testing.T) {
 	var failed model.Task
 	require.NoError(t, db.First(&failed, outcome.Task.ID).Error)
 	assert.EqualValues(t, model.TaskStatusFailure, failed.Status)
-	assert.Contains(t, failed.FailReason, "content[0].image_url.url")
-	assert.Contains(t, failed.FailReason, "unavailable")
+	assert.Equal(t, "参考图片（第 1 项）不可用，请更换图片", failed.FailReason)
 	view, err := service.BuildTaskPluginView(&failed)
 	require.NoError(t, err)
 	data, ok := view.Data.(map[string]any)
@@ -1942,7 +1949,7 @@ func TestDeferredVideoSubmissionReportsMaterialFailure(t *testing.T) {
 	assert.Contains(t, data, "error")
 	publicVideo := failed.ToOpenAIVideo()
 	require.NotNil(t, publicVideo.Error)
-	assert.Contains(t, publicVideo.Error.Message, "content[0].image_url.url")
+	assert.Equal(t, failed.FailReason, publicVideo.Error.Message)
 	assert.Empty(t, failed.PrivateData.VideoSubmission.Request)
 	assert.Zero(t, videoCalls, "unready material must never reach the video provider")
 	assert.Zero(t, failed.Quota)
@@ -1991,12 +1998,58 @@ func TestDeferredVideoSubmissionReportsMaterialFailure(t *testing.T) {
 	var rejectedTask model.Task
 	require.NoError(t, db.First(&rejectedTask, rejected.Task.ID).Error)
 	assert.EqualValues(t, model.TaskStatusFailure, rejectedTask.Status)
-	assert.Contains(t, rejectedTask.FailReason, "content[1].image_url.url")
-	assert.Contains(t, rejectedTask.FailReason, material.MaterialID)
-	assert.Contains(t, rejectedTask.FailReason, "Image rejected by content review")
+	assert.Equal(t, "参考图片（第 2 项）未通过审核，请更换图片", rejectedTask.FailReason)
+	assert.NotContains(t, string(rejectedTask.Data), material.MaterialID)
+	assert.NotContains(t, string(rejectedTask.Data), "Image rejected by content review")
+	assert.Contains(t, string(rejectedTask.Data), `"field":"content[1].image_url.url"`)
 	assert.Contains(t, string(rejectedTask.Data), `"usage":"reference_image"`)
 	assert.Equal(t, 1, videoCalls)
 	assert.Equal(t, 1, uploads)
+	t.Run("configuration rejection remains private", func(t *testing.T) {
+		reason := "Material preparation rejected: topenrouter material HTTP status 403: not configured"
+		require.NoError(t, db.Model(&model.MaterialBinding{}).Where("material_id = ?", material.Id).Update("fail_reason", reason).Error)
+		info.TaskRelayInfo.PublicTaskID, info.Billing = "", nil
+		outcome, taskErr := executeTaskSubmission(c, info)
+		require.Nil(t, taskErr, "%+v", taskErr)
+		require.NoError(t, runVideoSubmission(t.Context(), outcome.Task, plugin))
+		var failed model.Task
+		require.NoError(t, db.First(&failed, outcome.Task.ID).Error)
+		assert.Equal(t, "视频服务异常，请联系管理员", failed.FailReason)
+		public, err := service.BuildTaskPluginView(&failed)
+		require.NoError(t, err)
+		encoded, err := common.Marshal(public)
+		require.NoError(t, err)
+		for _, private := range []string{"topenrouter", "403", "not configured", material.MaterialID, "not ready"} {
+			assert.NotContains(t, string(encoded), private)
+		}
+		video := failed.ToOpenAIVideo()
+		require.NotNil(t, video.Error)
+		assert.Equal(t, failed.FailReason, video.Error.Message)
+		var binding model.MaterialBinding
+		require.NoError(t, db.Where("material_id = ?", material.Id).First(&binding).Error)
+		assert.Equal(t, reason, binding.FailReason, "administrator diagnostics must retain the original failure")
+		assert.Equal(t, 1, videoCalls)
+		assert.Equal(t, 1, uploads)
+		assert.Zero(t, failed.Quota)
+	})
+	t.Run("video authorization rejection keeps the service error", func(t *testing.T) {
+		videoStatus = http.StatusForbidden
+		t.Cleanup(func() { videoStatus = http.StatusOK })
+		require.NoError(t, db.Model(&material).Update("status", model.MaterialStatusReady).Error)
+		require.NoError(t, db.Model(&model.MaterialBinding{}).Where("material_id = ?", material.Id).Updates(map[string]any{"state": "ready", "upstream_status": "ACTIVE", "fail_reason": ""}).Error)
+		info.TaskRelayInfo.PublicTaskID, info.Billing = "", nil
+		outcome, taskErr := executeTaskSubmission(c, info)
+		require.Nil(t, taskErr, "%+v", taskErr)
+		require.NoError(t, runVideoSubmission(t.Context(), outcome.Task, plugin))
+		var failed model.Task
+		require.NoError(t, db.First(&failed, outcome.Task.ID).Error)
+		assert.Equal(t, "视频服务异常，请联系管理员", failed.FailReason)
+		assert.Equal(t, "failed_final", failed.SubmissionStage)
+		assert.NotContains(t, string(failed.Data), "not configured")
+		assert.Equal(t, 2, videoCalls)
+		assert.Equal(t, 1, uploads)
+		assert.Zero(t, failed.Quota)
+	})
 }
 
 func TestVideoSubmissionSettlementReloadsConfirmedBilling(t *testing.T) {
@@ -2152,7 +2205,7 @@ func TestDeferredVideoSubmissionLifecycle(t *testing.T) {
 	require.NoError(t, runVideoSubmission(t.Context(), &uncertain, nil))
 	require.NoError(t, db.First(&uncertain, uncertain.ID).Error)
 	assert.EqualValues(t, model.TaskStatusFailure, uncertain.Status)
-	assert.Contains(t, uncertain.FailReason, "may have accepted")
+	assert.Equal(t, "视频提交结果暂无法确认，请勿重复提交", uncertain.FailReason)
 	assert.Equal(t, "failed_final", uncertain.SubmissionStage)
 	t.Run("Redis and batch accounting", func(t *testing.T) {
 		server := miniredis.RunT(t)
@@ -2213,7 +2266,7 @@ func TestLocalVideoSubmissionIsolation(t *testing.T) {
 	assert.Empty(t, historical.SubmissionOwner)
 	require.NoError(t, db.First(&queued, queued.ID).Error)
 	assert.EqualValues(t, model.TaskStatusFailure, queued.Status)
-	assert.Contains(t, queued.FailReason, "submission data is unavailable")
+	assert.Equal(t, "视频请求处理失败，请联系管理员", queued.FailReason)
 	synchronous := model.Task{TaskID: model.GenerateTaskID(), ChannelId: channel.Id, Platform: "synchronous-video", Status: model.TaskStatusSubmitted, PrivateData: model.TaskPrivateData{UpstreamTaskID: "synchronous-upstream"}}
 	require.NoError(t, db.Create(&synchronous).Error)
 	pollable := model.Task{TaskID: model.GenerateTaskID(), ChannelId: channel.Id, Platform: "new-local-poll", Status: model.TaskStatusNotStart, SubmitTime: common.GetTimestamp(), PrivateData: model.TaskPrivateData{UpstreamTaskID: "new-upstream", VideoSubmission: &model.VideoSubmission{}}}
@@ -2472,11 +2525,11 @@ func TestMobileCloudVideoUploadBeforeSubmit(t *testing.T) {
 					assert.Equal(t, "reference_image", issues[0].Usage)
 					if tc.lookupFailure {
 						assert.Equal(t, "unavailable", issues[0].Status)
-						assert.Equal(t, "Video material lookup failed; retry to check the existing material", issues[0].Reason)
+						assert.Equal(t, "视频请求处理失败，请联系管理员", issues[0].Reason)
 					}
 					if tc.failed {
-						assert.NotEmpty(t, issues[0].MaterialID)
-						assert.Equal(t, "Unsupported image format", issues[0].Reason)
+						assert.Empty(t, issues[0].MaterialID)
+						assert.Equal(t, "参考图片格式不支持，请更换图片", issues[0].Reason)
 					}
 				} else {
 					assert.Equal(t, before+1, videoCalls)
@@ -2741,12 +2794,18 @@ func TestTopenRouterVideoUploadBeforeSubmit(t *testing.T) {
 					assert.Equal(t, "material_preparation_failed", taskErr.Code)
 					issues, ok := taskErr.Data.([]service.MaterialPreparationIssue)
 					require.True(t, ok)
-					assert.Equal(t, []service.MaterialPreparationIssue{{Index: 2, MaterialID: failed.MaterialID, Field: "content[2].image_url.url", Usage: "last_frame", Status: "failed", Reason: "Unsupported image format"}}, issues)
+					assert.Equal(t, "参考图片（第 3 项）格式不支持，请更换图片", taskErr.Message)
+					assert.Equal(t, []service.MaterialPreparationIssue{{Index: 2, Field: "content[2].image_url.url", Usage: "last_frame", Status: "failed", Reason: "参考图片格式不支持，请更换图片"}}, issues)
 				} else {
 					assert.Equal(t, before+1, videoCalls, "even an accepted request with a lost or invalid response must not be replayed")
 					assert.NotEqual(t, "material_preparation_failed", taskErr.Code)
 					if tc.response == "lost" {
 						assert.Equal(t, "do_request_failed", taskErr.Code)
+					}
+					if tc.response == "lost" || tc.response == "invalid" {
+						assert.Equal(t, "视频提交结果暂无法确认，请勿重复提交", taskErr.Message)
+					} else {
+						assert.Equal(t, "视频请求处理失败，请联系管理员", taskErr.Message)
 					}
 				}
 			} else {
@@ -2841,9 +2900,9 @@ func TestTopenRouterVideoUploadBeforeSubmit(t *testing.T) {
 				assert.Equal(t, 2, issues[0].Index)
 				assert.Equal(t, "content[2].image_url.url", issues[0].Field)
 				assert.Equal(t, "last_frame", issues[0].Usage)
-				assert.Equal(t, failed.MaterialID, issues[0].MaterialID)
+				assert.Empty(t, issues[0].MaterialID)
 				assert.Equal(t, "failed", issues[0].Status)
-				assert.Contains(t, issues[0].Reason, "InputImageSensitiveContentDetected")
+				assert.Equal(t, "参考图片未通过审核，请更换图片", issues[0].Reason)
 				respondTaskSubmissionError(c, taskErr)
 				assert.Equal(t, http.StatusBadRequest, recorder.Code)
 				var body struct {
@@ -2851,9 +2910,9 @@ func TestTopenRouterVideoUploadBeforeSubmit(t *testing.T) {
 					Data    []service.MaterialPreparationIssue `json:"data"`
 				}
 				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &body))
-				for _, detail := range []string{"content[2].image_url.url", failed.MaterialID, "InputImageSensitiveContentDetected", "input image may contain sensitive information"} {
-					assert.Contains(t, body.Message, detail)
-				}
+				assert.Equal(t, "参考图片（第 3 项）未通过审核，请更换图片", body.Message)
+				assert.NotContains(t, recorder.Body.String(), failed.MaterialID)
+				assert.NotContains(t, recorder.Body.String(), "InputImageSensitiveContentDetected")
 				if surface == "openai_video" {
 					assert.Equal(t, issues, body.Data)
 				}

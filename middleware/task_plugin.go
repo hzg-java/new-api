@@ -1280,18 +1280,26 @@ func RespondTaskPluginError(c *gin.Context, taskErr *dto.TaskError) bool {
 		return false
 	}
 	sanitized := sanitizedTaskPluginError(taskErr.StatusCode, taskErr.Message)
+	if taskErr.NoRetry {
+		switch taskErr.Message {
+		case service.VideoSubmissionFailureMessage("task_submission_unknown"), service.VideoSubmissionFailureMessage("material_configuration_failed"), service.VideoSubmissionFailureMessage(""):
+			sanitized.Message, sanitized.Retryable = taskErr.Message, false
+		}
+	}
 	var safeData []map[string]any
 	if taskErr.Code == "material_preparation_failed" && taskErr.StatusCode == http.StatusBadRequest && taskErr.LocalError && taskErr.NoRetry {
 		if issues, ok := taskErr.Data.([]service.MaterialPreparationIssue); ok {
 			sanitized.Code = taskErr.Code
-			safeData = make([]map[string]any, len(issues))
-			for i, issue := range issues {
-				reason := types.NewError(errors.New("Material preparation failed"), types.ErrorCodeBadResponse,
-					types.ErrOptionWithUpstreamResponse(types.OpenAIError{Message: issue.Reason})).ToOpenAIRelayError().Message
+			message, public := service.VideoMaterialFailure(issues)
+			if len(public) > 0 {
+				sanitized.Message = message
+			}
+			safeData = make([]map[string]any, len(public))
+			for i, issue := range public {
 				// Explicitly whitelist public fields; never forward arbitrary TaskError.Data.
 				safeData[i] = map[string]any{
 					"index": issue.Index, "field": issue.Field, "usage": issue.Usage,
-					"material_id": issue.MaterialID, "status": issue.Status, "reason": reason,
+					"status": issue.Status, "reason": issue.Reason,
 				}
 			}
 		}

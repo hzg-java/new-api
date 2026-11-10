@@ -269,25 +269,19 @@ func (a *TaskAdaptor) PrepareMaterialRequest(c *gin.Context, info *relaycommon.R
 	target := &model.Channel{Id: info.ChannelId, Type: info.ChannelType, Key: info.ApiKey, BaseURL: &info.ChannelBaseUrl, HeaderOverride: common.GetPointer(string(headers)), ChannelInfo: model.ChannelInfo{IsMultiKey: info.ChannelIsMultiKey}}
 	prepared, issues, reservation, err := service.PrepareVideoMaterialRequest(c.Request.Context(), info.UserId, target, body)
 	if err != nil || len(issues) > 0 {
-		message := "Video material preparation failed"
-		if err == nil {
-			message = "Video images are not ready; no video request was submitted"
-			var details strings.Builder
-			for i, issue := range issues {
-				if i > 0 {
-					details.WriteString("; ")
-				}
-				details.WriteString(issue.Field)
-				if issue.MaterialID != "" {
-					fmt.Fprintf(&details, " (material %s)", issue.MaterialID)
-				}
-				reason := types.NewError(errors.New("Material preparation failed"), types.ErrorCodeBadResponse,
-					types.ErrOptionWithUpstreamResponse(types.OpenAIError{Message: issue.Reason})).ToOpenAIRelayError().Message
-				fmt.Fprintf(&details, ": %s", reason)
-			}
-			message += ": " + details.String()
+		message, public := service.VideoMaterialFailure(issues)
+		if err != nil {
+			message = service.VideoSubmissionFailureMessage("material_configuration_failed")
+			reason := types.NewError(errors.New("Material preparation failed"), types.ErrorCodeBadResponse,
+				types.ErrOptionWithUpstreamResponse(types.OpenAIError{Message: err.Error()})).ToOpenAIRelayError().Message
+			logger.LogWarn(c, "video_material channel_id=%d task_id=%q reason=%q", info.ChannelId, info.PublicTaskID, reason)
 		}
-		return nil, &dto.TaskError{Code: "material_preparation_failed", Message: message, Data: issues, StatusCode: http.StatusBadRequest, LocalError: true, NoRetry: true}
+		for _, issue := range issues {
+			reason := types.NewError(errors.New("Material preparation failed"), types.ErrorCodeBadResponse,
+				types.ErrOptionWithUpstreamResponse(types.OpenAIError{Message: issue.Reason})).ToOpenAIRelayError().Message
+			logger.LogWarn(c, "video_material channel_id=%d task_id=%q field=%q material_id=%q status=%q reason=%q", info.ChannelId, info.PublicTaskID, issue.Field, issue.MaterialID, issue.Status, reason)
+		}
+		return nil, &dto.TaskError{Code: "material_preparation_failed", Message: message, Data: public, StatusCode: http.StatusBadRequest, LocalError: true, NoRetry: true}
 	}
 	descriptor.Body = prepared
 	if reservation == nil {
