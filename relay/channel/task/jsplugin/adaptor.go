@@ -281,7 +281,8 @@ func (a *TaskAdaptor) PrepareMaterialRequest(c *gin.Context, info *relaycommon.R
 				types.ErrOptionWithUpstreamResponse(types.OpenAIError{Message: issue.Reason})).ToOpenAIRelayError().Message
 			logger.LogWarn(c, "video_material channel_id=%d task_id=%q field=%q material_id=%q status=%q reason=%q", info.ChannelId, info.PublicTaskID, issue.Field, issue.MaterialID, issue.Status, reason)
 		}
-		return nil, &dto.TaskError{Code: "material_preparation_failed", Message: message, Data: public, StatusCode: http.StatusBadRequest, LocalError: true, NoRetry: true}
+		diagnostic := &dto.TaskError{Code: "material_preparation_failed", Message: "Material preparation failed", Data: issues, Error: err, StatusCode: http.StatusBadRequest}
+		return nil, &dto.TaskError{Code: "material_preparation_failed", Message: message, Data: public, Diagnostic: service.TaskErrorDiagnostic(diagnostic), StatusCode: http.StatusBadRequest, LocalError: true, NoRetry: true}
 	}
 	descriptor.Body = prepared
 	if reservation == nil {
@@ -522,14 +523,24 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, bod
 
 func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (_ *channel.TaskSubmitResponse, taskErr *dto.TaskError) {
 	started := time.Now()
-	var responseBody any
+	var responseBody, diagnosticBody any
 	var err error
 	streaming := a.submit != nil && a.submit.ResponseType == "sse"
 	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	acceptedStream := streaming || mediaType == "text/event-stream"
 	defer func() {
-		if acceptedStream && taskErr != nil {
+		if taskErr == nil {
+			return
+		}
+		if acceptedStream {
 			taskErr.NoRetry = true
+		}
+		if diagnosticBody == nil {
+			diagnosticBody = responseBody
+		}
+		if diagnosticBody != nil {
+			taskErr.Diagnostic, _ = common.Marshal(map[string]any{"status_code": resp.StatusCode, "body": diagnosticBody, "message": taskErr.Message, "code": taskErr.Code})
+			taskErr.Diagnostic = service.TaskErrorDiagnostic(taskErr)
 		}
 	}()
 	if !streaming && acceptedStream {
@@ -547,9 +558,11 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 			err = fmt.Errorf("task submit response exceeds size limit")
 		}
 		responseBody = string(body)
+		diagnosticBody = responseBody
 		var decoded any
 		if err == nil && common.Unmarshal(body, &decoded) == nil {
 			responseBody = decoded
+			diagnosticBody = json.RawMessage(body)
 		}
 	}
 	if err != nil {

@@ -40,6 +40,7 @@ var (
 	taskEventURLPattern           = regexp.MustCompile(`https?://[^\s<>"']+`)
 	taskEventAuthorizationPattern = regexp.MustCompile(`(?i)\b(Bearer|Basic)[ \t]+[A-Za-z0-9._~+/=-]+`)
 	taskEventAPIKeyPattern        = regexp.MustCompile(`(?i)\b((?:x[-_])?api[-_ ]?key["']?\s*[:=]\s*["']?)[^\s"',;&<>]+`)
+	taskEventCredentialPattern    = regexp.MustCompile(`(?i)\b((?:[a-z0-9_.-]*(?:token|secret|password|apikey)|key|authorization|proxy[-_]?authorization|cookie|set[-_]?cookie|passwd|(?:access|secret|private)[-_]?key|credentials?|auth|access|session(?:[-_]?id)?|signature|sig|x[-_]?(?:amz|goog)[-_]?(?:signature|credential))["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;&<>]+)`)
 	taskEventKeyTokenPattern      = regexp.MustCompile(`\bsk-[A-Za-z0-9_-]+`)
 )
 
@@ -102,6 +103,8 @@ func redactTaskEventJSON(encoded json.RawMessage) (json.RawMessage, error) {
 		if err := common.Unmarshal(encoded, &text); err != nil {
 			return nil, err
 		}
+		text = taskEventAuthorizationPattern.ReplaceAllString(text, "$1 [REDACTED]")
+		text = taskEventCredentialPattern.ReplaceAllString(text, "${1}[REDACTED]")
 		text = taskEventURLPattern.ReplaceAllStringFunc(text, func(raw string) string {
 			u, err := url.Parse(raw)
 			if err != nil {

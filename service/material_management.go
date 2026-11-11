@@ -460,7 +460,10 @@ func listMaterialGroups(ctx context.Context, provider MaterialProvider, query Mo
 	for pageNo := int32(1); pageNo <= 1000; pageNo++ {
 		query.PageNo, query.PageSize = &pageNo, common.GetPointer(int32(100))
 		page, err := provider.ListAssetGroups(ctx, query)
-		if err != nil || page == nil {
+		if err != nil {
+			return nil, errors.New(materialPreparationFailure("material group listing could not be confirmed", err))
+		}
+		if page == nil {
 			return nil, errors.New("material group listing could not be confirmed")
 		}
 		if page.Total < 0 || total >= 0 && page.Total != total {
@@ -491,7 +494,10 @@ func listMaterialAssets(ctx context.Context, provider MaterialProvider, query Mo
 	for pageNo := int32(1); pageNo <= 1000; pageNo++ {
 		query.PageNo, query.PageSize = &pageNo, common.GetPointer(int32(100))
 		page, err := provider.ListAssets(ctx, query)
-		if err != nil || page == nil {
+		if err != nil {
+			return nil, errors.New(materialPreparationFailure("material listing could not be confirmed", err))
+		}
+		if page == nil {
 			return nil, errors.New("material listing could not be confirmed")
 		}
 		if page.Total < 0 || total >= 0 && page.Total != total {

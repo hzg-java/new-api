@@ -237,7 +237,26 @@ func TestTopenRouterMaterialFailures(t *testing.T) {
 		{"platform error on 200", 200, `{"code":1,"message":"asset url not allowed"}`, true, "asset url not allowed"},
 		{"platform rejection", 403, `{"code":1,"message":"upstream not configured"}`, true, "not configured"},
 		{"explicit HTTP rejection", 401, `{}`, true, "401"},
+		{"official validation on 400", 400, `{"ResponseMetadata":{"RequestId":"req-validation","Error":{"Code":"InvalidParameter.URL","Message":"Unsupported image format"}}}`, true, "Unsupported image format|code=InvalidParameter.URL|requestID=req-validation|HTTP status 400"},
+		{"official internal error on 400", 400, `{"ResponseMetadata":{"RequestId":"req-internal","Error":{"Code":"InternalError","Message":"internal failure"}},"code":1,"message":"Unsupported image format"}`, false, "internal failure|code=InternalError|requestID=req-internal|HTTP status 400"},
+		{"official throttle on 400", 400, `{"ResponseMetadata":{"Error":{"Code":"Throttling","Message":"rate limited"}}}`, false, "rate limited|code=Throttling|HTTP status 400"},
+		{"unknown official code on 400", 400, `{"ResponseMetadata":{"Error":{"Code":"FutureError","Message":"unknown failure"}},"code":1,"message":"Unsupported image format"}`, false, "unknown failure|code=FutureError|HTTP status 400"},
+		{"official internal error on 403", 403, `{"ResponseMetadata":{"Error":{"Code":"InternalError","Message":"internal failure"}}}`, false, "internal failure"},
+		{"unknown official code on 401", 401, `{"ResponseMetadata":{"Error":{"Code":"FutureError","Message":"unknown failure"}}}`, false, "unknown failure"},
+		{"platform connection EOF on 400", 400, `{"code":1,"message":"Post \"https://private.example/raw/path?token=private-token\": EOF"}`, false, "Post|EOF|code=1|HTTP status 400"},
+		{"platform internal error on 422", 422, `{"code":1,"message":"gateway internal error, please retry"}`, false, "gateway internal error|code=1|HTTP status 422"},
+		{"platform timeout on 400", 400, `{"code":1,"message":"upstream request timed out"}`, false, "timed out"},
+		{"platform throttle on 400", 400, `{"code":1,"message":"too many requests: rate limited"}`, false, "rate limited"},
+		{"unknown platform error", 400, `{"code":1,"message":"unknown failure"}`, false, "unknown failure"},
+		{"invalid upstream response is not validation", 400, `{"code":1,"message":"invalid upstream response"}`, false, "invalid response"},
+		{"platform validation failure", 400, `{"code":1,"message":"validation failed: invalid URL"}`, true, "validation failed"},
+		{"internal error without platform code", 422, `{"message":"gateway internal error"}`, false, "gateway internal error"},
+		{"unclassified HTTP failure", 400, `{}`, false, "400"},
+		{"internal error overrides validation words", 400, `{"code":1,"message":"gateway internal error: unsupported image format check unavailable"}`, false, "gateway internal error"},
+		{"private error metadata", 400, `{"ResponseMetadata":{"RequestId":"req-test-platform-token-https://private.example/raw/path?token=private-token","Error":{"Code":"FutureError.test-platform-token.https://private.example/raw/path?token=private-token","Message":"unknown failure"}}}`, false, "unknown failure|code=FutureError.|requestID=req-"},
 		{"server error overrides business rejection", 502, `{"ResponseMetadata":{"Error":{"Code":"InvalidParameter.URL","Message":"Unsupported image format"}}}`, false, "502"},
+		{"rate limit overrides official rejection", 429, `{"ResponseMetadata":{"Error":{"Code":"InvalidParameter.URL","Message":"Unsupported image format"}}}`, false, "429"},
+		{"request timeout overrides official rejection", 408, `{"ResponseMetadata":{"Error":{"Code":"NotFound","Message":"Asset not found"}}}`, false, "408"},
 		{"rate limit", 429, `{"code":1,"message":"rate limited"}`, false, "429"},
 		{"request timeout", 408, `{"code":1,"message":"timeout"}`, false, "408"},
 		{"official server error on 200", 200, `{"ResponseMetadata":{"Error":{"Code":"InternalError","Message":"internal failure"}}}`, false, "internal failure"},
@@ -275,12 +294,66 @@ func TestTopenRouterMaterialFailures(t *testing.T) {
 			var rejection *TopenRouterMaterialRejection
 			assert.Equal(t, tc.rejection, errors.As(err, &rejection))
 			if tc.reason != "" {
-				assert.Contains(t, err.Error(), tc.reason)
+				for reason := range strings.SplitSeq(tc.reason, "|") {
+					assert.Contains(t, err.Error(), reason)
+				}
+				assert.Contains(t, err.Error(), "action=CreateAsset")
+				if !tc.rejection {
+					assert.Contains(t, err.Error(), "result is unknown")
+				}
 			}
 			for _, private := range []string{"test-platform-token", "private-token", "private.example", "/raw/path", server.URL} {
 				assert.NotContains(t, err.Error(), private)
 			}
 			assert.Equal(t, int32(1), calls.Load(), "mutations must never be retried")
+		})
+	}
+	// GetAsset callers need structured refusal metadata to distinguish a missing
+	// asset from an ambiguous read without parsing the user-facing message.
+	for _, tc := range []struct {
+		name, code, requestID string
+		status                int
+		rejection             bool
+	}{
+		{"not found", "NotFound.asset_id", "req-not-found", 404, true},
+		{"validation", "InvalidParameter.URL", "req-validation", 400, true},
+		{"internal", "InternalError", "req-internal", 400, false},
+		{"unknown dotted code", "FutureError.asset_id", "req-future", 400, false},
+		{"server overrides not found", "NotFound.asset_id", "req-server", 503, false},
+		{"private metadata", "InvalidParameter.test-platform-token", "req-test-platform-token-https://private.example/raw/path?token=private-token", 400, true},
+	} {
+		t.Run("GetAsset "+tc.name, func(t *testing.T) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = fmt.Fprintf(w, `{"ResponseMetadata":{"RequestId":%q,"Error":{"Code":%q,"Message":"Asset lookup failed"}}}`, tc.requestID, tc.code)
+			}))
+			defer server.Close()
+			asset, err := newTopenRouterMaterialTestClient(t, server).GetAsset(t.Context(), "asset-1")
+			require.Error(t, err)
+			assert.Nil(t, asset)
+			var rejection *TopenRouterMaterialRejection
+			if tc.rejection {
+				require.ErrorAs(t, err, &rejection)
+				assert.Equal(t, strings.ReplaceAll(tc.code, "test-platform-token", "***"), rejection.Code)
+				assert.Equal(t, tc.status, rejection.StatusCode)
+				assert.Equal(t, "GetAsset", rejection.Action)
+				assert.Contains(t, rejection.RequestID, "req-")
+				assert.Equal(t, rejection.Message, err.Error())
+				for _, private := range []string{"test-platform-token", "private-token", "private.example", "/raw/path"} {
+					assert.NotContains(t, rejection.Code, private)
+					assert.NotContains(t, rejection.RequestID, private)
+				}
+			} else {
+				assert.False(t, errors.As(err, &rejection))
+				assert.Contains(t, err.Error(), "result is unknown")
+			}
+			if tc.name != "private metadata" {
+				assert.Contains(t, err.Error(), "code="+tc.code)
+				assert.Contains(t, err.Error(), "requestID="+tc.requestID)
+			}
+			for _, private := range []string{"test-platform-token", "private-token", "private.example", "/raw/path", server.URL} {
+				assert.NotContains(t, err.Error(), private)
+			}
 		})
 	}
 }
@@ -382,11 +455,20 @@ func TestTopenRouterMaterialNoReplayOrRedirect(t *testing.T) {
 			assert.Equal(t, int32(1), calls.Load())
 			assert.NotContains(t, err.Error(), server.URL)
 			assert.NotContains(t, err.Error(), "test-platform-token")
+			assert.Contains(t, err.Error(), "action=CreateAssetGroup")
+			assert.Contains(t, err.Error(), "result is unknown")
 			if mode == "cancel" {
 				assert.ErrorIs(t, err, context.Canceled)
 			}
 			if mode == "deadline" {
 				assert.ErrorIs(t, err, context.DeadlineExceeded)
+				assert.Contains(t, strings.ToLower(err.Error()), "timeout")
+			}
+			if mode == "disconnect" || mode == "truncated body" {
+				assert.Contains(t, err.Error(), "EOF")
+			}
+			if mode == "truncated body" {
+				assert.Contains(t, err.Error(), "HTTP status 200")
 			}
 		})
 	}

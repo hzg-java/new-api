@@ -6,13 +6,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	taskdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
-	"github.com/QuantumNous/new-api/relaykit/types"
 	"gorm.io/gorm"
 )
 
@@ -27,39 +28,112 @@ func VideoMaterialFailure(issues []MaterialPreparationIssue) (string, []Material
 	var public []MaterialPreparationIssue
 	messages := make([]string, 0, len(issues))
 	for _, issue := range issues {
-		reason := types.NewError(errors.New("Material preparation failed"), types.ErrorCodeBadResponse,
-			types.ErrOptionWithUpstreamResponse(types.OpenAIError{Message: issue.Reason})).ToOpenAIRelayError().Message
-		reason = strings.ToLower(topenRouterMaterialReasonURL.ReplaceAllString(reason, ""))
-		message := "视频请求处理失败，请联系管理员"
-		imageSpecific := false
+		reason := strings.TrimSpace(strings.ToLower(topenRouterMaterialReasonURL.ReplaceAllString(issue.Reason, "")))
+		message := "参考图片处理失败，暂未获取到具体原因，请联系管理员并提供任务 ID。"
+		imageSpecific := true
 		switch {
-		case strings.Contains(reason, "not configured"), strings.Contains(reason, "unauthorized"), strings.Contains(reason, "forbidden"), strings.Contains(reason, "accessdenied"), strings.Contains(reason, "authenticationfailed"), strings.Contains(reason, "http status 401"), strings.Contains(reason, "http status 403"), strings.Contains(reason, "视频服务异常"):
-			message = "视频服务异常，请联系管理员"
-		case strings.Contains(reason, "sensitive"), strings.Contains(reason, "content review"), strings.Contains(reason, "moderation"), strings.Contains(reason, "未通过审核"), strings.Contains(reason, "审核不通过"):
-			message, imageSpecific = "参考图片未通过审核，请更换图片", true
-		case strings.Contains(reason, "unsupported image format"), strings.Contains(reason, "image format unsupported"), strings.Contains(reason, "格式不支持"):
-			message, imageSpecific = "参考图片格式不支持，请更换图片", true
+		case strings.Contains(reason, "not configured"), strings.Contains(reason, "未正确配置"):
+			message, imageSpecific = "图片上传服务未正确配置，暂时无法使用，请联系管理员处理。", false
+		case strings.Contains(reason, "unauthorized"), strings.Contains(reason, "forbidden"), strings.Contains(reason, "accessdenied"), strings.Contains(reason, "authenticationfailed"), strings.Contains(reason, "http status 401"), strings.Contains(reason, "http status 403"), strings.Contains(reason, "视频服务异常"):
+			message, imageSpecific = "视频服务异常，请联系管理员", false
+		case strings.Contains(reason, "gateway internal error"), strings.Contains(reason, "图片上传服务发生内部错误"):
+			message, imageSpecific = "图片上传服务发生内部错误，请联系管理员处理，无需修改图片。", false
+		case strings.Contains(reason, "eof"), strings.Contains(reason, "connection reset"), strings.Contains(reason, "连接意外中断"):
+			message = "处理参考图片时连接意外中断，结果无法确认，请勿重复提交，联系管理员核查。"
+		case strings.Contains(reason, "material upload result is unknown"), strings.Contains(reason, "material upload result could not be confirmed"), strings.Contains(reason, "上传结果无法确认"):
+			message = "参考图片上传结果无法确认，请勿重复上传，联系管理员核查。"
 		case strings.Contains(reason, "timed out"), strings.Contains(reason, "timeout"), strings.Contains(reason, "wait ended"), strings.Contains(reason, "处理超时"):
-			message = "参考图片处理超时，请稍后重试"
+			message = "参考图片处理超时，结果尚未确认，请勿重复上传，联系管理员核查。"
+		case strings.Contains(reason, "in use"), strings.Contains(reason, "操作占用"):
+			message = "参考图片正在被其他操作占用，请等待当前操作结束后再试。"
+		case strings.Contains(reason, "response does not match"), strings.Contains(reason, "处理结果与原图片不一致"):
+			message = "参考图片的处理结果与原图片不一致，请勿重复上传，联系管理员核查。"
+		case strings.Contains(reason, "readiness could not be confirmed"), strings.Contains(reason, "unrecognized material status"), strings.Contains(reason, "material status query"), strings.Contains(reason, "处理状态无法确认"):
+			message = "参考图片的处理状态无法确认，请勿重复上传，联系管理员核查。"
+		case strings.Contains(reason, "material no longer exists"), strings.Contains(reason, "已不存在或无权访问"):
+			message = "参考图片已不存在或无权访问，请联系管理员核查。"
+		case issue.Status == "pending" || issue.Status == "creating" || issue.Status == "processing":
+			message = "参考图片仍在处理中，暂未完成。"
+		case strings.Contains(reason, "copyright restrictions"), strings.Contains(reason, "copyright") && (strings.Contains(reason, "rejected") || strings.Contains(reason, "policyviolation")), strings.Contains(reason, "版权限制"):
+			message = "参考图片因可能涉及版权限制未通过审核，请更换图片。"
+		case strings.Contains(reason, "sensitivecontentdetected"), strings.Contains(reason, "sensitive") && (strings.Contains(reason, "rejected") || strings.Contains(reason, "policyviolation")), strings.Contains(reason, "内容安全审核"):
+			message = "参考图片未通过内容安全审核，请更换图片。"
+		case (strings.Contains(reason, "content review") || strings.Contains(reason, "moderation")) && (strings.Contains(reason, "rejected") || strings.Contains(reason, "policyviolation")), strings.Contains(reason, "未通过审核"), strings.Contains(reason, "审核不通过"):
+			message = "参考图片未通过审核，请更换图片"
+		case strings.Contains(reason, "unsupported image format"), strings.Contains(reason, "image format unsupported"), strings.Contains(reason, "格式不支持"):
+			message = "参考图片格式不支持，请更换图片"
 		case strings.Contains(reason, "download image"), strings.Contains(reason, "image download"), strings.Contains(reason, "image url"), strings.Contains(reason, "public https"), strings.Contains(reason, "无法读取"):
-			message, imageSpecific = "参考图片无法读取，请检查图片地址", true
-		case strings.Contains(reason, "material reference"), strings.Contains(reason, "material deletion"), strings.Contains(reason, "material is unavailable or its source changed"), strings.Contains(reason, "参考图片不可用"):
-			message, imageSpecific = "参考图片不可用，请更换图片", true
+			message = "参考图片无法读取，请检查图片地址"
+		case strings.Contains(reason, "material reference"), strings.Contains(reason, "material deletion"), strings.Contains(reason, "material is unavailable or its source changed"), strings.Contains(reason, "不可用，请更换图片"):
+			message = "参考图片不可用，请更换图片"
+		}
+		if imageSpecific {
+			label := fmt.Sprintf("参考图片（第 %d 项）", issue.Index+1)
+			if issue.imageNumber > 0 {
+				label = fmt.Sprintf("第 %d 张参考图片", issue.imageNumber)
+			}
+			message = strings.Replace(message, "参考图片", label, 1)
 		}
 		issue.MaterialID, issue.Reason = "", message
 		public = append(public, issue)
-		if imageSpecific {
-			// Index addresses the original content array, which can also contain text.
-			message = strings.Replace(message, "参考图片", fmt.Sprintf("参考图片（第 %d 项）", issue.Index+1), 1)
-		}
 		if !slices.Contains(messages, message) {
 			messages = append(messages, message)
 		}
 	}
 	if len(messages) == 0 {
-		return "视频请求处理失败，请联系管理员", public
+		return "参考图片处理失败，暂未获取到具体原因，请联系管理员并提供任务 ID。", public
+	}
+	if len(messages) > 1 {
+		for i := range messages {
+			messages[i] = strings.TrimSuffix(messages[i], "。")
+		}
 	}
 	return strings.Join(messages, "；"), public
+}
+
+func VideoSubmissionErrorMessage(taskErr *taskdto.TaskError) string {
+	if taskErr.StatusCode == http.StatusUnauthorized || taskErr.StatusCode == http.StatusForbidden {
+		return VideoSubmissionFailureMessage("material_configuration_failed")
+	}
+	fallback := VideoSubmissionFailureMessage(taskErr.Code)
+	if taskErr.Code != "fail_to_fetch_task" || taskErr.StatusCode < 400 || taskErr.StatusCode >= 500 || taskErr.StatusCode == http.StatusRequestTimeout || taskErr.StatusCode == http.StatusTooManyRequests {
+		return fallback
+	}
+	body := taskErr.Message
+	if taskErr.Error != nil {
+		body = taskErr.Error.Error()
+	}
+	var response struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+		Error   *struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if common.Unmarshal([]byte(body), &response) != nil {
+		return fallback
+	}
+	if response.Error != nil {
+		response.Code, response.Message = response.Error.Code, response.Error.Message
+	}
+	code := strings.ToLower(response.Code)
+	reason := strings.ToLower(topenRouterMaterialReasonURL.ReplaceAllString(response.Message, ""))
+	if strings.Contains(code, "internal") || strings.Contains(reason, "timeout") || strings.Contains(reason, "timed out") {
+		return fallback
+	}
+	switch {
+	case strings.Contains(code, "inputimagesensitivecontentdetected"):
+		return "参考图片未通过内容安全审核，请更换图片。"
+	case strings.Contains(code, "policyviolation") && strings.Contains(reason, "copyright"):
+		return "参考内容因可能涉及版权限制未通过审核，请修改后再试。"
+	case strings.Contains(code, "contentpolicyviolation"), strings.Contains(code, "contentsensitive"), strings.Contains(code, "contentfilter"):
+		return "参考内容或提示词未通过内容安全审核，请修改后再试。"
+	case strings.HasPrefix(code, "invalidparameter"), strings.HasPrefix(code, "missingparameter"):
+		return "视频请求参数不符合要求，请检查参数后再试。"
+	default:
+		return fallback
+	}
 }
 
 func VideoSubmissionFailureMessage(code string) string {
@@ -67,7 +141,7 @@ func VideoSubmissionFailureMessage(code string) string {
 	case "material_configuration_failed", "material_configuration_changed", "task_channel_changed", "task_channel_unavailable", "task_plugin_changed", "task_plugin_unavailable":
 		return "视频服务异常，请联系管理员"
 	case "material_preparation_timeout":
-		return "参考图片处理超时，请稍后重试"
+		return "参考图片处理超时，视频尚未提交，请查询已有任务或联系管理员核查。"
 	case "task_submission_unknown", "task_submission_interrupted", "task_submission_timeout":
 		return "视频提交结果暂无法确认，请勿重复提交"
 	case "task_timeout":
@@ -77,11 +151,21 @@ func VideoSubmissionFailureMessage(code string) string {
 	}
 }
 
-func PrepareVideoMaterials(ctx context.Context, userID int, channel MaterialChannel, inputs []MaterialImageInput) ([]string, []MaterialPreparationIssue, error) {
+func PrepareVideoMaterials(ctx context.Context, userID int, channel MaterialChannel, inputs []MaterialImageInput) (resolved []string, issues []MaterialPreparationIssue, err error) {
 	ctx, cancel := context.WithTimeout(ctx, 600*time.Second)
 	defer cancel()
+	defer func() {
+		for i := range issues {
+			for j, input := range inputs {
+				if issues[i].Index == input.Index {
+					issues[i].imageNumber = j + 1
+					break
+				}
+			}
+		}
+	}()
 	materials := make([]*model.Material, len(inputs))
-	issues := make([]MaterialPreparationIssue, 0)
+	issues = make([]MaterialPreparationIssue, 0)
 	for i, input := range inputs {
 		source := strings.TrimSpace(input.Source)
 		var material *model.Material
@@ -134,7 +218,7 @@ func PrepareVideoMaterials(ctx context.Context, userID int, channel MaterialChan
 	if len(issues) > 0 {
 		return nil, issues, nil
 	}
-	resolved := make([]string, len(inputs))
+	resolved = make([]string, len(inputs))
 	for {
 		issues = issues[:0]
 		pending := false
@@ -165,8 +249,6 @@ func PrepareVideoMaterials(ctx context.Context, userID int, channel MaterialChan
 				issue.Status, issue.Reason = "unavailable", "Video material readiness check failed; retry to check the existing material"
 			case errors.Is(err, gorm.ErrRecordNotFound) || current.Deleting || model.MaterialSourceVersion(&current) != model.MaterialSourceVersion(material):
 				issue.Status, issue.Reason = "unavailable", "Material is unavailable or its source changed"
-			case ctx.Err() != nil:
-				issue.Reason = "Material preparation wait ended; retry to check the existing material"
 			case binding.State == "ready" && binding.UpstreamStatus == "ACTIVE" && validateMobileCloudMaterialID(binding.AssetID) == nil:
 				resolved[i] = "asset://" + binding.AssetID
 				continue
@@ -176,9 +258,15 @@ func PrepareVideoMaterials(ctx context.Context, userID int, channel MaterialChan
 				if issue.Reason == "" {
 					issue.Reason = "Material is not ready; check the existing material before retrying"
 				}
+			case ctx.Err() != nil:
+				if issue.Reason == "" {
+					issue.Reason = "Material preparation wait ended; retry to check the existing material"
+				}
 			default:
 				pending = true
-				issue.Reason = "Material preparation is in progress"
+				if issue.Reason == "" {
+					issue.Reason = "Material preparation is in progress"
+				}
 			}
 			issues = append(issues, issue)
 		}
@@ -486,7 +574,7 @@ func prepareVideoMaterialBody(ctx context.Context, userID int, channel MaterialC
 	deadline, err := model.ReserveVideoMaterials(db.WithContext(ctx), userID, channel.Scope, owner, assetIDs)
 	if err != nil {
 		for i, input := range inputs {
-			issue := MaterialPreparationIssue{Index: input.Index, Field: input.Field, Usage: input.Usage, Status: "unavailable", Reason: "Material is unavailable or in use; retry after the current operation finishes"}
+			issue := MaterialPreparationIssue{Index: input.Index, imageNumber: i + 1, Field: input.Field, Usage: input.Usage, Status: "unavailable", Reason: "Material is unavailable or in use; retry after the current operation finishes"}
 			var material model.Material
 			bindings := db.Model(&model.MaterialBinding{}).Select("material_id").Where("scope = ? AND asset_id = ?", channel.Scope, assetIDs[i])
 			if lookupErr := db.WithContext(ctx).Where("user_id = ? AND id IN (?)", userID, bindings).Order("id").First(&material).Error; lookupErr == nil {

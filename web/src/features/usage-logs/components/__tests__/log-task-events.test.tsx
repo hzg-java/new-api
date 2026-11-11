@@ -129,15 +129,65 @@ describe('task events in consumption details', () => {
   })
 
   test.each([true, false])(
+    'video upstream diagnostics remain separate from the client response for administrators (%s)',
+    (isAdmin) => {
+      useAuthStore.getState().auth.setUser({
+        id: 7,
+        username: 'viewer',
+        role: isAdmin ? ROLE.ADMIN : ROLE.USER,
+      })
+      render(
+        details({
+          isAdmin,
+          log: {
+            ...log,
+            type: 5,
+            other: JSON.stringify({
+              admin_info: {
+                task_submission: {
+                  request: { model: 'video' },
+                  response: { message: 'concise-client-message' },
+                  upstream_error: {
+                    status_code: 403,
+                    body: {
+                      code: 'upstream-diagnostic-code',
+                      message: 'not configured',
+                    },
+                  },
+                },
+              },
+            }),
+          },
+        })
+      )
+      if (isAdmin) {
+        expect(
+          screen.getByRole('textbox', { name: 'Response' })
+        ).toHaveTextContent('concise-client-message')
+        const upstream = screen.getByRole('textbox', {
+          name: 'Upstream Response',
+        })
+        expect(upstream).toHaveTextContent('upstream-diagnostic-code')
+        expect(upstream).toHaveTextContent('403')
+      } else {
+        expect(
+          screen.queryByRole('textbox', { name: 'Upstream Response' })
+        ).not.toBeInTheDocument()
+        expect(
+          screen.queryByText('upstream-diagnostic-code')
+        ).not.toBeInTheDocument()
+      }
+    }
+  )
+
+  test.each([true, false])(
     'relay error snapshots respect administrator visibility (%s)',
     (isAdmin) => {
-      useAuthStore
-        .getState()
-        .auth.setUser({
-          id: 7,
-          username: 'viewer',
-          role: isAdmin ? ROLE.ADMIN : ROLE.USER,
-        })
+      useAuthStore.getState().auth.setUser({
+        id: 7,
+        username: 'viewer',
+        role: isAdmin ? ROLE.ADMIN : ROLE.USER,
+      })
       render(
         details({
           isAdmin,

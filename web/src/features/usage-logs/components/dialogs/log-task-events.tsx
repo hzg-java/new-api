@@ -16,10 +16,22 @@ export function FailedTaskSubmission(props: {
   submission?: NonNullable<LogOtherData['admin_info']>['task_submission']
 }) {
   const { t } = useTranslation()
+  const kinds: ('request' | 'response' | 'upstream_error')[] = [
+    'request',
+    'response',
+  ]
+  if (props.submission?.upstream_error !== undefined) {
+    kinds.push('upstream_error')
+  }
+  const labels = {
+    request: t('User Request'),
+    response: t('Response'),
+    upstream_error: t('Upstream Response'),
+  }
   return (
     <div className='min-w-0 space-y-3 border-t pt-4'>
-      {(['request', 'response'] as const).map((kind) => {
-        const label = kind === 'request' ? t('User Request') : t('Response')
+      {kinds.map((kind) => {
+        const label = labels[kind]
         const value = props.submission?.[kind]
         const code = JSON.stringify(value, null, 2)
         return (

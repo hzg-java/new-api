@@ -51,12 +51,13 @@ type MaterialReference struct {
 }
 
 type MaterialPreparationIssue struct {
-	Index      int    `json:"index"`
-	MaterialID string `json:"material_id"`
-	Field      string `json:"field"`
-	Usage      string `json:"usage"`
-	Status     string `json:"status"`
-	Reason     string `json:"reason"`
+	Index       int    `json:"index"`
+	MaterialID  string `json:"material_id"`
+	Field       string `json:"field"`
+	Usage       string `json:"usage"`
+	Status      string `json:"status"`
+	Reason      string `json:"reason"`
+	imageNumber int
 }
 
 func ResolvePreparedMaterials(ctx context.Context, userID int, scope string, references []MaterialReference) ([]string, []MaterialPreparationIssue, error) {
@@ -224,7 +225,7 @@ func PrepareMaterial(ctx context.Context, material *model.Material, scope string
 					}
 					return finishMaterialPreparation(db, material, binding, owner, "failed", materialOperationFailure("Material preparation rejected", createErr), true)
 				}
-				return finishMaterialPreparation(db, material, binding, owner, "uncertain", "Material group creation result is unknown; retry to check the existing result", true)
+				return finishMaterialPreparation(db, material, binding, owner, "uncertain", materialPreparationFailure("Material group creation result is unknown; retry to check the existing result", createErr), true)
 			}
 			group.UpstreamID, group.State = created.ID, "ready"
 			if err := model.SaveMaterialUpstreamGroup(db, &group, owner); err != nil {
@@ -234,7 +235,7 @@ func PrepareMaterial(ctx context.Context, material *model.Material, scope string
 		if claimed && !create {
 			items, queryErr := listMaterialGroups(ctx, provider, MobileCloudGroupQuery{GroupType: common.GetPointer("AIGC"), Name: &group.Name})
 			if queryErr != nil {
-				return finishMaterialPreparation(db, material, binding, owner, "uncertain", "Material group result could not be confirmed; retry to check without creating again", true)
+				return finishMaterialPreparation(db, material, binding, owner, "uncertain", materialPreparationFailure("Material group result could not be confirmed; retry to check without creating again", queryErr), true)
 			}
 			for _, candidate := range items {
 				if candidate.Name == group.Name && candidate.Type == "AIGC" && (group.CreationToken != "" && candidate.Description == group.CreationToken || group.CreationToken == "" && strings.HasPrefix(group.Name, "aigc-")) {
@@ -245,7 +246,11 @@ func PrepareMaterial(ctx context.Context, material *model.Material, scope string
 				}
 			}
 			if group.UpstreamID == "" {
-				return finishMaterialPreparation(db, material, binding, owner, "uncertain", "Material group creation result is unknown; retry to check the existing result", true)
+				reason := binding.FailReason
+				if reason == "" {
+					reason = "Material group creation result is unknown; retry to check the existing result"
+				}
+				return finishMaterialPreparation(db, material, binding, owner, "uncertain", reason, true)
 			}
 			group.State = "ready"
 			if err := model.SaveMaterialUpstreamGroup(db, &group, owner); err != nil {
@@ -273,6 +278,10 @@ func PrepareMaterial(ctx context.Context, material *model.Material, scope string
 			if _, rejected := materialRejectionMessage(createErr); rejected {
 				return finishMaterialPreparation(db, material, binding, owner, "failed", materialOperationFailure("Material preparation rejected", createErr), true)
 			}
+			binding.FailReason = materialPreparationFailure("Material upload result is unknown; retry to check without uploading again", createErr)
+			if err := model.SaveMaterialBinding(db, binding, owner); err != nil {
+				return err
+			}
 		} else {
 			binding.AssetID, binding.State = id, "processing"
 			if err := model.SaveMaterialBinding(db, binding, owner); err != nil {
@@ -283,7 +292,11 @@ func PrepareMaterial(ctx context.Context, material *model.Material, scope string
 	if binding.AssetID == "" {
 		items, queryErr := listMaterialAssets(ctx, provider, MobileCloudAssetQuery{GroupType: common.GetPointer("AIGC"), GroupIDs: []string{binding.GroupID}, Name: &binding.Name})
 		if queryErr != nil {
-			return finishMaterialPreparation(db, material, binding, owner, "uncertain", "Material upload result could not be confirmed; retry to check without uploading again", true)
+			reason := "Material upload result could not be confirmed; retry to check without uploading again"
+			if binding.FailReason != "" {
+				reason = binding.FailReason
+			}
+			return finishMaterialPreparation(db, material, binding, owner, "uncertain", materialPreparationFailure(reason, queryErr), true)
 		}
 		for _, candidate := range items {
 			if candidate.Name == binding.Name && candidate.GroupID == binding.GroupID && candidate.Type == "Image" {
@@ -295,7 +308,11 @@ func PrepareMaterial(ctx context.Context, material *model.Material, scope string
 			}
 		}
 		if binding.AssetID == "" {
-			return finishMaterialPreparation(db, material, binding, owner, "uncertain", "Material upload result is unknown; retry to check without uploading again", true)
+			reason := binding.FailReason
+			if reason == "" {
+				reason = "Material upload result is unknown; retry to check without uploading again"
+			}
+			return finishMaterialPreparation(db, material, binding, owner, "uncertain", reason, true)
 		}
 		binding.State = "processing"
 		if err := model.SaveMaterialBinding(db, binding, owner); err != nil {
@@ -304,10 +321,21 @@ func PrepareMaterial(ctx context.Context, material *model.Material, scope string
 	}
 	asset, err := provider.GetAsset(ctx, binding.AssetID)
 	if err != nil {
-		if common.GetTimestamp()-binding.StartedAt > 600 {
-			return finishMaterialPreparation(db, material, binding, owner, "uncertain", "Material preparation timed out; retry to check the existing material", true)
+		var rejection *TopenRouterMaterialRejection
+		if errors.As(err, &rejection) {
+			reason := "Material status query was rejected; check the existing material without uploading again"
+			if code, _, _ := strings.Cut(rejection.Code, "."); code == "NotFound" || rejection.StatusCode == 404 {
+				reason = "Material no longer exists or is inaccessible; check the existing material without uploading again"
+			}
+			return finishMaterialPreparation(db, material, binding, owner, "uncertain", materialPreparationFailure(reason, err), true)
 		}
-		return finishMaterialPreparation(db, material, binding, owner, "processing", "", false)
+		if binding.State == "uncertain" && binding.FailReason != "" && material.Status != model.MaterialStatusPending {
+			return finishMaterialPreparation(db, material, binding, owner, "uncertain", materialPreparationFailure(binding.FailReason, err), true)
+		}
+		if common.GetTimestamp()-binding.StartedAt > 600 {
+			return finishMaterialPreparation(db, material, binding, owner, "uncertain", materialPreparationFailure("Material preparation timed out; retry to check the existing material", err), true)
+		}
+		return finishMaterialPreparation(db, material, binding, owner, "processing", materialPreparationFailure("Material status query failed; check the existing material without uploading again", err), false)
 	}
 	var mismatchedFields []string
 	if asset.ID != binding.AssetID {
@@ -341,6 +369,20 @@ func PrepareMaterial(ctx context.Context, material *model.Material, scope string
 	default:
 		return finishMaterialPreparation(db, material, binding, owner, "uncertain", "Unrecognized material status; retry to check the existing material", true)
 	}
+}
+
+func materialPreparationFailure(reason string, cause error) string {
+	redacted, err := model.RedactTaskEventDetail(cause.Error())
+	var detail string
+	if err != nil || common.Unmarshal(redacted, &detail) != nil {
+		return reason
+	}
+	detail = strings.Join(strings.Fields(topenRouterMaterialReasonURL.ReplaceAllString(detail, "***")), " ")
+	if detail != "" && !strings.Contains(reason, detail) {
+		reason += ": " + detail
+	}
+	runes := []rune(reason)
+	return string(runes[:min(len(runes), 2048)])
 }
 
 func finishMaterialPreparation(db *gorm.DB, material *model.Material, binding *model.MaterialBinding, owner, state, reason string, retry bool) error {

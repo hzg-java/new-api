@@ -543,6 +543,7 @@ type taskEventResponseCapture struct {
 	task                  *model.Task
 	context               *gin.Context
 	request, attemptError json.RawMessage
+	attemptDiagnostic     json.RawMessage
 	detailKey             string
 	pending               []taskSubmissionErrorLog
 	finalErrorLog         *model.Log
@@ -551,8 +552,9 @@ type taskEventResponseCapture struct {
 }
 
 type taskSubmissionErrorLog struct {
-	log   *model.Log
-	write func()
+	log        *model.Log
+	write      func()
+	diagnostic json.RawMessage
 }
 
 // Error details are JSON values, never encoded strings or float64 round trips.
@@ -597,11 +599,15 @@ func (w *taskEventResponseCapture) arm(c *gin.Context, request any) {
 		if response == nil {
 			response = safeTaskSubmissionDetail(map[string]any{"message": log.Content})
 		}
-		admin[w.detailKey], _ = common.Marshal(map[string]json.RawMessage{"request": w.request, "response": response})
+		detail := map[string]json.RawMessage{"request": w.request, "response": response}
+		if len(w.attemptDiagnostic) > 0 {
+			detail["upstream_error"] = w.attemptDiagnostic
+		}
+		admin[w.detailKey], _ = common.Marshal(detail)
 		other["admin_info"], _ = common.Marshal(admin)
 		encoded, _ := common.Marshal(other)
 		log.Other = string(encoded)
-		w.pending = append(w.pending, taskSubmissionErrorLog{log: log, write: write})
+		w.pending = append(w.pending, taskSubmissionErrorLog{log: log, write: write, diagnostic: w.attemptDiagnostic})
 		w.finalErrorLog = log
 	})
 }
@@ -666,7 +672,11 @@ func (w *taskEventResponseCapture) record() {
 				_ = common.UnmarshalJsonStr(pending.log.Other, &other)
 				var admin map[string]json.RawMessage
 				_ = common.Unmarshal(other["admin_info"], &admin)
-				admin[w.detailKey], _ = common.Marshal(map[string]json.RawMessage{"request": w.request, "response": response})
+				entry := map[string]json.RawMessage{"request": w.request, "response": response}
+				if len(pending.diagnostic) > 0 {
+					entry["upstream_error"] = pending.diagnostic
+				}
+				admin[w.detailKey], _ = common.Marshal(entry)
 				other["admin_info"], _ = common.Marshal(admin)
 				encoded, _ := common.Marshal(other)
 				pending.log.Other = string(encoded)
@@ -776,6 +786,7 @@ func executeTaskSubmissionWith(
 		capture.finalErrorLog = nil
 		capture.finalError = nil
 		capture.attemptError = nil
+		capture.attemptDiagnostic = nil
 		if requestErr := c.Request.Context().Err(); requestErr != nil {
 			diagnostics.cancelled("before_attempt", retryParam.GetRetry()+1)
 			taskErr = service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
@@ -819,11 +830,16 @@ func executeTaskSubmissionWith(
 		stage = "submit"
 		capture.finalErrorLog = nil
 		capture.attemptError = nil
+		capture.attemptDiagnostic = nil
 		common.SetContextKey(c, constant.ContextKeyTaskEventUpstreamRequest, nil)
 		result, taskErr = submit(c, relayInfo)
+		if taskErr != nil {
+			capture.attemptDiagnostic = service.TaskErrorDiagnostic(taskErr)
+		}
 		if requestErr := c.Request.Context().Err(); requestErr != nil {
 			diagnostics.cancelled("after_submit", retryParam.GetRetry()+1)
 			taskErr = service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
+			taskErr.Diagnostic = capture.attemptDiagnostic
 			break
 		}
 		if taskErr == nil {
@@ -1145,11 +1161,9 @@ func respondTaskError(c *gin.Context, taskErr *taskdto.TaskError) {
 	c.JSON(taskErr.StatusCode, taskErr)
 }
 
-// taskSubmissionAPIError adapts a task error for the shared relay error paths.
-// TaskError.Error is nil for many local rejections, so fall back to the message.
 func taskSubmissionAPIError(taskErr *taskdto.TaskError) *types.NewAPIError {
 	err := taskErr.Error
-	if err == nil {
+	if err == nil || len(taskErr.Diagnostic) > 0 {
 		err = errors.New(taskErr.Message)
 	}
 	return types.NewOpenAIError(err, types.ErrorCodeBadResponseStatusCode, taskErr.StatusCode)

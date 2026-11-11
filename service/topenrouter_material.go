@@ -25,9 +25,16 @@ const topenRouterMaterialPath = "/v1/api/assets/"
 
 // Also remove malformed URLs that the shared URL parser cannot redact.
 var topenRouterMaterialReasonURL = regexp.MustCompile(`(?i)https?://[^\s"'<>]+`)
+var topenRouterMaterialErrorCode = regexp.MustCompile(`^[A-Z][A-Za-z0-9]*(?:\.[A-Za-z0-9_]+)*$`)
 
 // Only an explicit upstream refusal is safe to classify as rejection.
-type TopenRouterMaterialRejection struct{ Message string }
+type TopenRouterMaterialRejection struct {
+	Message    string
+	Code       string
+	StatusCode int
+	Action     string
+	RequestID  string
+}
 
 func (e *TopenRouterMaterialRejection) Error() string { return e.Message }
 
@@ -148,6 +155,9 @@ func NewTopenRouterMaterialClient(endpoint, token string) (*TopenRouterMaterialC
 }
 
 func (c *TopenRouterMaterialClient) safeReason(reason string) string {
+	if strings.TrimSpace(reason) == "" {
+		return ""
+	}
 	reason = strings.ReplaceAll(reason, c.token, "***")
 	reason = types.NewError(errors.New("Material request failed"), types.ErrorCodeBadResponse,
 		types.ErrOptionWithUpstreamResponse(types.OpenAIError{Message: reason})).ToOpenAIRelayError().Message
@@ -169,34 +179,49 @@ func (c *TopenRouterMaterialClient) request(ctx context.Context, action string, 
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
+	message := "topenrouter material upstream action=" + c.safeReason(action)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		// url.Error includes the endpoint; retain its cause, never its URL.
+		var urlErr *url.Error
+		cause := err
+		if errors.As(err, &urlErr) {
+			cause = urlErr.Err
+		}
+		message += ": connection failed: " + c.safeReason(cause.Error()) + "; result is unknown"
 		if errors.Is(err, context.Canceled) {
-			return fmt.Errorf("topenrouter material request canceled: %w", context.Canceled)
+			return fmt.Errorf("%s: %w", message, context.Canceled)
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
-			return fmt.Errorf("topenrouter material request timed out: %w", context.DeadlineExceeded)
+			return fmt.Errorf("%s: %w", message, context.DeadlineExceeded)
 		}
-		return errors.New("topenrouter material upstream connection failed; result is unknown")
+		return errors.New(message)
 	}
 	defer resp.Body.Close()
+	message += fmt.Sprintf(" HTTP status %d", resp.StatusCode)
+	requestID := c.safeReason(resp.Header.Get("X-Request-Id"))
+	if requestID != "" {
+		message += " requestID=" + requestID
+	}
 	const maxResponseBytes = 4 << 20
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
+		message += ": response could not be read: " + c.safeReason(err.Error()) + "; result is unknown"
 		if errors.Is(err, context.Canceled) {
-			return fmt.Errorf("topenrouter material response canceled: %w", context.Canceled)
+			return fmt.Errorf("%s: %w", message, context.Canceled)
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
-			return fmt.Errorf("topenrouter material response timed out: %w", context.DeadlineExceeded)
+			return fmt.Errorf("%s: %w", message, context.DeadlineExceeded)
 		}
-		return errors.New("topenrouter material upstream response could not be read; result is unknown")
+		return errors.New(message)
 	}
 	if len(data) > maxResponseBytes {
-		return errors.New("topenrouter material upstream response exceeds size limit; result is unknown")
+		return errors.New(message + ": response exceeds size limit; result is unknown")
 	}
 	var envelope struct {
 		ResponseMetadata struct {
-			Error *struct {
+			RequestID string `json:"RequestId"`
+			Error     *struct {
 				Code    string `json:"Code"`
 				Message string `json:"Message"`
 			} `json:"Error"`
@@ -205,42 +230,70 @@ func (c *TopenRouterMaterialClient) request(ctx context.Context, action string, 
 		Code    *int              `json:"code"`
 		Message string            `json:"message"`
 	}
-	message := "topenrouter material upstream rejected the request"
 	httpFailed := resp.StatusCode < 200 || resp.StatusCode >= 300
-	if httpFailed {
-		message = fmt.Sprintf("topenrouter material upstream HTTP status %d", resp.StatusCode)
-	}
 	data = bytes.TrimSpace(data)
 	if len(data) == 0 || data[0] != '{' || common.Unmarshal(data, &envelope) != nil {
 		return errors.New(message + ": invalid JSON response; result is unknown")
 	}
+	if envelope.ResponseMetadata.RequestID != "" {
+		requestID = c.safeReason(envelope.ResponseMetadata.RequestID)
+		message += " requestID=" + requestID
+	}
 	official := envelope.ResponseMetadata.Error
 	platformError := envelope.Code != nil && *envelope.Code == 1
-	if httpFailed || official != nil || platformError {
-		rejected := resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusRequestTimeout && resp.StatusCode != http.StatusTooManyRequests
-		if !httpFailed {
-			// Internal, throttling, timeout and unknown errors cannot prove refusal.
-			rejected = platformError
-			if official != nil {
-				code, _, _ := strings.Cut(official.Code, ".")
-				rejected = slices.Contains([]string{"InvalidParameter", "InvalidParameterValue", "MissingParameter", "NotFound", "Unauthorized", "AccessDenied", "Forbidden", "AuthenticationFailed", "InvalidAction", "InvalidVersion"}, code)
-			}
-		}
-		reason := envelope.Message
+	if httpFailed || official != nil || envelope.Code != nil {
+		code, reason := "", envelope.Message
+		rejected := false
 		if official != nil {
-			reason = official.Message
+			code, reason = official.Code, official.Message
+			baseCode, _, _ := strings.Cut(code, ".")
+			// Official codes take precedence over HTTP and platform envelopes.
+			rejected = slices.Contains([]string{"InvalidParameter", "InvalidParameterValue", "MissingParameter", "NotFound", "Unauthorized", "AccessDenied", "Forbidden", "AuthenticationFailed", "InvalidAction", "InvalidVersion"}, baseCode)
+		} else {
+			if envelope.Code != nil {
+				code = strconv.Itoa(*envelope.Code)
+			}
+			lowerReason := strings.ToLower(reason)
+			// Code 1 alone is not evidence: gateways use it for transport failures too.
+			transient := slices.ContainsFunc([]string{"internal", "eof", "timeout", "timed out", "deadline", "connection", "connect", "network", "tls", "rate limit", "too many requests", "throttl", "unavailable"}, func(fragment string) bool {
+				return strings.Contains(lowerReason, fragment)
+			})
+			validation := slices.ContainsFunc([]string{"validation failed", "validation error", "invalid parameter", "invalid url", "invalid image", "invalid asset", "invalid group", "unsupported image", "unsupported asset", "url not allowed", "missing parameter", "required parameter", "is required"}, func(fragment string) bool {
+				return strings.Contains(lowerReason, fragment)
+			})
+			rejected = !transient && (resp.StatusCode == http.StatusUnauthorized ||
+				resp.StatusCode == http.StatusForbidden && strings.Contains(lowerReason, "not configured") ||
+				platformError && validation)
+		}
+		// A timeout, throttle, server failure or redirect never proves refusal.
+		rejected = rejected && (resp.StatusCode >= 200 && resp.StatusCode < 300 || resp.StatusCode >= 400 && resp.StatusCode < 500) &&
+			resp.StatusCode != http.StatusRequestTimeout && resp.StatusCode != http.StatusTooManyRequests
+		// The shared reason sanitizer mistakes dotted official codes for domains.
+		// Preserve only code-shaped metadata and still redact credentials in it.
+		if official != nil && topenRouterMaterialErrorCode.MatchString(code) {
+			codeParts := strings.Split(strings.ReplaceAll(code, c.token, "***"), ".")
+			for i := range codeParts {
+				codeParts[i] = c.safeReason(codeParts[i])
+			}
+			code = strings.Join(codeParts, ".")
+			code = string([]rune(code)[:min(512, utf8.RuneCountInString(code))])
+		} else {
+			code = c.safeReason(code)
+		}
+		if code != "" {
+			message += " code=" + code
 		}
 		if strings.TrimSpace(reason) != "" {
 			message += ": " + c.safeReason(reason)
 		}
 		if rejected {
-			return &TopenRouterMaterialRejection{Message: message}
+			return &TopenRouterMaterialRejection{Message: message, Code: code, StatusCode: resp.StatusCode, Action: c.safeReason(action), RequestID: requestID}
 		}
 		return errors.New(message + "; result is unknown")
 	}
 	result := bytes.TrimSpace(envelope.Result)
-	if envelope.Code != nil || len(result) == 0 || result[0] != '{' || common.Unmarshal(result, output) != nil {
-		return errors.New("topenrouter material upstream result is missing or invalid; result is unknown")
+	if len(result) == 0 || result[0] != '{' || common.Unmarshal(result, output) != nil {
+		return errors.New(message + ": result is missing or invalid; result is unknown")
 	}
 	return nil
 }

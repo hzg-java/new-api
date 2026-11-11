@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	taskdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 )
@@ -228,6 +229,34 @@ func parseStatusCodeMappingValue(value any) (int, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func TaskErrorDiagnostic(taskErr *taskdto.TaskError) json.RawMessage {
+	var detail any = taskErr.Diagnostic
+	if len(taskErr.Diagnostic) == 0 {
+		message := taskErr.Message
+		if taskErr.Error != nil {
+			message = taskErr.Error.Error()
+		}
+		fields := map[string]any{"code": taskErr.Code, "status_code": taskErr.StatusCode, "message": message}
+		var body json.RawMessage
+		if common.Unmarshal([]byte(message), &body) == nil {
+			fields["body"] = body
+			delete(fields, "message")
+		}
+		if taskErr.Data != nil {
+			fields["data"] = taskErr.Data
+		}
+		detail = fields
+	}
+	redacted, err := model.RedactTaskEventDetail(detail)
+	if err != nil {
+		return json.RawMessage(`{"unavailable":"redaction_failed"}`)
+	}
+	if len(redacted) > model.TaskEventPayloadLimit {
+		return json.RawMessage(`{"unavailable":"size_limit_exceeded"}`)
+	}
+	return redacted
 }
 
 func TaskErrorWrapperLocal(err error, code string, statusCode int) *taskdto.TaskError {

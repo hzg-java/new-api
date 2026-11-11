@@ -326,14 +326,11 @@ func runVideoSubmission(parent context.Context, task *model.Task, plugin *plugin
 		}
 		cleanup, cancel := context.WithTimeout(context.WithoutCancel(parent), 10*time.Second)
 		defer cancel()
-		if taskErr != nil && taskErr.Code == "material_preparation_failed" {
-			return failVideoSubmission(cleanup, task, owner, taskErr)
-		}
-		return failVideoSubmission(cleanup, task, owner, &dto.TaskError{Code: "task_submission_timeout", Message: "Video task submission timed out; the provider request will not be replayed automatically"})
+		return failVideoSubmission(cleanup, task, owner, videoSubmissionDeadlineError(task.SubmissionStage, taskErr))
 	}
 	if taskErr != nil {
 		if task.SubmissionStage == "submitting" && (taskErr.Code == "do_request_failed" || taskErr.Code == "read_response_body_failed" || taskErr.Code == "plugin_submit_response_failed" || taskErr.Code == "plugin_submit_response_invalid") {
-			taskErr = &dto.TaskError{Code: "task_submission_unknown", Message: "Video submission result is unknown; the provider may have accepted the request. This task will not be submitted again automatically"}
+			taskErr = &dto.TaskError{Code: "task_submission_unknown", Message: "Video submission result is unknown; the provider may have accepted the request. This task will not be submitted again automatically", Diagnostic: service.TaskErrorDiagnostic(taskErr)}
 		}
 		return failVideoSubmission(ctx, task, owner, taskErr)
 	}
@@ -373,13 +370,25 @@ func runVideoSubmission(parent context.Context, task *model.Task, plugin *plugin
 	return settleVideoSubmission(ctx, task, owner)
 }
 
+func videoSubmissionDeadlineError(stage string, previous *dto.TaskError) *dto.TaskError {
+	if previous != nil && (previous.Code == "material_preparation_failed" || previous.Code == "fail_to_fetch_task") {
+		return previous
+	}
+	code := "task_submission_timeout"
+	if stage == "preparing" {
+		code = "material_preparation_timeout"
+	}
+	taskErr := &dto.TaskError{Code: code, Message: service.VideoSubmissionFailureMessage(code), NoRetry: true}
+	if previous != nil {
+		taskErr.Diagnostic = service.TaskErrorDiagnostic(previous)
+	}
+	return taskErr
+}
+
 func failVideoSubmission(ctx context.Context, task *model.Task, owner string, taskErr *dto.TaskError) error {
 	reason := kittypes.NewError(errors.New("Video task submission failed"), kittypes.ErrorCodeBadResponse, kittypes.ErrOptionWithUpstreamResponse(kittypes.OpenAIError{Message: taskErr.Message})).ToOpenAIRelayError().Message
 	logger.LogWarn(ctx, "video_submission task_id=%q channel_id=%d code=%q reason=%q", task.TaskID, task.ChannelId, taskErr.Code, reason)
-	message := service.VideoSubmissionFailureMessage(taskErr.Code)
-	if taskErr.StatusCode == http.StatusUnauthorized || taskErr.StatusCode == http.StatusForbidden {
-		message = service.VideoSubmissionFailureMessage("material_configuration_failed")
-	}
+	message := service.VideoSubmissionErrorMessage(taskErr)
 	var materials []service.MaterialPreparationIssue
 	if taskErr.Code == "material_preparation_failed" {
 		if issues, ok := taskErr.Data.([]service.MaterialPreparationIssue); ok && len(issues) > 0 {
@@ -402,8 +411,14 @@ func failVideoSubmission(ctx context.Context, task *model.Task, owner string, ta
 		return errors.New("video submission lease lost before failure persistence")
 	}
 	task.SubmissionStage = "failed"
-	if err := model.RecordTaskEvent(task.ID, "result", task.FinishTime, model.TaskResultEventPayload(task)); err != nil {
+	payload := model.TaskResultEventPayload(task)
+	detail := payload["admin_info"].(map[string]any)
+	detail["upstream_error"] = service.TaskErrorDiagnostic(taskErr)
+	delete(payload, "admin_info")
+	if err := model.RecordTaskEvent(task.ID, "result", task.FinishTime, payload); err != nil {
 		logger.LogWarn(ctx, "record failed video task event: "+err.Error())
+	} else if err := model.RecordTaskEventDetail(task.ID, "result", task.FinishTime, detail); err != nil {
+		logger.LogWarn(ctx, "record failed video task detail: "+err.Error())
 	}
 	return settleVideoSubmission(ctx, task, owner)
 }

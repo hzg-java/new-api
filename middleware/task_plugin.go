@@ -1296,9 +1296,13 @@ func RespondTaskPluginError(c *gin.Context, taskErr *dto.TaskError) bool {
 	}
 	sanitized := sanitizedTaskPluginError(taskErr.StatusCode, taskErr.Message)
 	if taskErr.NoRetry {
+		sanitized.Retryable = false
 		switch taskErr.Message {
 		case service.VideoSubmissionFailureMessage("task_submission_unknown"), service.VideoSubmissionFailureMessage("material_configuration_failed"), service.VideoSubmissionFailureMessage(""):
-			sanitized.Message, sanitized.Retryable = taskErr.Message, false
+			sanitized.Message = taskErr.Message
+		}
+		if taskErr.Code == "fail_to_fetch_task" {
+			sanitized.Message = service.VideoSubmissionErrorMessage(taskErr)
 		}
 	}
 	var safeData []map[string]any

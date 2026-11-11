@@ -151,6 +151,7 @@ export interface LogOtherData {
     task_submission?: {
       request?: unknown
       response?: unknown
+      upstream_error?: unknown
     }
     relay_error?: {
       request?: unknown

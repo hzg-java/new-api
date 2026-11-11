@@ -416,6 +416,7 @@ func submitPreparedTask(c *gin.Context, info *relaycommon.RelayInfo, platform co
 			if finalTaskErr == nil {
 				return
 			}
+			finalTaskErr.Diagnostic = service.TaskErrorDiagnostic(finalTaskErr)
 			reason := kittypes.NewError(errors.New("Video task submission failed"), kittypes.ErrorCodeBadResponse, kittypes.ErrOptionWithUpstreamResponse(kittypes.OpenAIError{Message: finalTaskErr.Message})).ToOpenAIRelayError().Message
 			logger.LogWarn(c, "video_submission task_id=%q channel_id=%d code=%q reason=%q", info.PublicTaskID, info.ChannelId, finalTaskErr.Code, reason)
 			finalTaskErr.NoRetry = true
@@ -423,10 +424,7 @@ func submitPreparedTask(c *gin.Context, info *relaycommon.RelayInfo, platform co
 			case "do_request_failed", "read_response_body_failed", "plugin_submit_response_failed", "plugin_submit_response_invalid":
 				finalTaskErr.Message = service.VideoSubmissionFailureMessage("task_submission_unknown")
 			default:
-				finalTaskErr.Message = service.VideoSubmissionFailureMessage(finalTaskErr.Code)
-				if finalTaskErr.StatusCode == http.StatusUnauthorized || finalTaskErr.StatusCode == http.StatusForbidden {
-					finalTaskErr.Message = service.VideoSubmissionFailureMessage("material_configuration_failed")
-				}
+				finalTaskErr.Message = service.VideoSubmissionErrorMessage(finalTaskErr)
 			}
 		}()
 	}
