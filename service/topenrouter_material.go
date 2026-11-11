@@ -418,9 +418,6 @@ func (c *TopenRouterMaterialClient) CreateAsset(ctx context.Context, asset Mobil
 	if err := validateTopenRouterMaterialID(result.ID); err != nil {
 		return "", err
 	}
-	if strings.TrimSpace(result.Status) == "" {
-		return "", errors.New("topenrouter material create response status is missing; result is unknown")
-	}
 	return result.ID, nil
 }
 

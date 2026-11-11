@@ -81,9 +81,13 @@ func TestTopenRouterMaterialActions(t *testing.T) {
 			return c.UpdateAssetGroup(ctx, "group-1", MobileCloudGroupUpdate{Name: common.GetPointer("portraits"), Description: common.GetPointer("")})
 		}, &MobileCloudAssetGroup{ID: "group-1", Name: "portraits", Type: "AIGC", Description: "ownership", CreatedTime: "created", UpdatedTime: "updated"}},
 		{"DeleteAssetGroup", `{"Id":"group-1"}`, `{}`, "", "", func(c *TopenRouterMaterialClient) (any, error) { return c.DeleteAssetGroup(ctx, "group-1") }, true},
-		{"CreateAsset", `{"URL":"https://source.example/input.png","AssetType":"Image","Name":"portrait","GroupId":"group-1"}`, `{"Id":"asset-1","Status":"Processing"}`, "", "", func(c *TopenRouterMaterialClient) (any, error) {
-			return c.CreateAsset(ctx, MobileCloudCreateAssetInput{GroupID: "group-1", Name: "portrait", Type: "Image", URL: "https://source.example/input.png"})
-		}, "asset-1"},
+		{"CreateAsset", `{"URL":"https://source.example/input.png","AssetType":"Image","Name":"portrait","GroupId":"group-1"}`, `{"Id":"asset-1"}`, "GetAsset", asset, func(c *TopenRouterMaterialClient) (any, error) {
+			id, err := c.CreateAsset(ctx, MobileCloudCreateAssetInput{GroupID: "group-1", Name: "portrait", Type: "Image", URL: "https://source.example/input.png"})
+			if err != nil {
+				return nil, err
+			}
+			return c.GetAsset(ctx, id)
+		}, &MobileCloudAsset{ID: "asset-1", GroupID: "group-1", Name: "portrait", Type: "Image", URL: "https://source.example/current?token=temporary", Status: "ACTIVE", CreatedTime: "created", UpdatedTime: "updated"}},
 		{"ListAssets", `{"Page":2,"PageSize":20,"GroupIds":["group-1"]}`, `{"Items":[` + asset + `],"TotalCount":21}`, "", "", func(c *TopenRouterMaterialClient) (any, error) {
 			return c.ListAssets(ctx, MobileCloudAssetQuery{PageNo: common.GetPointer(int32(2)), PageSize: common.GetPointer(int32(20)), GroupType: common.GetPointer("AIGC"), GroupIDs: []string{"group-1"}, Name: common.GetPointer("does-not-match"), Statuses: []string{"FAILED"}})
 		}, &MobileCloudMaterialPage[MobileCloudAsset]{Data: []MobileCloudAsset{{ID: "asset-1", GroupID: "group-1", Name: "portrait", Type: "Image", URL: "https://source.example/current?token=temporary", Status: "ACTIVE", CreatedTime: "created", UpdatedTime: "updated"}}, Total: 21}},
@@ -250,7 +254,8 @@ func TestTopenRouterMaterialFailures(t *testing.T) {
 		{"string result", 200, `{"Result":"asset-1"}`, false, ""},
 		{"array result", 200, `{"Result":[]}`, false, ""},
 		{"empty result", 200, `{"Result":{}}`, false, ""},
-		{"missing create status", 200, `{"Result":{"Id":"asset-1"}}`, false, ""},
+		{"missing create id", 200, `{"Result":{"Status":"Processing"}}`, false, ""},
+		{"invalid create id", 200, `{"Result":{"Id":"../asset"}}`, false, ""},
 		{"trailing JSON", 200, `{"Result":{"Id":"asset-1","Status":"Processing"}}{}`, false, ""},
 		{"oversized", 200, `{"padding":"` + strings.Repeat("x", 4<<20) + `"}`, false, "size limit"},
 		{"private reason", 400, `{"code":1,"message":"Unsupported image format; test-platform-token; https://private.example/raw/path?token=private-token; Authorization: Bearer other-private-token"}`, true, "Unsupported image format"},
