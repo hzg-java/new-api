@@ -4480,6 +4480,33 @@ func TestVideoMaterialFailureStateBoundaries(t *testing.T) {
 	}
 }
 
+func TestAIGCMaterialRetryRecreatesUncertainUploadWithoutAssetID(t *testing.T) {
+	db, users := setupAdminMaterialPostgres(t)
+	material := model.Material{
+		MaterialID: model.NewPlatformMaterialID(), UserId: users[1].Id,
+		Name: "uncertain retry", LibraryType: model.MaterialLibraryAIGC,
+		FileType: model.MaterialFileImage, SourceURL: publicMaterialURL,
+		Status: model.MaterialStatusFailed, CanRetry: true,
+	}
+	require.NoError(t, db.Create(&material).Error)
+	binding := model.MaterialBinding{
+		MaterialId: material.Id, Scope: "uncertain-retry", Version: model.MaterialSourceVersion(&material),
+		ChannelID: 16, Provider: "topenrouter", Name: "old-upload-name",
+		GroupID: "upstream-group", State: "uncertain", FailReason: "upload result unknown",
+		CanRetry: true, StartedAt: common.GetTimestamp() - 30,
+	}
+	require.NoError(t, db.Create(&binding).Error)
+	provider := &materialPreparationProvider{status: "ACTIVE"}
+	retried, err := model.RetryUserMaterial(users[1].Id, material.Id)
+	require.NoError(t, err)
+	require.NoError(t, service.PrepareMaterial(t.Context(), retried, binding.Scope, provider))
+	require.NoError(t, db.First(&binding, binding.Id).Error)
+	assert.Equal(t, 1, provider.assets)
+	assert.NotEqual(t, "old-upload-name", binding.Name)
+	assert.Equal(t, "ready", binding.State)
+	assert.NotEmpty(t, binding.AssetID)
+}
+
 func TestAIGCMaterialReadinessGate(t *testing.T) {
 	db, users := setupAdminMaterialPostgres(t)
 	require.NoError(t, model.MigrateMaterialPreparation(db))

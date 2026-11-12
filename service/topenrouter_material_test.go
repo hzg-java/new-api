@@ -23,6 +23,7 @@ func newTopenRouterMaterialTestClient(t *testing.T, server *httptest.Server) *To
 	t.Helper()
 	client, err := NewTopenRouterMaterialClient(server.URL, "test-platform-token")
 	require.NoError(t, err)
+	client.retryWait = func(context.Context, time.Duration) error { return nil }
 	transport := client.httpClient.Transport.(*http.Transport)
 	transport.TLSClientConfig.RootCAs = server.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
 	t.Cleanup(transport.CloseIdleConnections)
@@ -305,7 +306,11 @@ func TestTopenRouterMaterialFailures(t *testing.T) {
 			for _, private := range []string{"test-platform-token", "private-token", "private.example", "/raw/path", server.URL} {
 				assert.NotContains(t, err.Error(), private)
 			}
-			assert.Equal(t, int32(1), calls.Load(), "mutations must never be retried")
+			wantCalls := int32(1)
+			if !tc.rejection && topenRouterMaterialRetryable(tc.status, "", tc.body) {
+				wantCalls = 3
+			}
+			assert.Equal(t, wantCalls, calls.Load(), "explicit rejections must never be retried")
 		})
 	}
 	// GetAsset callers need structured refusal metadata to distinguish a missing
@@ -356,6 +361,113 @@ func TestTopenRouterMaterialFailures(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTopenRouterMaterialCreateAssetRetries(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		responses []struct {
+			status int
+			body   string
+		}
+		wantCalls  int32
+		wantID     string
+		wantReject bool
+	}{
+		{
+			name: "502 then succeeds",
+			responses: []struct {
+				status int
+				body   string
+			}{
+				{http.StatusBadGateway, `{"code":1,"message":"gateway internal error"}`},
+				{http.StatusOK, `{"Result":{"Id":"asset-2"}}`},
+			},
+			wantCalls: 2, wantID: "asset-2",
+		},
+		{
+			name: "two transient failures then succeeds",
+			responses: []struct {
+				status int
+				body   string
+			}{
+				{http.StatusServiceUnavailable, `{"code":1,"message":"upstream unavailable"}`},
+				{http.StatusTooManyRequests, `{"code":1,"message":"rate limited"}`},
+				{http.StatusOK, `{"Result":{"Id":"asset-3"}}`},
+			},
+			wantCalls: 3, wantID: "asset-3",
+		},
+		{
+			name: "three transient failures preserve final error",
+			responses: []struct {
+				status int
+				body   string
+			}{
+				{http.StatusBadGateway, `{"code":1,"message":"gateway internal error"}`},
+				{http.StatusBadGateway, `{"code":1,"message":"gateway internal error"}`},
+				{http.StatusBadGateway, `{"code":1,"message":"gateway internal error"}`},
+			},
+			wantCalls: 3,
+		},
+		{
+			name: "explicit rejection is not retried",
+			responses: []struct {
+				status int
+				body   string
+			}{
+				{http.StatusBadRequest, `{"ResponseMetadata":{"Error":{"Code":"InvalidParameter.URL","Message":"Unsupported image format"}}}`},
+			},
+			wantCalls: 1, wantReject: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				index := int(calls.Add(1)) - 1
+				require.Less(t, index, len(tc.responses))
+				body, err := io.ReadAll(r.Body)
+				require.NoError(t, err)
+				assert.JSONEq(t, `{"URL":"https://source.example/input.png","AssetType":"Image","Name":"portrait","GroupId":"group-1"}`, string(body))
+				w.WriteHeader(tc.responses[index].status)
+				_, _ = io.WriteString(w, tc.responses[index].body)
+			}))
+			defer server.Close()
+			client := newTopenRouterMaterialTestClient(t, server)
+			id, err := client.CreateAsset(t.Context(), MobileCloudCreateAssetInput{GroupID: "group-1", Name: "portrait", Type: "Image", URL: "https://source.example/input.png"})
+			assert.Equal(t, tc.wantCalls, calls.Load())
+			if tc.wantID != "" {
+				require.NoError(t, err)
+				assert.Equal(t, tc.wantID, id)
+				return
+			}
+			require.Error(t, err)
+			assert.Empty(t, id)
+			var rejection *TopenRouterMaterialRejection
+			assert.Equal(t, tc.wantReject, errors.As(err, &rejection))
+			if !tc.wantReject {
+				assert.Contains(t, err.Error(), "attempts=3")
+				assert.Contains(t, err.Error(), "result is unknown")
+			}
+		})
+	}
+}
+
+func TestTopenRouterMaterialCreateAssetStopsAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		cancel()
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, `{"code":1,"message":"gateway internal error"}`)
+	}))
+	defer server.Close()
+	client := newTopenRouterMaterialTestClient(t, server)
+	_, err := client.CreateAsset(ctx, MobileCloudCreateAssetInput{GroupID: "group-1", Name: "portrait", Type: "Image", URL: "https://source.example/input.png"})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, int32(1), calls.Load())
 }
 
 func TestTopenRouterMaterialReasonPrivacy(t *testing.T) {

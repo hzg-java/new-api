@@ -149,6 +149,17 @@ func PrepareMaterial(ctx context.Context, material *model.Material, scope string
 			return err
 		}
 	}
+	if material.Status == model.MaterialStatusPending && binding.State == "uncertain" && binding.AssetID == "" {
+		binding.State = "pending"
+		binding.FailReason = ""
+		binding.CanRetry = false
+		binding.Name = "aigc-" + common.GetUUID()
+		binding.StartedAt = common.GetTimestamp()
+		binding.UpstreamStatus = ""
+		if err := model.SaveMaterialBinding(db, binding, owner); err != nil {
+			return err
+		}
+	}
 	if material.GroupId != nil && binding.AssetID == "" && (binding.GroupID == "" || binding.State == "pending") {
 		var group model.MaterialGroup
 		if err := db.Where("id = ? AND user_id = ?", *material.GroupId, material.UserId).First(&group).Error; err != nil {

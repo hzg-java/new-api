@@ -38,10 +38,40 @@ type TopenRouterMaterialRejection struct {
 
 func (e *TopenRouterMaterialRejection) Error() string { return e.Message }
 
+type topenRouterMaterialRetryableError struct{ error }
+
+func (e *topenRouterMaterialRetryableError) Unwrap() error { return e.error }
+
+type topenRouterMaterialAttemptsError struct {
+	error
+	attempts int
+}
+
+func (e *topenRouterMaterialAttemptsError) Error() string {
+	return fmt.Sprintf("%s; attempts=%d", e.error, e.attempts)
+}
+
+func (e *topenRouterMaterialAttemptsError) Unwrap() error { return e.error }
+
+func topenRouterMaterialRetryable(status int, code, reason string) bool {
+	if slices.Contains([]int{http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout}, status) {
+		return true
+	}
+	code = strings.ToLower(code)
+	if slices.Contains([]string{"internalerror", "unavailable", "throttling"}, code) {
+		return true
+	}
+	reason = strings.ToLower(reason)
+	return slices.ContainsFunc([]string{"internal", "eof", "connection reset", "connection", "network", "timeout", "timed out", "deadline", "rate limit", "too many requests", "throttl", "unavailable"}, func(fragment string) bool {
+		return strings.Contains(reason, fragment)
+	})
+}
+
 type TopenRouterMaterialClient struct {
 	endpoint   url.URL
 	token      string
 	httpClient *http.Client
+	retryWait  func(context.Context, time.Duration) error
 }
 
 var _ MaterialManagementProvider = (*TopenRouterMaterialClient)(nil)
@@ -117,6 +147,17 @@ func (c *TopenRouterMaterialClient) materialAsset(a topenRouterMaterialAsset) Mo
 	return asset
 }
 
+func waitTopenRouterMaterialRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 func NewTopenRouterMaterialClient(endpoint, token string) (*TopenRouterMaterialClient, error) {
 	base, err := url.Parse(endpoint)
 	if err != nil || base.Scheme != "https" || base.Hostname() == "" || base.User != nil || base.Opaque != "" || base.RawPath != "" || strings.ContainsAny(endpoint, "?#") {
@@ -151,6 +192,7 @@ func NewTopenRouterMaterialClient(endpoint, token string) (*TopenRouterMaterialC
 			Transport: transport, Timeout: 60 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
+		retryWait: waitTopenRouterMaterialRetry,
 	}, nil
 }
 
@@ -195,7 +237,7 @@ func (c *TopenRouterMaterialClient) request(ctx context.Context, action string, 
 		if errors.Is(err, context.DeadlineExceeded) {
 			return fmt.Errorf("%s: %w", message, context.DeadlineExceeded)
 		}
-		return errors.New(message)
+		return &topenRouterMaterialRetryableError{error: errors.New(message)}
 	}
 	defer resp.Body.Close()
 	message += fmt.Sprintf(" HTTP status %d", resp.StatusCode)
@@ -213,7 +255,7 @@ func (c *TopenRouterMaterialClient) request(ctx context.Context, action string, 
 		if errors.Is(err, context.DeadlineExceeded) {
 			return fmt.Errorf("%s: %w", message, context.DeadlineExceeded)
 		}
-		return errors.New(message)
+		return &topenRouterMaterialRetryableError{error: errors.New(message)}
 	}
 	if len(data) > maxResponseBytes {
 		return errors.New(message + ": response exceeds size limit; result is unknown")
@@ -233,7 +275,11 @@ func (c *TopenRouterMaterialClient) request(ctx context.Context, action string, 
 	httpFailed := resp.StatusCode < 200 || resp.StatusCode >= 300
 	data = bytes.TrimSpace(data)
 	if len(data) == 0 || data[0] != '{' || common.Unmarshal(data, &envelope) != nil {
-		return errors.New(message + ": invalid JSON response; result is unknown")
+		unknown := errors.New(message + ": invalid JSON response; result is unknown")
+		if httpFailed && topenRouterMaterialRetryable(resp.StatusCode, "", "") {
+			return &topenRouterMaterialRetryableError{error: unknown}
+		}
+		return unknown
 	}
 	if envelope.ResponseMetadata.RequestID != "" {
 		requestID = c.safeReason(envelope.ResponseMetadata.RequestID)
@@ -289,7 +335,11 @@ func (c *TopenRouterMaterialClient) request(ctx context.Context, action string, 
 		if rejected {
 			return &TopenRouterMaterialRejection{Message: message, Code: code, StatusCode: resp.StatusCode, Action: c.safeReason(action), RequestID: requestID}
 		}
-		return errors.New(message + "; result is unknown")
+		unknown := errors.New(message + "; result is unknown")
+		if topenRouterMaterialRetryable(resp.StatusCode, code, reason) {
+			return &topenRouterMaterialRetryableError{error: unknown}
+		}
+		return unknown
 	}
 	result := bytes.TrimSpace(envelope.Result)
 	if len(result) == 0 || result[0] != '{' || common.Unmarshal(result, output) != nil {
@@ -464,14 +514,34 @@ func (c *TopenRouterMaterialClient) CreateAsset(ctx context.Context, asset Mobil
 	if asset.GroupID != "" {
 		input.GroupID = &asset.GroupID
 	}
-	var result topenRouterMaterialAsset
-	if err := c.request(ctx, "CreateAsset", input, &result); err != nil {
-		return "", err
+	const maxAttempts = 3
+	delays := [...]time.Duration{0, 2 * time.Second, 5 * time.Second}
+	for attempt := range maxAttempts {
+		if attempt > 0 {
+			if err := c.retryWait(ctx, delays[attempt]); err != nil {
+				return "", err
+			}
+		}
+		var result topenRouterMaterialAsset
+		err := c.request(ctx, "CreateAsset", input, &result)
+		if err == nil {
+			if err := validateTopenRouterMaterialID(result.ID); err != nil {
+				return "", err
+			}
+			return result.ID, nil
+		}
+		if ctx.Err() != nil {
+			return "", err
+		}
+		var retryable *topenRouterMaterialRetryableError
+		if !errors.As(err, &retryable) || attempt == maxAttempts-1 {
+			if errors.As(err, &retryable) {
+				return "", &topenRouterMaterialAttemptsError{error: err, attempts: attempt + 1}
+			}
+			return "", err
+		}
 	}
-	if err := validateTopenRouterMaterialID(result.ID); err != nil {
-		return "", err
-	}
-	return result.ID, nil
+	return "", errors.New("topenrouter material create asset retry loop ended unexpectedly")
 }
 
 func (c *TopenRouterMaterialClient) ListAssets(ctx context.Context, input MobileCloudAssetQuery) (*MobileCloudMaterialPage[MobileCloudAsset], error) {
