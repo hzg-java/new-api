@@ -386,9 +386,9 @@ func videoSubmissionDeadlineError(stage string, previous *dto.TaskError) *dto.Ta
 }
 
 func failVideoSubmission(ctx context.Context, task *model.Task, owner string, taskErr *dto.TaskError) error {
-	reason := kittypes.NewError(errors.New("Video task submission failed"), kittypes.ErrorCodeBadResponse, kittypes.ErrOptionWithUpstreamResponse(kittypes.OpenAIError{Message: taskErr.Message})).ToOpenAIRelayError().Message
+	reason := string(service.TaskErrorDiagnostic(taskErr))
 	logger.LogWarn(ctx, "video_submission task_id=%q channel_id=%d code=%q reason=%q", task.TaskID, task.ChannelId, taskErr.Code, reason)
-	message := service.VideoSubmissionErrorMessage(taskErr)
+	message := service.VideoTaskErrorMessage(task, taskErr)
 	var materials []service.MaterialPreparationIssue
 	if taskErr.Code == "material_preparation_failed" {
 		if issues, ok := taskErr.Data.([]service.MaterialPreparationIssue); ok && len(issues) > 0 {

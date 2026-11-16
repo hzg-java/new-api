@@ -3,6 +3,7 @@ package middleware
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1302,7 +1303,8 @@ func RespondTaskPluginError(c *gin.Context, taskErr *dto.TaskError) bool {
 			sanitized.Message = taskErr.Message
 		}
 		if taskErr.Code == "fail_to_fetch_task" {
-			sanitized.Message = service.VideoSubmissionErrorMessage(taskErr)
+			upstream, _ := common.GetContextKeyType[json.RawMessage](c, constant.ContextKeyTaskEventUpstreamRequest)
+			sanitized.Message = service.VideoSubmissionErrorMessage(taskErr, upstream)
 		}
 	}
 	var safeData []map[string]any

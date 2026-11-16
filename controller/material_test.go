@@ -30,6 +30,7 @@ import (
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/relay"
+	jspluginadaptor "github.com/QuantumNous/new-api/relay/channel/task/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -1673,7 +1674,7 @@ func TestMobileCloudVideoSubmitMaterialGate(t *testing.T) {
 					require.NoError(t, err)
 					assert.JSONEq(t, string(want), string(upstream))
 				} else {
-					assert.False(t, recorded)
+					assert.True(t, recorded, "video requests retain their actual content order")
 				}
 			} else if tc.status == 0 {
 				require.NotNil(t, taskErr)
@@ -2190,7 +2191,7 @@ func TestDeferredVideoSubmissionReportsMaterialFailure(t *testing.T) {
 		require.NoError(t, runVideoSubmission(t.Context(), outcome.Task, plugin))
 		var failed model.Task
 		require.NoError(t, db.First(&failed, outcome.Task.ID).Error)
-		assert.Equal(t, "视频服务异常，请联系管理员", failed.FailReason)
+		assert.Equal(t, "视频服务权限异常，暂时无法生成，请联系管理员处理。", failed.FailReason)
 		assert.Equal(t, "failed_final", failed.SubmissionStage)
 		assert.NotContains(t, string(failed.Data), "not configured")
 		assertVideoTaskUpstreamError(t, &failed, "video_access_denied", http.StatusForbidden)
@@ -2235,8 +2236,8 @@ func TestDeferredVideoSubmissionReportsMaterialFailure(t *testing.T) {
 		assert.Equal(t, 3, videoCalls, "an uncertain submission must not be replayed")
 	})
 	for _, tc := range []struct{ code, message, want string }{
-		{"InputImageSensitiveContentDetected", "input image rejected", "参考图片未通过内容安全审核，请更换图片。"},
-		{"InvalidParameter.duration", "duration is invalid", "视频请求参数不符合要求，请检查参数后再试。"},
+		{"InputImageSensitiveContentDetected", "input image rejected", "图片素材未通过内容安全审核，可能包含敏感信息，请更换该素材或修改其内容后再试。"},
+		{"InvalidParameter.duration", "duration is invalid", "视频时长参数不符合要求，请调整后再试。"},
 	} {
 		t.Run("video refusal "+tc.code, func(t *testing.T) {
 			videoStatus = http.StatusBadRequest
@@ -2256,6 +2257,104 @@ func TestDeferredVideoSubmissionReportsMaterialFailure(t *testing.T) {
 			assert.Zero(t, failed.Quota)
 			require.NoError(t, runVideoSubmission(t.Context(), &failed, plugin))
 			assert.Equal(t, callsBefore+1, videoCalls)
+		})
+	}
+}
+
+func TestVideoTaskFailureDescriptions(t *testing.T) {
+	db := setupMaterialConcurrentPostgres(t)
+	require.NoError(t, db.AutoMigrate(&model.Task{}, &model.TaskEvent{}, &model.Channel{}, &model.Log{}))
+	previousLog := model.LOG_DB
+	model.LOG_DB = db
+	t.Cleanup(func() { model.LOG_DB = previousLog })
+	user := model.User{Username: "video-description-owner", AffCode: common.GetUUID(), Status: common.UserStatusEnabled}
+	require.NoError(t, db.Create(&user).Error)
+	request := json.RawMessage(`{"content":[{"type":"text"},{"type":"image_url"},{"type":"audio_url"},{"type":"video_url"},{"type":"audio_url"},{"type":"image_url"},{"type":"audio_url"}]}`)
+	failure := json.RawMessage(`{"error":{"code":"InputAudioSensitiveContentDetected","message":"The input audio content[6] may contain sensitive information; token=diagnostic-secret","param":"content[6]"}}`)
+	want := "第 3 个音频素材未通过内容安全审核，可能包含敏感信息，请更换该素材或修改其内容后再试。"
+	for _, mode := range []string{"deferred", "historical", "polling", "batch"} {
+		t.Run(mode, func(t *testing.T) {
+			task := model.Task{TaskID: "task_description_" + mode, UserId: user.Id, Action: constant.TaskActionReferenceToVideo, Status: model.TaskStatusQueued, SubmitTime: common.GetTimestamp(), SubmissionOwner: "test-owner", SubmissionLeaseUntil: common.GetTimestamp() + 60}
+			require.NoError(t, db.Create(&task).Error)
+			require.NoError(t, model.RecordTaskEventDetail(task.ID, "request", task.SubmitTime, model.TaskEventRequestDetail{Request: request, UpstreamRequest: request}))
+			taskErr := &dto.TaskError{Code: "fail_to_fetch_task", StatusCode: http.StatusBadRequest, Message: string(failure)}
+			switch mode {
+			case "deferred":
+				require.NoError(t, failVideoSubmission(t.Context(), &task, "test-owner", taskErr))
+				require.NoError(t, db.First(&task, task.ID).Error)
+				assert.Equal(t, want, task.FailReason)
+			case "historical":
+				task.Status, task.FailReason, task.FinishTime = model.TaskStatusFailure, "视频请求处理失败，请联系管理员", common.GetTimestamp()
+				require.NoError(t, db.Save(&task).Error)
+				detail := model.TaskResultEventPayload(&task)["admin_info"].(map[string]any)
+				detail["upstream_error"] = service.TaskErrorDiagnostic(taskErr)
+				require.NoError(t, model.RecordTaskEventDetail(task.ID, "result", task.FinishTime, detail))
+			case "polling", "batch":
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write(failure)
+				}))
+				t.Cleanup(server.Close)
+				channel := model.Channel{Name: "video-error-mock", Type: constant.ChannelTypeTaskPlugin, BaseURL: &server.URL, Key: "test-only", Status: common.ChannelStatusEnabled}
+				require.NoError(t, db.Create(&channel).Error)
+				task.ChannelId = channel.Id
+				require.NoError(t, db.Save(&task).Error)
+				plugin, err := pluginruntime.CompilePlugin(`
+					export const meta = {apiVersion:1,key:"error-preview",name:"Error Preview",version:"1.0.0",fetchMode:"per_task",models:["video"],author:{name:"test"},usageSchema:{}};
+					export function buildSubmitRequest(ctx) {return {url:ctx.baseUrl,method:"POST",body:{}};}
+					export function parseSubmitResponse(ctx,response) {return {taskId:response.body.id};}
+					export function buildQueryRequest(ctx) {return {url:ctx.baseUrl,method:"GET"};}
+					export function parseTaskResult(ctx,body) {return {status:"FAILURE",reason:body.error.message};}
+					export function buildBatchQueryRequest(ctx) {return {url:ctx.baseUrl,method:"GET"};}
+					export function parseBatchResult(ctx,body) {return ctx.tasks.map(task=>({taskId:task.taskId,status:"FAILURE",reason:JSON.stringify(body),code:418}));}
+				`, pluginruntime.Options{Key: "error-preview"})
+				require.NoError(t, err)
+				oldFactory, oldCache := service.GetTaskAdaptorFunc, common.MemoryCacheEnabled
+				common.MemoryCacheEnabled = false
+				service.GetTaskAdaptorFunc = func(constant.TaskPlatform) service.TaskPollingAdaptor { return jspluginadaptor.New(plugin) }
+				t.Cleanup(func() { service.GetTaskAdaptorFunc, common.MemoryCacheEnabled = oldFactory, oldCache })
+				service.InitHttpClient()
+				if mode == "batch" {
+					task.Data = json.RawMessage(`{"error":{"code":"OutputVideoSensitiveContentDetected"}}`)
+					require.NoError(t, db.Save(&task).Error)
+					require.NoError(t, service.UpdateBatchTasks(t.Context(), jspluginadaptor.New(plugin), map[int][]string{channel.Id: {task.TaskID}}, map[string]*model.Task{task.TaskID: &task}))
+				} else {
+					require.NoError(t, service.UpdateVideoTasks(t.Context(), task.Platform, map[int][]string{channel.Id: {task.TaskID}}, map[string]*model.Task{task.TaskID: &task}))
+				}
+				require.NoError(t, db.First(&task, task.ID).Error)
+				assert.Equal(t, want, task.FailReason)
+			}
+
+			for _, role := range []int{common.RoleCommonUser, common.RoleAdminUser} {
+				listed := tasksToDto([]*model.Task{&task}, false, role)
+				require.Len(t, listed, 1)
+				assert.Equal(t, want, listed[0].FailReason)
+				assert.NotContains(t, listed[0].FailReason, "content[")
+				assert.NotContains(t, listed[0].FailReason, "diagnostic-secret")
+			}
+			var stored model.Task
+			require.NoError(t, db.First(&stored, task.ID).Error)
+			if mode == "historical" {
+				assert.Equal(t, "视频请求处理失败，请联系管理员", stored.FailReason, "historical display must not rewrite stored tasks")
+				require.NoError(t, db.Model(&model.TaskEvent{}).Where("task_id = ? AND kind = ?", task.ID, "request").Update("payload", `{}`).Error)
+				task.FailReason = want
+				listed := tasksToDto([]*model.Task{&task}, false, common.RoleCommonUser)
+				require.Len(t, listed, 1)
+				assert.Equal(t, want, listed[0].FailReason, "missing request details must not remove a known material position")
+			}
+			events, err := model.GetTaskEvents(task.ID)
+			require.NoError(t, err)
+			for _, event := range events {
+				if event.Kind == "result" {
+					require.NoError(t, event.ProjectDetail(true))
+					assert.Contains(t, event.Payload, "InputAudioSensitiveContentDetected")
+					assert.NotContains(t, event.Payload, "diagnostic-secret")
+					if mode == "batch" {
+						assert.Contains(t, event.Payload, `"upstream_error"`)
+						assert.Contains(t, event.Payload, "content[6]")
+					}
+				}
+			}
 		})
 	}
 }
@@ -3135,7 +3234,7 @@ func TestTopenRouterVideoUploadBeforeSubmit(t *testing.T) {
 				assert.Zero(t, billing.refunds)
 				upstream, ok := common.GetContextKeyType[json.RawMessage](c, constant.ContextKeyTaskEventUpstreamRequest)
 				if tc.disabled {
-					assert.False(t, ok)
+					assert.True(t, ok, "video requests retain their actual content order")
 				} else {
 					require.True(t, ok)
 					expected, err := common.Marshal(map[string]any{

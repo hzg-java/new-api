@@ -344,7 +344,7 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 			task.Progress = responseItem.TaskInfo.Progress
 		}
 		if responseItem.TaskInfo.Reason != "" || task.Status == model.TaskStatusFailure {
-			logger.LogInfo(ctx, task.TaskID+" 构建失败，"+task.FailReason)
+			logger.LogInfo(ctx, task.TaskID+" 构建失败，"+string(TaskErrorDiagnostic(&taskdto.TaskError{Message: task.FailReason})))
 			task.Status = model.TaskStatusFailure
 			task.Progress = "100%"
 		}
@@ -362,6 +362,21 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		if responseItem.TaskInfo.Url != "" {
 			task.PrivateData.ResultURL = responseItem.TaskInfo.Url
 		}
+		var videoFailureDetail map[string]any
+		if task.Status == model.TaskStatusFailure && IsVideoTask(task) {
+			if task.FinishTime == 0 {
+				task.FinishTime = common.GetTimestamp()
+			}
+			videoFailureDetail = model.TaskResultEventPayload(task)["admin_info"].(map[string]any)
+			videoFailureDetail["upstream_error"] = map[string]any{"code": responseItem.TaskInfo.Code, "message": responseItem.TaskInfo.Reason}
+			current := *task
+			if responseItem.Data == nil {
+				current.Data = nil
+			}
+			task.FailReason = VideoTaskFailureMessage(&current, responseItem.TaskInfo.Reason)
+			responseItem.TaskInfo.Reason = task.FailReason
+			videoFailureDetail["fail_reason"] = task.FailReason
+		}
 
 		isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 		terminalTransition := isDone && snap.Status != task.Status
@@ -375,6 +390,11 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 			continue
 		}
 		if terminalTransition {
+			if videoFailureDetail != nil {
+				if err := model.RecordTaskEventDetail(task.ID, "result", task.FinishTime, videoFailureDetail); err != nil {
+					logger.LogWarn(ctx, "record batch video error: "+err.Error())
+				}
+			}
 			finalizeTerminalTask(ctx, adaptor, task, &responseItem.TaskInfo)
 		}
 	}
@@ -595,6 +615,10 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 			task.FinishTime = now
 		}
 		task.FailReason = taskResult.Reason
+		if IsVideoTask(task) {
+			task.FailReason = VideoTaskFailureMessage(task, taskResult.Reason)
+			taskResult.Reason = task.FailReason
+		}
 		logger.LogInfo(ctx, fmt.Sprintf("Task %s failed: %s", task.TaskID, task.FailReason))
 		taskResult.Progress = taskcommon.ProgressComplete
 		shouldFinalizeBilling = true
@@ -831,6 +855,12 @@ func failTaskFromPoll(ctx context.Context, adaptor TaskPollingAdaptor, task *mod
 		task.FinishTime = now
 	}
 	task.FailReason = reason
+	if IsVideoTask(task) {
+		task.FailReason = "暂时无法获取视频任务结果，请提供任务 ID 联系管理员核查，勿重复提交。"
+		if strings.HasPrefix(reason, "upstream task not found") {
+			task.FailReason = "视频任务记录不存在或已失效，无法获取结果，请联系管理员核查。"
+		}
+	}
 	won, err := task.UpdateWithStatus(fromStatus)
 	if err != nil {
 		return err
@@ -838,7 +868,14 @@ func failTaskFromPoll(ctx context.Context, adaptor TaskPollingAdaptor, task *mod
 	if !won {
 		return nil
 	}
-	finalizeTerminalTask(ctx, adaptor, task, relaycommon.FailTaskInfo(reason))
+	if IsVideoTask(task) {
+		detail := model.TaskResultEventPayload(task)["admin_info"].(map[string]any)
+		detail["upstream_error"] = reason
+		if err := model.RecordTaskEventDetail(task.ID, "result", task.FinishTime, detail); err != nil {
+			logger.LogWarn(ctx, "record video poll error: "+err.Error())
+		}
+	}
+	finalizeTerminalTask(ctx, adaptor, task, relaycommon.FailTaskInfo(task.FailReason))
 	return nil
 }
 

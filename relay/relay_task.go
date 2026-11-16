@@ -22,7 +22,6 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
-	kittypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -410,21 +409,28 @@ func submitPreparedTask(c *gin.Context, info *relaycommon.RelayInfo, platform co
 		return nil, service.TaskErrorWrapper(err, "build_request_failed", http.StatusInternalServerError)
 	}
 
-	// A lost response cannot prove that a reserved video submission was rejected.
-	if materialReserved {
+	// A lost response cannot prove that a video submission was rejected.
+	if materialReserved || service.IsVideoTask(&model.Task{Action: info.Action}) {
 		defer func() {
 			if finalTaskErr == nil {
 				return
 			}
 			finalTaskErr.Diagnostic = service.TaskErrorDiagnostic(finalTaskErr)
-			reason := kittypes.NewError(errors.New("Video task submission failed"), kittypes.ErrorCodeBadResponse, kittypes.ErrOptionWithUpstreamResponse(kittypes.OpenAIError{Message: finalTaskErr.Message})).ToOpenAIRelayError().Message
+			reason := string(finalTaskErr.Diagnostic)
 			logger.LogWarn(c, "video_submission task_id=%q channel_id=%d code=%q reason=%q", info.PublicTaskID, info.ChannelId, finalTaskErr.Code, reason)
-			finalTaskErr.NoRetry = true
+			if materialReserved {
+				finalTaskErr.NoRetry = true
+			}
 			switch finalTaskErr.Code {
 			case "do_request_failed", "read_response_body_failed", "plugin_submit_response_failed", "plugin_submit_response_invalid":
+				finalTaskErr.NoRetry = true
 				finalTaskErr.Message = service.VideoSubmissionFailureMessage("task_submission_unknown")
 			default:
-				finalTaskErr.Message = service.VideoSubmissionErrorMessage(finalTaskErr)
+				if finalTaskErr.StatusCode >= 500 || finalTaskErr.StatusCode == http.StatusRequestTimeout {
+					finalTaskErr.NoRetry = true
+				}
+				upstream, _ := common.GetContextKeyType[json.RawMessage](c, constant.ContextKeyTaskEventUpstreamRequest)
+				finalTaskErr.Message = service.VideoSubmissionErrorMessage(finalTaskErr, upstream)
 			}
 		}()
 	}
@@ -457,6 +463,11 @@ func submitPreparedTask(c *gin.Context, info *relaycommon.RelayInfo, platform co
 	}
 	if parsed == nil {
 		return nil, service.TaskErrorWrapperLocal(errors.New("task adaptor returned an empty response"), "plugin_submit_response_invalid", http.StatusBadGateway)
+	}
+	if parsed.Immediate != nil && parsed.Immediate.Status == model.TaskStatusFailure && service.IsVideoTask(&model.Task{Action: info.Action}) {
+		upstream, _ := common.GetContextKeyType[json.RawMessage](c, constant.ContextKeyTaskEventUpstreamRequest)
+		failure := &dto.TaskError{Code: "video_generation_failed", Message: string(parsed.TaskData)}
+		parsed.Immediate.Reason = service.VideoSubmissionErrorMessage(failure, upstream)
 	}
 
 	// 11. 提交后计费调整：让适配器根据上游实际返回调整 OtherRatios

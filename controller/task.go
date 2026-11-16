@@ -574,6 +574,7 @@ func tasksToDto(tasks []*model.Task, fillUser bool, viewerRole int) []*dto.TaskD
 			}
 		}
 	}
+	failureMessages := service.VideoTaskLogFailureMessages(tasks)
 	result := make([]*dto.TaskDto, len(tasks))
 	for i, task := range tasks {
 		if fillUser {
@@ -582,6 +583,9 @@ func tasksToDto(tasks []*model.Task, fillUser bool, viewerRole int) []*dto.TaskD
 			}
 		}
 		item := relay.TaskModel2Dto(task)
+		if message := failureMessages[task.ID]; message != "" {
+			item.FailReason = message
+		}
 		if billing := task.PrivateData.BillingContext; billing != nil {
 			switch {
 			case billing.TieredSnapshot != nil:

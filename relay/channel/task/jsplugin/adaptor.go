@@ -84,13 +84,13 @@ const maxTaskArtifacts = 64
 const maxTaskPluginPersistedJSONBytes = 1 << 20
 
 type TaskAdaptor struct {
-	plugin           *pluginruntime.LoadedPlugin
-	info             *relaycommon.RelayInfo
-	submit           *requestDescriptor
-	routeRequest     *pluginruntime.RouteRequestContext
-	requestHeaders   map[string]string
-	files            []map[string]any
-	materialPrepared bool
+	plugin         *pluginruntime.LoadedPlugin
+	info           *relaycommon.RelayInfo
+	submit         *requestDescriptor
+	routeRequest   *pluginruntime.RouteRequestContext
+	requestHeaders map[string]string
+	files          []map[string]any
+	videoRequest   bool
 }
 
 func New(plugin *pluginruntime.LoadedPlugin) *TaskAdaptor { return &TaskAdaptor{plugin: plugin} }
@@ -253,10 +253,11 @@ func (a *TaskAdaptor) ValidateDeferredMaterialRequest(c *gin.Context, info *rela
 
 func (a *TaskAdaptor) PrepareMaterialRequest(c *gin.Context, info *relaycommon.RelayInfo) (func(), *dto.TaskError) {
 	switch constant.NormalizeTaskAction(info.Action) {
-	case constant.TaskActionImageToVideo, constant.TaskActionTextToVideo, constant.TaskActionFirstTailToVideo, constant.TaskActionReferenceToVideo:
+	case constant.TaskActionImageToVideo, constant.TaskActionTextToVideo, constant.TaskActionFirstTailToVideo, constant.TaskActionReferenceToVideo, constant.TaskActionRemix:
 	default:
 		return nil, nil
 	}
+	a.videoRequest = true
 	descriptor, err := a.buildSubmit(c, info)
 	if err != nil {
 		return nil, service.TaskErrorWrapperLocal(err, "plugin_request_invalid", http.StatusBadRequest)
@@ -288,7 +289,6 @@ func (a *TaskAdaptor) PrepareMaterialRequest(c *gin.Context, info *relaycommon.R
 	if reservation == nil {
 		return nil, nil
 	}
-	a.materialPrepared = true
 	// Submission must end before the material reservation expires.
 	original := c.Request
 	ctx, cancel := context.WithDeadline(original.Context(), reservation.Deadline)
@@ -380,7 +380,7 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 	if err != nil {
 		return nil, err
 	}
-	if a.materialPrepared {
+	if a.videoRequest {
 		snapshot := json.RawMessage(body)
 		if len(body) > model.TaskEventPayloadLimit {
 			snapshot = json.RawMessage(`{"unavailable":"size_limit_exceeded"}`)

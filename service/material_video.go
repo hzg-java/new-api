@@ -6,13 +6,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"net/http"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
-	taskdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"gorm.io/gorm"
 )
@@ -89,51 +87,6 @@ func VideoMaterialFailure(issues []MaterialPreparationIssue) (string, []Material
 		}
 	}
 	return strings.Join(messages, "；"), public
-}
-
-func VideoSubmissionErrorMessage(taskErr *taskdto.TaskError) string {
-	if taskErr.StatusCode == http.StatusUnauthorized || taskErr.StatusCode == http.StatusForbidden {
-		return VideoSubmissionFailureMessage("material_configuration_failed")
-	}
-	fallback := VideoSubmissionFailureMessage(taskErr.Code)
-	if taskErr.Code != "fail_to_fetch_task" || taskErr.StatusCode < 400 || taskErr.StatusCode >= 500 || taskErr.StatusCode == http.StatusRequestTimeout || taskErr.StatusCode == http.StatusTooManyRequests {
-		return fallback
-	}
-	body := taskErr.Message
-	if taskErr.Error != nil {
-		body = taskErr.Error.Error()
-	}
-	var response struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
-		Error   *struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if common.Unmarshal([]byte(body), &response) != nil {
-		return fallback
-	}
-	if response.Error != nil {
-		response.Code, response.Message = response.Error.Code, response.Error.Message
-	}
-	code := strings.ToLower(response.Code)
-	reason := strings.ToLower(topenRouterMaterialReasonURL.ReplaceAllString(response.Message, ""))
-	if strings.Contains(code, "internal") || strings.Contains(reason, "timeout") || strings.Contains(reason, "timed out") {
-		return fallback
-	}
-	switch {
-	case strings.Contains(code, "inputimagesensitivecontentdetected"):
-		return "参考图片未通过内容安全审核，请更换图片。"
-	case strings.Contains(code, "policyviolation") && strings.Contains(reason, "copyright"):
-		return "参考内容因可能涉及版权限制未通过审核，请修改后再试。"
-	case strings.Contains(code, "contentpolicyviolation"), strings.Contains(code, "contentsensitive"), strings.Contains(code, "contentfilter"):
-		return "参考内容或提示词未通过内容安全审核，请修改后再试。"
-	case strings.HasPrefix(code, "invalidparameter"), strings.HasPrefix(code, "missingparameter"):
-		return "视频请求参数不符合要求，请检查参数后再试。"
-	default:
-		return fallback
-	}
 }
 
 func VideoSubmissionFailureMessage(code string) string {

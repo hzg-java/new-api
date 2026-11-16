@@ -2,10 +2,12 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
 	taskdto "github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -128,19 +130,72 @@ func TestVideoSubmissionErrorMessage(t *testing.T) {
 		name, body, want string
 		status           int
 	}{
-		{"image safety", `{"error":{"code":"InputImageSensitiveContentDetected","message":"input image rejected"}}`, "参考图片未通过内容安全审核，请更换图片。", 400},
-		{"copyright", `{"error":{"code":"PolicyViolation","message":"copyright restrictions"}}`, "参考内容因可能涉及版权限制未通过审核，请修改后再试。", 400},
-		{"invalid parameter", `{"error":{"code":"InvalidParameter.duration","message":"duration is invalid; token=secret"}}`, "视频请求参数不符合要求，请检查参数后再试。", 400},
-		{"authentication", `{"error":{"code":"Unauthorized","message":"token=secret"}}`, "视频服务异常，请联系管理员", 403},
-		{"timeout is not review rejection", `{"error":{"code":"InternalError","message":"copyright review service timeout"}}`, "视频请求处理失败，请联系管理员", 400},
+		{"image safety", `{"error":{"code":"InputImageSensitiveContentDetected","message":"input image rejected"}}`, "图片素材未通过内容安全审核，可能包含敏感信息，请更换该素材或修改其内容后再试。", 400},
+		{"copyright", `{"error":{"code":"PolicyViolation","message":"copyright restrictions"}}`, "输入内容因可能涉及版权限制未通过审核，请修改或更换后再试。", 400},
+		{"invalid parameter", `{"error":{"code":"InvalidParameter.duration","message":"duration is invalid; token=secret"}}`, "视频时长参数不符合要求，请调整后再试。", 400},
+		{"authentication", `{"error":{"code":"Unauthorized","message":"token=secret"}}`, "视频服务权限异常，暂时无法生成，请联系管理员处理。", 403},
+		{"timeout is not review rejection", `{"error":{"code":"InternalError","message":"copyright review service timeout"}}`, "视频处理超时，结果尚未确认，请勿重复提交，请提供任务 ID 联系管理员核查。", 400},
 		{"arbitrary text is not forwarded", `{"error":{"message":"token=secret; https://private.example/copyright"}}`, "视频请求处理失败，请联系管理员", 400},
+		{"rate limit is not content rejection", `{"error":{"code":"InputImageSensitiveContentDetected","message":"stale rejection"}}`, "当前视频请求过多，暂时无法处理，请稍后查询已有任务或联系管理员核查。", 429},
+		{"gateway failure is not content rejection", `{"error":{"code":"InputAudioSensitiveContentDetected","message":"stale rejection"}}`, "视频服务暂时不可用，提交结果尚未确认，请勿重复提交，请联系管理员核查。", 502},
+		{"download forbidden is not service credentials", `{"error":{"code":"InvalidParameter","message":"Failed to download input audio: HTTP 403"}}`, "音频素材无法读取，请确认素材地址有效且允许访问。", 400},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			taskErr := &taskdto.TaskError{Code: "fail_to_fetch_task", Message: tc.body, Error: errors.New(tc.body), StatusCode: tc.status}
-			assert.Equal(t, tc.want, VideoSubmissionErrorMessage(taskErr))
+			assert.Equal(t, tc.want, VideoSubmissionErrorMessage(taskErr, nil))
 			taskErr.Message = tc.want
-			assert.Equal(t, tc.want, VideoSubmissionErrorMessage(taskErr), "public projection must not hide the original refusal")
+			assert.Equal(t, tc.want, VideoSubmissionErrorMessage(taskErr, nil), "public projection must not hide the original refusal")
 		})
+	}
+}
+
+func TestVideoSubmissionSpecificErrors(t *testing.T) {
+	for _, tc := range []struct{ name, body, want string }{
+		{"audio safety", `{"error":{"code":"InputAudioSensitiveContentDetected","message":"The input audio may contain sensitive information","param":"content[9]"}}`, "音频素材未通过内容安全审核，可能包含敏感信息，请更换该素材或修改其内容后再试。"},
+		{"video safety", `{"error":{"code":"InputVideoSensitiveContentDetected","message":"input video rejected"}}`, "视频素材未通过内容安全审核，可能包含敏感信息，请更换该素材或修改其内容后再试。"},
+		{"prompt safety", `{"error":{"code":"InputTextSensitiveContentDetected","message":"input text rejected"}}`, "提示词未通过内容安全审核，请修改提示词后再试。"},
+		{"prompt code overrides image words", `{"error":{"code":"InputTextSensitiveContentDetected","message":"prompt describing input image rejected"}}`, "提示词未通过内容安全审核，请修改提示词后再试。"},
+		{"output safety", `{"error":{"code":"OutputVideoSensitiveContentDetected","message":"output video rejected","param":"content[9]"}}`, "生成的视频未通过内容安全审核，无法返回，请调整提示词或参考素材后再试。"},
+		{"service credit", `{"error":{"code":"InsufficientBalance","message":"account balance insufficient"}}`, "视频服务额度不足，暂时无法生成，请联系管理员处理。"},
+		{"internal error", `{"error":{"code":"InternalError","message":"internal processing failed"}}`, "视频生成服务发生内部错误，本次生成失败，请联系管理员处理。"},
+		{"missing duration", `{"error":{"code":"MissingParameter.duration","message":"missing duration"}}`, "缺少必要参数：视频时长，请补充后再试。"},
+		{"format", `{"error":{"code":"InvalidParameter","message":"Unsupported audio format","param":"content[9].audio_url.url"}}`, "音频素材格式不支持，请转换为支持的格式后再试。"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			taskErr := &taskdto.TaskError{Code: "fail_to_fetch_task", Message: tc.body, StatusCode: 400}
+			assert.Equal(t, tc.want, VideoSubmissionErrorMessage(taskErr, nil))
+		})
+	}
+}
+
+func TestVideoSubmissionMaterialPositions(t *testing.T) {
+	request := json.RawMessage(`{"content":[{"type":"text"},{"type":"image_url"},{"type":"video_url"},{"type":"audio_url"},{"type":"image_url"},{"type":"audio_url"},{"type":"text"},{"type":"audio_url"}]}`)
+	for _, tc := range []struct{ name, body, want string }{
+		{"third audio among mixed content", `{"error":{"code":"InputAudioSensitiveContentDetected","message":"input audio rejected","param":"content[7]"}}`, "第 3 个音频素材未通过内容安全审核，可能包含敏感信息，请更换该素材或修改其内容后再试。"},
+		{"second image among mixed content", `{"error":{"code":"InputImageSensitiveContentDetected","param":"content[4].image_url.url"}}`, "第 2 个图片素材未通过内容安全审核，可能包含敏感信息，请更换该素材或修改其内容后再试。"},
+		{"video identified by error message", `{"error":{"code":"InputVideoSensitiveContentDetected","message":"The input video 'content[2]' may contain sensitive information"}}`, "第 1 个视频素材未通过内容安全审核，可能包含敏感信息，请更换该素材或修改其内容后再试。"},
+		{"multiple image positions", `{"error":{"code":"InputImageSensitiveContentDetected","message":"content[1], content[4] rejected"}}`, "第 1 个图片素材、第 2 个图片素材未通过内容安全审核，可能包含敏感信息，请更换该素材或修改其内容后再试。"},
+		{"missing index does not invent a number", `{"error":{"code":"InputAudioSensitiveContentDetected"}}`, "音频素材未通过内容安全审核，可能包含敏感信息，请更换该素材或修改其内容后再试。"},
+		{"out of range index does not invent a number", `{"error":{"code":"InputAudioSensitiveContentDetected","param":"content[99]"}}`, "音频素材未通过内容安全审核，可能包含敏感信息，请更换该素材或修改其内容后再试。"},
+		{"mismatched media does not invent a number", `{"error":{"code":"InputAudioSensitiveContentDetected","param":"content[1]"}}`, "音频素材未通过内容安全审核，可能包含敏感信息，请更换该素材或修改其内容后再试。"},
+		{"URL content is not index evidence", `{"error":{"code":"InputAudioSensitiveContentDetected","message":"https://private.example/content[7]?token=secret"}}`, "音频素材未通过内容安全审核，可能包含敏感信息，请更换该素材或修改其内容后再试。"},
+		{"output failure never blames input", `{"error":{"code":"OutputVideoSensitiveContentDetected","param":"content[7]"}}`, "生成的视频未通过内容安全审核，无法返回，请调整提示词或参考素材后再试。"},
+		{"audio read failure", `{"error":{"code":"InvalidParameter","message":"Failed to download input audio","param":"content[7]"}}`, "第 3 个音频素材无法读取，请确认素材地址有效且允许访问。"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			taskErr := &taskdto.TaskError{Code: "fail_to_fetch_task", Message: tc.body, StatusCode: 400}
+			assert.Equal(t, tc.want, VideoSubmissionErrorMessage(taskErr, request))
+			diagnostic := TaskErrorDiagnostic(taskErr)
+			taskErr.Diagnostic, taskErr.Message = diagnostic, tc.want
+			assert.Equal(t, tc.want, VideoSubmissionErrorMessage(taskErr, request), "normalizing twice preserves the same material position")
+		})
+	}
+}
+
+func TestVideoTaskFailureWithoutErrorCode(t *testing.T) {
+	for _, body := range []string{`{"error":{"message":"timeout"}}`, `{}`} {
+		task := &model.Task{Data: json.RawMessage(body)}
+		assert.Equal(t, "视频处理超时，结果尚未确认，请勿重复提交，请提供任务 ID 联系管理员核查。", VideoTaskFailureMessage(task, "timeout"))
 	}
 }
 

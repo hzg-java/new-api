@@ -529,6 +529,7 @@ export function parseTaskResult() { return {status:"SUCCESS"}; }
 		{status: http.StatusAccepted},
 		{status: http.StatusBadRequest, wantCode: "fail_to_fetch_task"},
 		{status: http.StatusBadGateway, wantCode: "fail_to_fetch_task"},
+		{status: 0, wantCode: "do_request_failed"},
 	} {
 		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
 			saveBillingConfig(t)
@@ -537,6 +538,13 @@ export function parseTaskResult() { return {status:"SUCCESS"}; }
 				"billing_setting.billing_expr": `{"declared-model":"tier(\"flat\", 3)"}`,
 			}))
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if tc.status == 0 {
+					conn, _, err := w.(http.Hijacker).Hijack()
+					if err == nil {
+						_ = conn.Close()
+					}
+					return
+				}
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(tc.status)
 				_, _ = w.Write([]byte(`{"id":"job-42","message":"upstream body"}`))
@@ -556,8 +564,15 @@ export function parseTaskResult() { return {status:"SUCCESS"}; }
 			if tc.wantCode != "" {
 				require.NotNil(t, taskErr)
 				assert.Equal(t, tc.wantCode, taskErr.Code)
-				assert.Equal(t, tc.status, taskErr.StatusCode)
-				assert.Contains(t, taskErr.Message, "upstream body")
+				if tc.status == 0 {
+					assert.True(t, taskErr.NoRetry, "an uncertain video submission must not be replayed without a material reservation")
+					assert.Equal(t, service.VideoSubmissionFailureMessage("task_submission_unknown"), taskErr.Message)
+				} else {
+					assert.Equal(t, tc.status, taskErr.StatusCode)
+					assert.Contains(t, string(taskErr.Diagnostic), "upstream body")
+					assert.NotContains(t, taskErr.Message, "upstream body")
+					assert.Equal(t, tc.status >= 500, taskErr.NoRetry)
+				}
 				assert.Nil(t, result)
 				return
 			}
