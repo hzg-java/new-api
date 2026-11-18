@@ -26,6 +26,7 @@ import {
   act,
   fireEvent,
   render as renderUI,
+  renderHook,
   screen,
   waitFor,
   within,
@@ -40,9 +41,11 @@ import { api } from '@/lib/api'
 import { formatNumber, formatTimestampToDate } from '@/lib/format'
 
 import type { TaskLog } from '../../types'
+import { createChannelColumn } from '../columns/column-helpers'
 import { useTaskLogsColumns } from '../columns/task-logs-columns'
 import { TaskDetailsDialog } from '../dialogs/task-details-dialog'
 import { UsageLogsMobileList } from '../usage-logs-mobile-card'
+import { UsageLogsProvider, useUsageLogsContext } from '../usage-logs-provider'
 
 const log: TaskLog = {
   id: 1,
@@ -68,6 +71,7 @@ function TaskTable(props: {
   log: TaskLog
   isAdmin: boolean
   mobile?: boolean
+  showChannel?: boolean
 }) {
   const columns = useTaskLogsColumns(props.isAdmin, false)
   const table = useReactTable({
@@ -75,7 +79,11 @@ function TaskTable(props: {
     columns,
     getCoreRowModel: getCoreRowModel(),
     state: {
-      columnVisibility: { user: false, channel_id: false, artifacts: false },
+      columnVisibility: {
+        user: false,
+        channel_id: props.showChannel ?? false,
+        artifacts: false,
+      },
     },
   })
   if (props.mobile) {
@@ -112,12 +120,26 @@ function TaskTable(props: {
   )
 }
 
+function SensitiveVisibilityToggle() {
+  const context = useUsageLogsContext()
+  return (
+    <button
+      type='button'
+      onClick={() => context.setSensitiveVisible(!context.sensitiveVisible)}
+    >
+      {context.sensitiveVisible ? 'Hide sensitive data' : 'Show sensitive data'}
+    </button>
+  )
+}
+
 function render(element: ReactElement) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
   return renderUI(
-    <QueryClientProvider client={client}>{element}</QueryClientProvider>
+    <QueryClientProvider client={client}>
+      <UsageLogsProvider>{element}</UsageLogsProvider>
+    </QueryClientProvider>
   )
 }
 
@@ -127,6 +149,207 @@ afterEach(() => {
 })
 
 describe('task log presentation', () => {
+  test('given the channel factory has no name option as used by drawing logs, it preserves the ID-only badge without a provider', async () => {
+    const user = userEvent.setup()
+    const writeText = vi.spyOn(navigator.clipboard, 'writeText')
+    const namedLog = { ...log, channel_name: 'Not opted in' }
+    const { result } = renderHook(() =>
+      useReactTable({
+        data: [namedLog],
+        columns: [createChannelColumn<TaskLog>({ headerLabel: 'Channel' })],
+        getCoreRowModel: getCoreRowModel(),
+      })
+    )
+    const cell = result.current.getRowModel().rows[0].getVisibleCells()[0]
+    renderUI(<>{flexRender(cell.column.columnDef.cell, cell.getContext())}</>)
+
+    const badge = screen.getByTitle('Click to copy: 357')
+    expect(badge).toHaveTextContent(/^#357$/)
+    expect(screen.queryByText(/Not opted in/)).not.toBeInTheDocument()
+    await user.click(badge)
+    expect(writeText).toHaveBeenCalledWith('357')
+  })
+
+  describe.each([false, true])('task channels on mobile=%s', (mobile) => {
+    test('given a channel name, admins see the name with its ID and can copy the ID', async () => {
+      const user = userEvent.setup()
+      const writeText = vi.spyOn(navigator.clipboard, 'writeText')
+      const namedLog = { ...log, channel_name: 'Video provider' }
+      render(<TaskTable log={namedLog} isAdmin mobile={mobile} showChannel />)
+
+      expect(screen.getByText('Video provider #357')).toBeVisible()
+      const badge = screen.getByTitle('Video provider #357')
+      await user.click(badge)
+      expect(writeText).toHaveBeenCalledWith('357')
+    })
+
+    test.each([undefined, ''])(
+      'given channel name %s, admins fall back to the ID',
+      (channel_name) => {
+        const namedLog = { ...log, channel_name }
+        render(<TaskTable log={namedLog} isAdmin mobile={mobile} showChannel />)
+
+        expect(screen.getByText('#357')).toBeVisible()
+        expect(screen.getByTitle('Click to copy: 357')).toBeVisible()
+      }
+    )
+
+    test('given no channel ID, admins see a dash even if a stale name exists', () => {
+      const namedLog = {
+        ...log,
+        channel_id: 0,
+        channel_name: 'Deleted provider',
+      }
+      render(<TaskTable log={namedLog} isAdmin mobile={mobile} showChannel />)
+
+      if (mobile) {
+        expect(
+          within(
+            screen.getByText('Channel').parentElement as HTMLElement
+          ).getByText('-')
+        ).toBeVisible()
+      } else {
+        const channelIndex = screen
+          .getAllByRole('columnheader')
+          .findIndex((header) => header.textContent === 'Channel')
+        expect(screen.getAllByRole('cell')[channelIndex]).toHaveTextContent(
+          /^-$/
+        )
+      }
+      expect(screen.queryByText(/Deleted provider/)).not.toBeInTheDocument()
+      expect(screen.queryByText('#0')).not.toBeInTheDocument()
+    })
+
+    test('given a long channel name, admins see a bounded truncated badge with the complete title', () => {
+      const channel_name =
+        'enterprise-video-production-failover-without-a-short-alias'
+      const namedLog = { ...log, channel_name }
+      render(<TaskTable log={namedLog} isAdmin mobile={mobile} showChannel />)
+
+      const badge = screen.getByTitle(`${channel_name} #357`)
+      expect(badge).toBeVisible()
+      expect(badge).toHaveClass('max-w-[200px]')
+      expect(within(badge).getByText(`${channel_name} #357`)).toHaveClass(
+        'truncate'
+      )
+    })
+
+    test('given an admin-only channel name in data, regular users cannot see the channel', () => {
+      const namedLog = { ...log, channel_name: 'Private provider' }
+      const view = render(
+        <TaskTable log={namedLog} isAdmin={false} mobile={mobile} showChannel />
+      )
+
+      expect(screen.queryByText('Channel')).not.toBeInTheDocument()
+      expect(view.container.innerHTML).not.toContain('Private provider')
+      expect(screen.queryByText('#357')).not.toBeInTheDocument()
+    })
+
+    test('given sensitive data is hidden, the channel name disappears from text, titles, tooltips and copying', async () => {
+      const user = userEvent.setup()
+      const writeText = vi.spyOn(navigator.clipboard, 'writeText')
+      const namedLog = { ...log, channel_name: 'Private provider' }
+      const view = render(
+        <>
+          <SensitiveVisibilityToggle />
+          <TaskTable log={namedLog} isAdmin mobile={mobile} showChannel />
+        </>
+      )
+
+      expect(screen.getByText('Private provider #357')).toBeVisible()
+      await user.click(
+        screen.getByRole('button', { name: 'Hide sensitive data' })
+      )
+      expect(view.container.innerHTML).not.toContain('Private provider')
+      const badge = screen.getByTitle('Click to copy: 357')
+      expect(badge).toHaveTextContent('#357')
+      await user.hover(badge)
+      expect(screen.queryByRole('tooltip')).not.toBeInTheDocument()
+      await user.click(badge)
+      expect(writeText).toHaveBeenCalledWith('357')
+      expect(writeText.mock.calls.flat()).not.toContain('Private provider')
+
+      await user.click(
+        screen.getByRole('button', { name: 'Show sensitive data' })
+      )
+      expect(screen.getByText('Private provider #357')).toBeVisible()
+    })
+
+    test('given sensitive data is hidden, opening task details does not expose the channel name', async () => {
+      vi.spyOn(api, 'get').mockResolvedValue({
+        data: { success: true, data: [] },
+      })
+      const user = userEvent.setup()
+      const namedLog = { ...log, channel_name: 'Private provider' }
+      render(
+        <>
+          <SensitiveVisibilityToggle />
+          <TaskTable log={namedLog} isAdmin mobile={mobile} showChannel />
+        </>
+      )
+
+      await user.click(
+        screen.getByRole('button', { name: 'Hide sensitive data' })
+      )
+      await user.click(screen.getByRole('button', { name: 'View details' }))
+      const dialog = await screen.findByRole('dialog')
+      expect(
+        within(dialog).getByText('Channel').parentElement
+      ).toHaveTextContent('#357')
+      expect(dialog.innerHTML).not.toContain('Private provider')
+    })
+  })
+
+  test.each([
+    ['Video provider', 357, 'Video provider #357'],
+    [undefined, 357, '#357'],
+    ['', 357, '#357'],
+    ['Deleted provider', 0, '-'],
+  ])(
+    'given admin details with channel name=%s and ID=%s, the channel displays %s',
+    async (channel_name, channel_id, expected) => {
+      vi.spyOn(api, 'get').mockResolvedValue({
+        data: { success: true, data: [] },
+      })
+      const namedLog = { ...log, channel_name, channel_id }
+      render(
+        <TaskDetailsDialog
+          log={namedLog}
+          isAdmin
+          isRoot={false}
+          open
+          onOpenChange={() => undefined}
+        />
+      )
+
+      const dialog = within(await screen.findByRole('dialog'))
+      expect(dialog.getByText('Channel').parentElement).toHaveTextContent(
+        expected
+      )
+    }
+  )
+
+  test('given a channel name in data, regular-user details omit it and the channel ID', async () => {
+    vi.spyOn(api, 'get').mockResolvedValue({
+      data: { success: true, data: [] },
+    })
+    const namedLog = { ...log, channel_name: 'Private provider' }
+    render(
+      <TaskDetailsDialog
+        log={namedLog}
+        isAdmin={false}
+        isRoot={false}
+        open
+        onOpenChange={() => undefined}
+      />
+    )
+
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).queryByText('Channel')).not.toBeInTheDocument()
+    expect(dialog.innerHTML).not.toContain('Private provider')
+    expect(within(dialog).queryByText('#357')).not.toBeInTheDocument()
+  })
+
   test.each(['NOT_START', 'SUBMITTED', 'QUEUED', 'IN_PROGRESS', 'UNKNOWN'])(
     'hides estimated cost for %s tasks',
     (status) => {

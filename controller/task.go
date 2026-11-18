@@ -533,6 +533,33 @@ func tasksToDto(tasks []*model.Task, fillUser bool, viewerRole int) []*dto.TaskD
 			}
 		}
 	}
+	channelNames := make(map[int]string)
+	if viewerRole >= common.RoleAdminUser {
+		channelIDs := types.NewSet[int]()
+		for _, task := range tasks {
+			if task.ChannelId != 0 {
+				channelIDs.Add(task.ChannelId)
+			}
+		}
+		if common.MemoryCacheEnabled {
+			for _, id := range channelIDs.Items() {
+				if channel, err := model.CacheGetChannel(id); err == nil {
+					channelNames[id] = channel.Name
+				}
+			}
+		} else if channelIDs.Len() > 0 {
+			var channels []struct {
+				Id   int
+				Name string
+			}
+			if err := model.DB.Model(&model.Channel{}).Select("id", "name").Where("id IN ?", channelIDs.Items()).Find(&channels).Error; err != nil {
+				common.SysError("query task log channel names: " + err.Error())
+			}
+			for _, channel := range channels {
+				channelNames[channel.Id] = channel.Name
+			}
+		}
+	}
 	// List queries intentionally omit data. Load completion snapshots only for
 	// video rows needing actual token display, in one bounded page query. Never
 	// attach these payloads to the public DTO or mutate the listed tasks.
@@ -583,6 +610,7 @@ func tasksToDto(tasks []*model.Task, fillUser bool, viewerRole int) []*dto.TaskD
 			}
 		}
 		item := relay.TaskModel2Dto(task)
+		item.ChannelName = channelNames[task.ChannelId]
 		if message := failureMessages[task.ID]; message != "" {
 			item.FailReason = message
 		}

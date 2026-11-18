@@ -9,6 +9,7 @@ const (
 
 	ContextKeyOriginalModel            ContextKey = "original_model"
 	ContextKeyRequestStartTime         ContextKey = "request_start_time"
+	ContextKeyImageRequestDetail       ContextKey = "image_request_detail"
 	ContextKeyTaskEventUpstreamRequest ContextKey = "task_event_upstream_request"
 	ContextKeyTaskEventResponseTask    ContextKey = "task_event_response_task"
 

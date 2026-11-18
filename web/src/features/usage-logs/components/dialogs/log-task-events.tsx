@@ -12,16 +12,17 @@ import type { LogOtherData } from '../../types'
 import { DetailRow, DetailSection } from './log-detail-layout'
 import { TaskTimeline } from './task-details-dialog'
 
-export function FailedTaskSubmission(props: {
-  submission?: NonNullable<LogOtherData['admin_info']>['task_submission']
+export function LogRequestDetails(props: {
+  snapshot?: NonNullable<LogOtherData['admin_info']>['task_submission']
+  showResponse?: boolean
 }) {
   const { t } = useTranslation()
-  const kinds: ('request' | 'response' | 'upstream_error')[] = [
-    'request',
-    'response',
-  ]
-  if (props.submission?.upstream_error !== undefined) {
-    kinds.push('upstream_error')
+  const kinds: ('request' | 'response' | 'upstream_error')[] = ['request']
+  if (props.showResponse !== false) {
+    kinds.push('response')
+    if (props.snapshot?.upstream_error !== undefined) {
+      kinds.push('upstream_error')
+    }
   }
   const labels = {
     request: t('User Request'),
@@ -32,7 +33,7 @@ export function FailedTaskSubmission(props: {
     <div className='min-w-0 space-y-3 border-t pt-4'>
       {kinds.map((kind) => {
         const label = labels[kind]
-        const value = props.submission?.[kind]
+        const value = props.snapshot?.[kind]
         const code = JSON.stringify(value, null, 2)
         return (
           <DetailSection key={kind} label={label}>
@@ -45,7 +46,8 @@ export function FailedTaskSubmission(props: {
                 {value !== null &&
                   typeof value === 'object' &&
                   'unavailable' in value &&
-                  typeof value.unavailable === 'string' && (
+                  typeof value.unavailable === 'string' &&
+                  value.unavailable !== 'uploaded_file_bytes_omitted' && (
                     <span className='text-muted-foreground text-xs'>
                       {t('Not recorded')}
                     </span>

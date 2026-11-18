@@ -75,10 +75,6 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}
 
 	var errorCapture *taskEventResponseCapture
-	if relayFormat != types.RelayFormatOpenAIRealtime && constant.ErrorLogEnabled {
-		errorCapture = installRelayErrorCapture(c)
-		defer errorCapture.record()
-	}
 
 	requestId := c.GetString(common.RequestIdKey)
 	//group := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
@@ -97,6 +93,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			return
 		}
 		defer ws.Close()
+	}
+
+	request, err := helper.GetAndValidateRequest(c, relayFormat)
+	if relayFormat != types.RelayFormatOpenAIRealtime && (constant.ErrorLogEnabled || relayFormat == types.RelayFormatOpenAIImage) {
+		errorCapture = installRelayErrorCapture(c)
+		defer errorCapture.record()
 	}
 
 	defer func() {
@@ -127,7 +129,6 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 	}()
 
-	request, err := helper.GetAndValidateRequest(c, relayFormat)
 	if err != nil {
 		// Map "request body too large" to 413 so clients can handle it correctly
 		if common.IsRequestBodyTooLargeError(err) || errors.Is(err, common.ErrRequestBodyTooLarge) {
@@ -578,13 +579,11 @@ func (w *taskEventResponseCapture) arm(c *gin.Context, request any) {
 		w.detailKey = "task_submission"
 	}
 	w.request = safeTaskSubmissionDetail(request)
+	switch relayconstant.Path2RelayMode(c.Request.URL.Path) {
+	case relayconstant.RelayModeImagesGenerations, relayconstant.RelayModeImagesEdits:
+		common.SetContextKey(c, constant.ContextKeyImageRequestDetail, w.request)
+	}
 	c.Set(model.ContextKeyErrorLogCollector, func(log *model.Log, write func()) {
-		if w.detailKey == "relay_error" && len(w.pending) == 0 {
-			mediaType, _, _ := mime.ParseMediaType(c.Request.Header.Get("Content-Type"))
-			if mediaType == "application/json" {
-				w.request = safeTaskSubmissionDetail(taskEventOriginalRequest(c))
-			}
-		}
 		var other map[string]json.RawMessage
 		_ = common.UnmarshalJsonStr(log.Other, &other)
 		if other == nil {
@@ -614,7 +613,13 @@ func (w *taskEventResponseCapture) arm(c *gin.Context, request any) {
 
 func installRelayErrorCapture(c *gin.Context) *taskEventResponseCapture {
 	capture := &taskEventResponseCapture{TaskResponseCapture: &service.TaskResponseCapture{ResponseWriter: c.Writer}, detailKey: "relay_error"}
-	capture.arm(c, map[string]any{"unavailable": "unsupported_content_type"})
+	var request any = map[string]any{"unavailable": "unsupported_content_type"}
+	mediaType, _, _ := mime.ParseMediaType(c.Request.Header.Get("Content-Type"))
+	switch mediaType {
+	case "application/json", "multipart/form-data", "application/x-www-form-urlencoded":
+		request = taskEventOriginalRequest(c)
+	}
+	capture.arm(c, request)
 	c.Writer = capture
 	return capture
 }

@@ -10,6 +10,7 @@ import { useAuthStore } from '@/stores/auth-store'
 import type { UsageLog } from '../../data/schema'
 import type { TaskEventsResponse } from '../../types'
 import { DetailsDialog } from '../dialogs/details-dialog'
+import { LogRequestDetails } from '../dialogs/log-task-events'
 
 const log: UsageLog = {
   id: 1,
@@ -500,4 +501,272 @@ describe('task events in consumption details', () => {
       screen.queryByRole('textbox', { name: 'User Request' })
     ).not.toBeInTheDocument()
   })
+})
+
+describe('image request snapshots in consumption details', () => {
+  test('request-only details omit recorded response and upstream response bodies', () => {
+    render(
+      <LogRequestDetails
+        snapshot={{
+          request: { prompt: 'request-only-canary' },
+          response: { data: ['hidden-success-body'] },
+          upstream_error: { message: 'hidden-upstream-body' },
+        }}
+        showResponse={false}
+      />
+    )
+    expect(
+      screen.getByRole('textbox', { name: 'User Request' })
+    ).toHaveTextContent('request-only-canary')
+    expect(screen.queryByText('Response')).not.toBeInTheDocument()
+    expect(screen.queryByText('Upstream Response')).not.toBeInTheDocument()
+    expect(screen.queryByText(/hidden-success-body/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/hidden-upstream-body/)).not.toBeInTheDocument()
+  })
+
+  test.each([
+    {
+      path: '/v1/images/generations',
+      request: { prompt: 'image-generation-request', n: 0, stream: false },
+      canary: 'image-generation-request',
+    },
+    {
+      path: '/v1/images/edits',
+      request: {
+        kind: 'multipart',
+        fields: { prompt: ['image-edit-request'] },
+        files: [{ field: 'image', filename: 'input.png', size: 123 }],
+        unavailable: 'uploaded_file_bytes_omitted',
+      },
+      canary: 'image-edit-request',
+    },
+  ])(
+    'successful $path shows the saved user request without any response',
+    ({ path, request, canary }) => {
+      const get = vi.spyOn(api, 'get')
+      render(
+        details({
+          log: {
+            ...log,
+            model_name: 'image',
+            other: JSON.stringify({
+              request_path: path,
+              admin_info: {
+                image_request: request,
+                task_submission: {
+                  request: { prompt: 'wrong-request-snapshot' },
+                  response: { data: ['success-response-canary'] },
+                  upstream_error: { message: 'success-upstream-canary' },
+                },
+              },
+            }),
+          },
+        })
+      )
+      expect(
+        screen.getByRole('textbox', { name: 'User Request' })
+      ).toHaveTextContent(canary)
+      expect(screen.queryByText('Not recorded')).not.toBeInTheDocument()
+      if (path === '/v1/images/edits') {
+        expect(
+          screen.getByRole('textbox', { name: 'User Request' })
+        ).toHaveTextContent('input.png')
+      } else {
+        expect(
+          screen.getByRole('textbox', { name: 'User Request' })
+        ).toHaveTextContent('"n": 0')
+        expect(
+          screen.getByRole('textbox', { name: 'User Request' })
+        ).toHaveTextContent('"stream": false')
+      }
+      expect(screen.queryByText('Response')).not.toBeInTheDocument()
+      expect(
+        screen.queryByRole('textbox', { name: 'Upstream Response' })
+      ).not.toBeInTheDocument()
+      expect(
+        screen.queryByText(/success-response-canary/)
+      ).not.toBeInTheDocument()
+      expect(
+        screen.queryByText(/success-upstream-canary/)
+      ).not.toBeInTheDocument()
+      expect(
+        screen.queryByText(/wrong-request-snapshot/)
+      ).not.toBeInTheDocument()
+      expect(screen.queryByText('Submission Accepted')).not.toBeInTheDocument()
+      expect(get).not.toHaveBeenCalled()
+    }
+  )
+
+  test.each([
+    { path: '/v1/images/generations', source: 'relay_error' },
+    { path: '/v1/images/generations', source: 'task_submission' },
+    { path: '/v1/images/edits', source: 'relay_error' },
+    { path: '/v1/images/edits', source: 'task_submission' },
+  ])(
+    'failed $path shows the request and response saved in $source',
+    ({ path, source }) => {
+      const get = vi.spyOn(api, 'get')
+      render(
+        details({
+          log: {
+            ...log,
+            type: 5,
+            other: JSON.stringify({
+              request_path: path,
+              admin_info: {
+                [source]: {
+                  request: { prompt: 'failed-image-request' },
+                  response: { error: 'failed-image-response' },
+                  ...(source === 'task_submission'
+                    ? { upstream_error: { message: 'failed-image-upstream' } }
+                    : {}),
+                },
+              },
+            }),
+          },
+        })
+      )
+      expect(
+        screen.getByRole('textbox', { name: 'User Request' })
+      ).toHaveTextContent('failed-image-request')
+      expect(
+        screen.getByRole('textbox', { name: 'Response' })
+      ).toHaveTextContent('failed-image-response')
+      if (source === 'task_submission') {
+        expect(
+          screen.getByRole('textbox', { name: 'Upstream Response' })
+        ).toHaveTextContent('failed-image-upstream')
+      }
+      expect(get).not.toHaveBeenCalled()
+    }
+  )
+
+  test.each(['/v1/images/generations', '/v1/images/edits'])(
+    'historical successful %s without a snapshot marks the user request as not recorded',
+    (path) => {
+      render(
+        details({
+          log: {
+            ...log,
+            model_name: 'historical-image-model',
+            other: JSON.stringify({ request_path: path }),
+          },
+        })
+      )
+      expect(screen.getByText('User Request')).toBeInTheDocument()
+      expect(screen.getAllByText('Not recorded')).toHaveLength(1)
+      expect(
+        screen.queryByRole('textbox', { name: 'User Request' })
+      ).not.toBeInTheDocument()
+      expect(screen.queryByText('Response')).not.toBeInTheDocument()
+      expect(screen.queryByText('Submission Accepted')).not.toBeInTheDocument()
+    }
+  )
+
+  test.each([true, false])(
+    'successful image task with snapshot=%s never loads or displays submission accepted or success responses',
+    async (hasSnapshot) => {
+      const get = vi.spyOn(api, 'get').mockResolvedValue({ data: history })
+      render(
+        details({
+          log: {
+            ...log,
+            other: JSON.stringify({
+              request_path: '/v1/images/generations',
+              task_id: 'image-plugin-task',
+              admin_info: {
+                task_plugin: { key: 'image', name: 'Image plugin' },
+                image_request: hasSnapshot
+                  ? { prompt: 'image-task-request' }
+                  : undefined,
+                task_submission: {
+                  response: { data: ['image-task-success-response'] },
+                },
+              },
+            }),
+          },
+        })
+      )
+      await act(async () => {})
+      if (hasSnapshot) {
+        expect(
+          screen.getByRole('textbox', { name: 'User Request' })
+        ).toHaveTextContent('image-task-request')
+      } else {
+        expect(screen.getByText('User Request')).toBeInTheDocument()
+        expect(screen.getAllByText('Not recorded')).toHaveLength(1)
+      }
+      expect(screen.queryByText('Submission Accepted')).not.toBeInTheDocument()
+      expect(screen.queryByText(/accepted-canary/)).not.toBeInTheDocument()
+      expect(screen.queryByText('Response')).not.toBeInTheDocument()
+      expect(
+        screen.queryByText(/image-task-success-response/)
+      ).not.toBeInTheDocument()
+      expect(get).not.toHaveBeenCalled()
+    }
+  )
+
+  describe.each([2, 5])(
+    'image log type %s administrator visibility',
+    (type) => {
+      const imageLog = {
+        ...log,
+        type,
+        other: JSON.stringify({
+          request_path: '/v1/images/edits',
+          admin_info: {
+            image_request: { prompt: 'private-image-request' },
+            relay_error: {
+              request: { prompt: 'private-image-request' },
+              response: { error: 'private-image-response' },
+            },
+          },
+        }),
+      }
+
+      test.each([
+        { role: ROLE.USER, isAdmin: false },
+        { role: ROLE.USER, isAdmin: true },
+        { role: ROLE.ADMIN, isAdmin: false },
+      ])(
+        'role $role with isAdmin=$isAdmin cannot see image snapshots',
+        ({ role, isAdmin }) => {
+          const get = vi.spyOn(api, 'get')
+          useAuthStore
+            .getState()
+            .auth.setUser({ id: 7, username: 'viewer', role })
+          render(details({ log: imageLog, isAdmin }))
+          expect(screen.queryByText('User Request')).not.toBeInTheDocument()
+          expect(screen.queryByText('Response')).not.toBeInTheDocument()
+          expect(
+            screen.queryByText(/private-image-request/)
+          ).not.toBeInTheDocument()
+          expect(
+            screen.queryByText(/private-image-response/)
+          ).not.toBeInTheDocument()
+          expect(get).not.toHaveBeenCalled()
+        }
+      )
+
+      test('revoking administrator role immediately hides saved image bodies', () => {
+        render(details({ log: imageLog }))
+        expect(
+          screen.getByRole('textbox', { name: 'User Request' })
+        ).toHaveTextContent('private-image-request')
+        act(() =>
+          useAuthStore
+            .getState()
+            .auth.setUser({ id: 7, username: 'viewer', role: ROLE.USER })
+        )
+        expect(screen.queryByText('User Request')).not.toBeInTheDocument()
+        expect(screen.queryByText('Response')).not.toBeInTheDocument()
+        expect(
+          screen.queryByText(/private-image-request/)
+        ).not.toBeInTheDocument()
+        expect(
+          screen.queryByText(/private-image-response/)
+        ).not.toBeInTheDocument()
+      })
+    }
+  )
 })

@@ -465,7 +465,13 @@ export function TaskDetailsDialog(props: TaskDetailsDialogProps) {
             />
             <DetailRow
               label={t('Channel')}
-              value={`#${props.log.channel_id}`}
+              value={
+                props.log.channel_id
+                  ? [props.log.channel_name?.trim(), `#${props.log.channel_id}`]
+                      .filter(Boolean)
+                      .join(' ')
+                  : '-'
+              }
               mono
             />
             <DetailRow label={t('Group')} value={props.log.group || '-'} />

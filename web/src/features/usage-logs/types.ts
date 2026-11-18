@@ -148,6 +148,7 @@ export interface LogOtherData {
     // Reject / intercept reason (admin only)
     reject_reason?: string
     task_plugin?: TaskPluginInfo
+    image_request?: unknown
     task_submission?: {
       request?: unknown
       response?: unknown
@@ -350,6 +351,7 @@ export interface TaskLog {
   task_id: string
   action: string // MUSIC, LYRICS, GENERATE, TEXT_GENERATE, etc.
   channel_id: number
+  channel_name?: string
   group: string
   quota: number
   billing_mode?: 'per_call' | 'per_token' | 'tiered_expr'

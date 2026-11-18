@@ -30,9 +30,227 @@ import (
 	"gorm.io/gorm"
 )
 
+func TestRelayErrorRequestSnapshots(t *testing.T) {
+	var multipartBody bytes.Buffer
+	writer := multipart.NewWriter(&multipartBody)
+	for _, field := range [][2]string{
+		{"model", "gpt-image-2"}, {"prompt", "replace background"}, {"prompt", "keep subject"},
+		{"size", "1024x1024"}, {"quality", "high"}, {"n", "2"}, {"api_key", "request-secret-canary"},
+	} {
+		require.NoError(t, writer.WriteField(field[0], field[1]))
+	}
+	file, err := writer.CreateFormFile("image[]", "input.png")
+	require.NoError(t, err)
+	_, err = io.WriteString(file, "image-binary-canary"+strings.Repeat("x", model.TaskEventPayloadLimit))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	for _, tc := range []struct {
+		name, contentType, body, want string
+		converted                     bool
+	}{
+		{
+			name: "multipart image edit before channel conversion", contentType: writer.FormDataContentType(), body: multipartBody.String(), converted: true,
+			want: `{"kind":"multipart","fields":{"model":["gpt-image-2"],"prompt":["replace background","keep subject"],"size":["1024x1024"],"quality":["high"],"n":["2"],"api_key":"[REDACTED]"},"files":[{"field":"image[]","filename":"input.png","mime_type":"application/octet-stream","size":61459}],"unavailable":"uploaded_file_bytes_omitted"}`,
+		},
+		{
+			name: "oversized multipart fields", contentType: writer.FormDataContentType(),
+			body: strings.Replace(multipartBody.String(), "replace background", strings.Repeat("x", model.TaskEventPayloadLimit+1), 1),
+			want: `{"unavailable":"size_limit_exceeded"}`,
+		},
+		{
+			name: "invalid multipart", contentType: "multipart/form-data", body: "missing boundary",
+			want: `{"unavailable":"invalid_multipart"}`,
+		},
+		{
+			name: "JSON before channel content type conversion", contentType: "application/json; charset=utf-8", converted: true,
+			body: `{"model":"gpt-image-2","prompt":"replace background","seed":9007199254740993,"scale":1.2300,"enabled":false,"api_key":"request-secret-canary"}`,
+			want: `{"model":"gpt-image-2","prompt":"replace background","seed":9007199254740993,"scale":1.2300,"enabled":false,"api_key":"[REDACTED]"}`,
+		},
+		{
+			name: "invalid JSON", contentType: "application/json", body: `{"broken"`,
+			want: `{"unavailable":"non_json_request"}`,
+		},
+		{
+			name: "oversized JSON", contentType: "application/json", body: `{"prompt":"` + strings.Repeat("x", model.TaskEventPayloadLimit+1) + `"}`,
+			want: `{"unavailable":"size_limit_exceeded"}`,
+		},
+		{
+			name: "URL encoded fields", contentType: "application/x-www-form-urlencoded; charset=UTF-8",
+			body: "model=gpt-image-2&prompt=first&prompt=second&api_key=request-secret-canary",
+			want: `{"kind":"form","fields":{"model":["gpt-image-2"],"prompt":["first","second"],"api_key":"[REDACTED]"}}`,
+		},
+		{
+			name: "invalid URL encoded fields", contentType: "application/x-www-form-urlencoded", body: "prompt=%zz",
+			want: `{"unavailable":"invalid_form"}`,
+		},
+		{
+			name: "unsupported content type", contentType: "text/plain", body: `{"prompt":"do not capture"}`,
+			want: `{"unavailable":"unsupported_content_type"}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(tc.body))
+			c.Request.Header.Set("Content-Type", tc.contentType)
+			t.Cleanup(func() {
+				common.CleanupBodyStorage(c)
+				if c.Request.MultipartForm != nil {
+					require.NoError(t, c.Request.MultipartForm.RemoveAll())
+				}
+			})
+			capture := installRelayErrorCapture(c)
+			replayed, err := io.ReadAll(c.Request.Body)
+			require.NoError(t, err)
+			assert.Equal(t, tc.body, string(replayed))
+			if tc.converted {
+				c.Request.Header.Set("Content-Type", "multipart/form-data; boundary=upstream-boundary")
+				if c.Request.MultipartForm != nil {
+					c.Request.MultipartForm.Value["model"] = []string{"mapped-model"}
+					c.Request.MultipartForm.Value["prompt"] = []string{"converted-prompt"}
+				}
+			}
+			collect := c.MustGet(model.ContextKeyErrorLogCollector).(func(*model.Log, func()))
+			row := &model.Log{Other: `{}`}
+			writes := 0
+			collect(row, func() { writes++ })
+			c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": "upstream failure"}})
+			capture.record()
+			assert.Equal(t, 1, writes)
+			var stored struct {
+				Admin struct {
+					Detail struct{ Request, Response json.RawMessage } `json:"relay_error"`
+				} `json:"admin_info"`
+			}
+			require.NoError(t, common.UnmarshalJsonStr(row.Other, &stored))
+			assert.JSONEq(t, tc.want, string(stored.Admin.Detail.Request))
+			assert.JSONEq(t, `{"error":{"message":"upstream failure"}}`, string(stored.Admin.Detail.Response))
+			assert.NotContains(t, row.Other, "request-secret-canary")
+			assert.NotContains(t, row.Other, "image-binary-canary")
+			if strings.HasPrefix(tc.contentType, "application/json") && tc.converted {
+				assert.Contains(t, string(stored.Admin.Detail.Request), "9007199254740993")
+				assert.Contains(t, string(stored.Admin.Detail.Request), "1.2300")
+			}
+		})
+	}
+}
+
+func TestImageRequestCaptureWithErrorLoggingDisabled(t *testing.T) {
+	previous := constant.ErrorLogEnabled
+	constant.ErrorLogEnabled = false
+	t.Cleanup(func() { constant.ErrorLogEnabled = previous })
+	for _, path := range []string{"/v1/images/generations", "/v1/images/edits"} {
+		t.Run(path, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"prompt":"original-request","api_key":"secret-canary"}`))
+			c.Request.Header.Set("Content-Type", "application/json")
+			t.Cleanup(func() { common.CleanupBodyStorage(c) })
+			Relay(c, types.RelayFormatOpenAIImage)
+			assert.Equal(t, http.StatusBadRequest, recorder.Code)
+			request, ok := common.GetContextKeyType[json.RawMessage](c, constant.ContextKeyImageRequestDetail)
+			require.True(t, ok)
+			assert.JSONEq(t, `{"prompt":"original-request","api_key":"[REDACTED]"}`, string(request))
+		})
+	}
+}
+
+func TestImageConsumptionRequestDetails(t *testing.T) {
+	db := setupMaterialConcurrentPostgres(t)
+	require.NoError(t, db.AutoMigrate(&model.Log{}, &model.Channel{}))
+	previousLog := model.LOG_DB
+	previousConsume, previousExport := common.LogConsumeEnabled, common.DataExportEnabled
+	previousError := constant.ErrorLogEnabled
+	model.LOG_DB, common.LogConsumeEnabled, common.DataExportEnabled = db, true, false
+	constant.ErrorLogEnabled = false
+	t.Cleanup(func() {
+		model.LOG_DB, common.LogConsumeEnabled, common.DataExportEnabled = previousLog, previousConsume, previousExport
+		constant.ErrorLogEnabled = previousError
+	})
+	user := &model.User{Username: "image-owner", AffCode: "image-owner"}
+	require.NoError(t, db.Create(user).Error)
+	channel := &model.Channel{Name: "image-channel"}
+	require.NoError(t, db.Create(channel).Error)
+
+	for _, path := range []string{"/v1/images/generations", "/v1/images/edits"} {
+		for _, plugin := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s plugin=%t", path, plugin), func(t *testing.T) {
+				body := `{"model":"gpt-image-2","prompt":"original-image-request","api_key":"image-secret-canary"}`
+				contentType := "application/json"
+				want := `{"model":"gpt-image-2","prompt":"original-image-request","api_key":"[REDACTED]"}`
+				if path == "/v1/images/edits" {
+					var multipartBody bytes.Buffer
+					writer := multipart.NewWriter(&multipartBody)
+					require.NoError(t, writer.WriteField("model", "gpt-image-2"))
+					require.NoError(t, writer.WriteField("prompt", "original-image-request"))
+					require.NoError(t, writer.WriteField("api_key", "image-secret-canary"))
+					file, err := writer.CreateFormFile("image", "input.png")
+					require.NoError(t, err)
+					_, err = io.WriteString(file, "image-binary-canary")
+					require.NoError(t, err)
+					require.NoError(t, writer.Close())
+					body, contentType = multipartBody.String(), writer.FormDataContentType()
+					want = `{"kind":"multipart","fields":{"model":["gpt-image-2"],"prompt":["original-image-request"],"api_key":"[REDACTED]"},"files":[{"field":"image","filename":"input.png","mime_type":"application/octet-stream","size":19}],"unavailable":"uploaded_file_bytes_omitted"}`
+				}
+				c, _ := gin.CreateTestContext(httptest.NewRecorder())
+				c.Request = httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+				c.Request.Header.Set("Content-Type", contentType)
+				c.Set("id", user.Id)
+				c.Set("token_id", 12)
+				t.Cleanup(func() {
+					common.CleanupBodyStorage(c)
+					if c.Request.MultipartForm != nil {
+						require.NoError(t, c.Request.MultipartForm.RemoveAll())
+					}
+				})
+				info := &relaycommon.RelayInfo{UserId: user.Id, TokenId: 12, OriginModelName: "gpt-image-2", TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+				info.ChannelMeta = &relaycommon.ChannelMeta{ChannelId: channel.Id}
+				var capture *taskEventResponseCapture
+				if plugin {
+					capture = installTaskEventResponseCapture(c)
+					capture.arm(c, taskEventOriginalRequest(c))
+				} else {
+					capture = installRelayErrorCapture(c)
+				}
+				c.Request.Header.Set("Content-Type", "multipart/form-data; boundary=upstream")
+				if plugin {
+					service.LogTaskConsumption(c, info, &model.Task{TaskID: "image-task"})
+				} else {
+					other := service.GenerateTextOtherInfo(c, info, 1, 1, 1, 0, 1, 0, 1)
+					model.RecordConsumeLog(c, user.Id, model.RecordConsumeLogParams{ModelName: "gpt-image-2", TokenId: 12, Other: other})
+				}
+				c.JSON(http.StatusOK, gin.H{"data": []any{gin.H{"b64_json": "successful-image-response-canary"}}})
+				capture.record()
+				var row model.Log
+				require.NoError(t, db.Order("id desc").First(&row).Error)
+				assert.Equal(t, model.LogTypeConsume, row.Type)
+				var stored struct {
+					Admin struct {
+						Request json.RawMessage `json:"image_request"`
+					} `json:"admin_info"`
+				}
+				require.NoError(t, common.UnmarshalJsonStr(row.Other, &stored))
+				assert.JSONEq(t, want, string(stored.Admin.Request))
+				assert.NotContains(t, row.Other, "image-secret-canary")
+				assert.NotContains(t, row.Other, "image-binary-canary")
+				assert.NotContains(t, row.Other, "successful-image-response-canary")
+				assert.NotContains(t, row.Other, `"relay_error"`)
+				model.FormatAdminLogs([]*model.Log{&row})
+				assert.Contains(t, row.Other, "original-image-request")
+				rows, err := model.GetLogByTokenId(12)
+				require.NoError(t, err)
+				for _, userRow := range rows {
+					assert.NotContains(t, userRow.Other, "image_request")
+					assert.NotContains(t, userRow.Other, "original-image-request")
+				}
+			})
+		}
+	}
+}
+
 func TestRelayErrorSnapshots(t *testing.T) {
-	t.Setenv("TEST_TASK_DB_DIALECT", "sqlite")
-	db, _ := openTaskDialectDatabase(t, &model.User{}, &model.Log{})
+	db := setupMaterialConcurrentPostgres(t)
+	require.NoError(t, db.AutoMigrate(&model.Log{}))
 	oldDB, oldLog, oldEnabled := model.DB, model.LOG_DB, constant.ErrorLogEnabled
 	oldRedis, oldMemory := common.RedisEnabled, common.MemoryCacheEnabled
 	common.RedisEnabled, common.MemoryCacheEnabled = false, false
@@ -42,21 +260,37 @@ func TestRelayErrorSnapshots(t *testing.T) {
 		common.RedisEnabled, common.MemoryCacheEnabled = oldRedis, oldMemory
 	})
 	require.NoError(t, db.Create(&model.User{Id: 7, Username: "relay-owner", AffCode: "relay"}).Error)
-	for _, tc := range []struct{ name, body string }{
-		{"json", `{"model":"original","api_key":"secret-canary","count":9007199254740993}`},
-		{"oversized", `{"prompt":"` + strings.Repeat("x", model.TaskEventPayloadLimit+1) + `"}`},
-		{"invalid", `{"broken"`},
-		{"relay handler", `{"broken"`},
+	var multipartBody bytes.Buffer
+	writer := multipart.NewWriter(&multipartBody)
+	require.NoError(t, writer.WriteField("model", "gpt-image-2"))
+	require.NoError(t, writer.WriteField("prompt", "original image edit"))
+	require.NoError(t, writer.WriteField("n", "invalid"))
+	require.NoError(t, writer.Close())
+	for _, tc := range []struct{ name, body, contentType string }{
+		{"json", `{"model":"original","api_key":"secret-canary","count":9007199254740993}`, "application/json"},
+		{"oversized", `{"prompt":"` + strings.Repeat("x", model.TaskEventPayloadLimit+1) + `"}`, "application/json"},
+		{"invalid", `{"broken"`, "application/json"},
+		{"relay handler", `{"broken"`, "application/json"},
+		{"multipart relay handler", multipartBody.String(), writer.FormDataContentType()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(recorder)
 			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(tc.body))
-			c.Request.Header.Set("Content-Type", "application/json")
+			c.Request.Header.Set("Content-Type", tc.contentType)
 			c.Set("id", 7)
 			c.Set("token_id", 12)
-			t.Cleanup(func() { common.CleanupBodyStorage(c) })
-			if tc.name == "relay handler" {
+			t.Cleanup(func() {
+				common.CleanupBodyStorage(c)
+				if c.Request.MultipartForm != nil {
+					require.NoError(t, c.Request.MultipartForm.RemoveAll())
+				}
+			})
+			if tc.name == "multipart relay handler" {
+				c.Request.URL.Path = "/v1/images/edits"
+				Relay(c, types.RelayFormatOpenAIImage)
+				assert.Equal(t, http.StatusBadRequest, recorder.Code)
+			} else if tc.name == "relay handler" {
 				Relay(c, types.RelayFormatOpenAI)
 			} else {
 				capture := installRelayErrorCapture(c)
@@ -91,6 +325,9 @@ func TestRelayErrorSnapshots(t *testing.T) {
 			}
 			if tc.name == "invalid" {
 				assert.Contains(t, string(stored.Admin.Detail.Request), "non_json_request")
+			}
+			if tc.name == "multipart relay handler" {
+				assert.JSONEq(t, `{"kind":"multipart","fields":{"model":["gpt-image-2"],"prompt":["original image edit"],"n":["invalid"]},"files":null}`, string(stored.Admin.Detail.Request))
 			}
 			model.FormatAdminLogs([]*model.Log{&row})
 			assert.Contains(t, row.Other, "relay_error")
@@ -1336,6 +1573,79 @@ func TestTerminalTaskTransitionRecordsResultOnce(t *testing.T) {
 	events, err = model.GetTaskEvents(task.ID)
 	require.NoError(t, err)
 	assert.Len(t, events, 1)
+}
+
+func TestTaskLogChannelNames(t *testing.T) {
+	db := setupMaterialConcurrentPostgres(t)
+	require.NoError(t, db.AutoMigrate(&model.Task{}, &model.TaskEvent{}, &model.Channel{}))
+	channel := &model.Channel{Name: "视频主渠道", Key: "channel-secret-canary"}
+	require.NoError(t, db.Create(channel).Error)
+	user := &model.User{Username: "channel-log-owner", AffCode: "channel-log-owner"}
+	require.NoError(t, db.Create(user).Error)
+	for _, task := range []*model.Task{
+		{TaskID: "channel-first", UserId: user.Id, ChannelId: channel.Id},
+		{TaskID: "channel-second", UserId: user.Id, ChannelId: channel.Id},
+		{TaskID: "channel-missing", UserId: user.Id, ChannelId: channel.Id + 1},
+		{TaskID: "channel-unassigned", UserId: user.Id},
+	} {
+		require.NoError(t, db.Create(task).Error)
+	}
+	for _, tc := range []struct {
+		name    string
+		role    int
+		handler gin.HandlerFunc
+	}{
+		{"admin", common.RoleAdminUser, GetAllTask},
+		{"root", common.RoleRootUser, GetAllTask},
+		{"self", common.RoleCommonUser, GetUserTask},
+		{"admin self", common.RoleAdminUser, GetUserTask},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, "/api/task/?page_size=20", nil)
+			c.Set("id", user.Id)
+			c.Set("role", tc.role)
+			tc.handler(c)
+			var response struct {
+				Success bool
+				Data    struct {
+					Items []map[string]json.RawMessage
+				}
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			require.True(t, response.Success)
+			require.Len(t, response.Data.Items, 4)
+			for _, item := range response.Data.Items {
+				var taskID, name string
+				require.NoError(t, common.Unmarshal(item["task_id"], &taskID))
+				if raw := item["channel_name"]; len(raw) > 0 {
+					require.NoError(t, common.Unmarshal(raw, &name))
+				}
+				want := ""
+				if (tc.name == "admin" || tc.name == "root") && (taskID == "channel-first" || taskID == "channel-second") {
+					want = "视频主渠道"
+				}
+				assert.Equal(t, want, name, taskID)
+				var channelID int
+				require.NoError(t, common.Unmarshal(item["channel_id"], &channelID))
+				if tc.name == "self" || tc.name == "admin self" {
+					assert.Zero(t, channelID)
+				} else if taskID == "channel-missing" {
+					assert.Equal(t, channel.Id+1, channelID)
+				} else if taskID == "channel-unassigned" {
+					assert.Zero(t, channelID)
+				} else {
+					assert.Equal(t, channel.Id, channelID)
+				}
+			}
+			if tc.name == "self" || tc.name == "admin self" {
+				assert.NotContains(t, recorder.Body.String(), "视频主渠道")
+				assert.NotContains(t, recorder.Body.String(), "channel_name")
+			}
+			assert.NotContains(t, recorder.Body.String(), "channel-secret-canary")
+		})
+	}
 }
 
 func TestTaskLogDTOSeparatesUserAdminAndRootDetails(t *testing.T) {

@@ -52,6 +52,7 @@ function TaskDetailsCell(props: {
   isRoot: boolean
 }) {
   const { t } = useTranslation()
+  const { sensitiveVisible } = useUsageLogsContext()
   const [dialogOpen, setDialogOpen] = useState(false)
 
   return (
@@ -77,7 +78,11 @@ function TaskDetailsCell(props: {
         ) : null}
       </div>
       <TaskDetailsDialog
-        log={props.log}
+        log={
+          sensitiveVisible
+            ? props.log
+            : { ...props.log, channel_name: undefined }
+        }
         isAdmin={props.isAdmin}
         isRoot={props.isRoot}
         open={dialogOpen}
@@ -92,6 +97,7 @@ export function useTaskLogsColumns(
   isRoot: boolean
 ): ColumnDef<TaskLog>[] {
   const { t, i18n } = useTranslation()
+  const { sensitiveVisible } = useUsageLogsContext()
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
   return useMemo(() => {
     const columns: ColumnDef<TaskLog>[] = [
@@ -121,7 +127,11 @@ export function useTaskLogsColumns(
 
     if (isAdmin) {
       columns.push(
-        createChannelColumn<TaskLog>({ headerLabel: t('Channel') }),
+        createChannelColumn<TaskLog>({
+          headerLabel: t('Channel'),
+          getChannelName: (log) =>
+            sensitiveVisible ? log.channel_name : undefined,
+        }),
         {
           id: 'user',
           header: t('User'),
@@ -396,5 +406,5 @@ export function useTaskLogsColumns(
         columnOrder.indexOf(String(rightId))
       )
     })
-  }, [t, locale, isAdmin, isRoot])
+  }, [t, locale, isAdmin, isRoot, sensitiveVisible])
 }

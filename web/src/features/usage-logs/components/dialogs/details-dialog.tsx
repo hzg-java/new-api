@@ -93,7 +93,7 @@ import { USAGE_BILLING_PATH, type LogOtherData } from '../../types'
 import { ResponseModelDetails } from '../model-badge'
 import { PluginAuthorLink } from '../plugin-author-link'
 import { DetailRow, DetailSection } from './log-detail-layout'
-import { FailedTaskSubmission, LogTaskEvents } from './log-task-events'
+import { LogRequestDetails, LogTaskEvents } from './log-task-events'
 
 // Maps a channel-update changed-field token (as recorded by the backend audit)
 // to its i18n label key for display in the audit details.
@@ -484,22 +484,27 @@ export function DetailsDialog(props: DetailsDialogProps) {
   const typeConfig = getLogTypeConfig(props.log.type)
   const viewer = useAuthStore((state) => state.auth.user)
   const taskId = typeof other?.task_id === 'string' ? other.task_id : ''
+  const isImageRequest =
+    other?.request_path === '/v1/images/generations' ||
+    other?.request_path === '/v1/images/edits'
+  const canViewRequestDetails =
+    props.open && props.isAdmin && (viewer?.role ?? ROLE.GUEST) >= ROLE.ADMIN
+  const showImageRequest =
+    canViewRequestDetails && props.log.type === 2 && isImageRequest
   const showFailedSubmission =
-    props.open &&
-    props.isAdmin &&
-    (viewer?.role ?? ROLE.GUEST) >= ROLE.ADMIN &&
+    canViewRequestDetails &&
     props.log.type === 5 &&
-    !!(
-      other?.admin_info?.relay_error ||
-      other?.admin_info?.task_submission ||
-      other?.admin_info?.task_plugin
-    )
+    (isImageRequest ||
+      !!(
+        other?.admin_info?.relay_error ||
+        other?.admin_info?.task_submission ||
+        other?.admin_info?.task_plugin
+      ))
   const showTaskEvents =
-    props.open &&
-    props.isAdmin &&
-    (viewer?.role ?? ROLE.GUEST) >= ROLE.ADMIN &&
+    canViewRequestDetails &&
     viewer != null &&
     props.log.type === 2 &&
+    !isImageRequest &&
     taskId.trim().length > 0 &&
     Number.isSafeInteger(props.log.user_id) &&
     props.log.user_id > 0
@@ -783,9 +788,16 @@ export function DetailsDialog(props: DetailsDialogProps) {
           />
         )}
 
+        {showImageRequest && (
+          <LogRequestDetails
+            snapshot={{ request: other?.admin_info?.image_request }}
+            showResponse={false}
+          />
+        )}
+
         {showFailedSubmission && (
-          <FailedTaskSubmission
-            submission={
+          <LogRequestDetails
+            snapshot={
               other?.admin_info?.relay_error ??
               other?.admin_info?.task_submission
             }
