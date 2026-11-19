@@ -316,9 +316,11 @@ it.each([
         .mocked(api.get)
         .mock.calls.filter(([path]) => path.includes('/stat?'))
       expect(statsCalls.length).toBeGreaterThan(0)
-      for (const [path] of statsCalls) {
-        expect(path).not.toContain('request_id=')
-      }
+      const query = new URL(String(statsCalls.at(-1)?.[0]), 'http://localhost')
+        .searchParams
+      expect(query.get('request_id')).toBe('request-20261029-exact')
+      expect(query.get('group')).toBe('default')
+      expect(query.get('type')).toBe('2')
     })
     if (mobile) await user.click(screen.getByRole('button', { name: 'Filter' }))
     expect(screen.getByRole('textbox', { name: 'Request ID' })).toHaveValue(

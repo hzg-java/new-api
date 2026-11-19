@@ -6,11 +6,12 @@ import {
   createRouter,
   RouterProvider,
 } from '@tanstack/react-router'
-import { cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, expect, test, vi } from 'vitest'
 
 import { api } from '@/lib/api'
+import { formatLogQuota } from '@/lib/format'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { CommonLogsStats } from '../common-logs-stats'
@@ -30,11 +31,20 @@ test.each([1, 10])(
   async (role) => {
     vi.spyOn(window, 'scrollTo').mockImplementation(() => {})
     useAuthStore.getState().auth.setUser({ id: 1, username: 'viewer', role })
-    vi.spyOn(api, 'get').mockResolvedValue({
-      data: {
-        success: true,
-        data: { quota: 0, rpm: 2, tpm: 50, total_tokens: 12345 },
-      },
+    const get = vi.spyOn(api, 'get').mockImplementation(async (url) => {
+      const query = new URL(String(url), 'http://localhost').searchParams
+      const empty = query.get('request_id') === 'missing'
+      return {
+        data: {
+          success: true,
+          data: {
+            quota: empty ? 0 : 500000,
+            rpm: empty ? 0 : 2,
+            tpm: empty ? 0 : 50,
+            total_tokens: empty ? 0 : 12345,
+          },
+        },
+      }
     })
     const root = createRootRoute()
     const auth = createRoute({
@@ -54,7 +64,9 @@ test.each([1, 10])(
     const router = createRouter({
       routeTree: root.addChildren([auth.addChildren([logs])]),
       history: createMemoryHistory({
-        initialEntries: ['/usage-logs/common?model_name=model-a'],
+        initialEntries: [
+          '/usage-logs/common?model=model-a&requestId=request-selected&type=%5B%222%22%5D&token=key-a&group=default&username=owner&channel=2&startTime=1730000000000&endTime=1730086400000&page=3&pageSize=1',
+        ],
       }),
     })
     client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -65,6 +77,20 @@ test.each([1, 10])(
     )
     expect(await screen.findByText('Total Tokens')).toBeVisible()
     expect(screen.getByText('12,345')).toBeVisible()
+    expect(screen.getByText(formatLogQuota(500000))).toBeVisible()
+    const query = new URL(String(get.mock.calls[0][0]), 'http://localhost')
+      .searchParams
+    expect(Object.fromEntries(query)).toMatchObject({
+      type: '2',
+      model_name: 'model-a',
+      request_id: 'request-selected',
+      token_name: 'key-a',
+      group: 'default',
+      start_timestamp: '1730000000',
+      end_timestamp: '1730086400',
+    })
+    expect(query.get('username')).toBe(role === 10 ? 'owner' : null)
+    expect(query.get('channel')).toBe(role === 10 ? '2' : null)
     const user = userEvent.setup()
     await user.hover(screen.getByText('RPM'))
     expect(await screen.findByRole('tooltip')).toHaveTextContent(
@@ -80,5 +106,23 @@ test.each([1, 10])(
         role === 10 ? /\/api\/log\/stat\?/ : /\/api\/log\/self\/stat\?/
       )
     )
+
+    await act(async () => {
+      await router.navigate({
+        to: '/usage-logs/$section',
+        params: { section: 'common' },
+        search: { ...router.state.location.search, requestId: 'missing' },
+      })
+    })
+    await waitFor(() => {
+      expect(screen.queryByText('12,345')).not.toBeInTheDocument()
+      expect(screen.getByText(formatLogQuota(0))).toBeVisible()
+    })
+    expect(
+      new URL(
+        String(get.mock.calls.at(-1)?.[0]),
+        'http://localhost'
+      ).searchParams.get('request_id')
+    ).toBe('missing')
   }
 )

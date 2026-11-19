@@ -487,6 +487,7 @@ export interface GetLogStatsParams {
   username?: string
   token_name?: string
   model_name?: string
+  request_id?: string
   start_timestamp?: number
   end_timestamp?: number
   channel?: number

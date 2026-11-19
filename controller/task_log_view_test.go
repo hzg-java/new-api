@@ -528,11 +528,15 @@ func TestVideoTaskDisplayBillingProjection(t *testing.T) {
 		{"failed refund incomplete", model.TaskStatusFailure, 100, 100, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			db, _ := openTaskDialectDatabase(t, &model.Task{})
-			oldDB := model.DB
-			model.DB = db
-			t.Cleanup(func() { model.DB = oldDB })
-			require.NoError(t, db.Create(&model.Task{TaskID: "video", UserId: 7, Action: constant.TaskActionTextToVideo, Status: tc.status, Quota: tc.quota}).Error)
+			db, _ := openTaskDialectDatabase(t, &model.Task{}, &model.Log{})
+			oldDB, oldLogDB := model.DB, model.LOG_DB
+			model.DB, model.LOG_DB = db, db
+			t.Cleanup(func() { model.DB, model.LOG_DB = oldDB, oldLogDB })
+			task := model.Task{TaskID: "video", UserId: 7, Action: constant.TaskActionTextToVideo, Status: tc.status, Quota: tc.quota}
+			if !tc.pending {
+				task.PrivateData.SettledQuota = &tc.quota
+			}
+			require.NoError(t, db.Create(&task).Error)
 			logs := []*model.Log{{UserId: 7, Type: model.LogTypeConsume, Quota: 100, Other: `{"task_id":"video","billing_source":"subscription","subscription_consumed":100}`}}
 			require.NoError(t, enrichVideoTaskLogs(logs))
 			assert.Equal(t, tc.want, logs[0].Quota)
@@ -573,8 +577,8 @@ func TestVideoTaskDisplayGroupsBeforeEndpointPagination(t *testing.T) {
 		common.SetDatabaseTypes(oldMain, oldLog)
 	})
 	for _, task := range []model.Task{
-		{TaskID: "video", UserId: 7, Action: constant.TaskActionTextToVideo, Status: model.TaskStatusSuccess, Quota: 60},
-		{TaskID: "video", UserId: 8, Action: constant.TaskActionTextToVideo, Status: model.TaskStatusSuccess, Quota: 30},
+		{TaskID: "video", UserId: 7, Action: constant.TaskActionTextToVideo, Status: model.TaskStatusSuccess, Quota: 60, PrivateData: model.TaskPrivateData{SettledQuota: common.GetPointer(60)}},
+		{TaskID: "video", UserId: 8, Action: constant.TaskActionTextToVideo, Status: model.TaskStatusSuccess, Quota: 30, PrivateData: model.TaskPrivateData{SettledQuota: common.GetPointer(30)}},
 		{TaskID: "image", UserId: 7, Action: "text_to_image"},
 		{TaskID: "ambiguous", UserId: 7, Action: constant.TaskActionTextToVideo},
 		{TaskID: "ambiguous", UserId: 7, Action: constant.TaskActionTextToVideo},

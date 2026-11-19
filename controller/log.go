@@ -62,6 +62,34 @@ func projectVideoTaskLogs(logs []*model.Log, consolidate bool) ([]*model.Log, er
 		}
 		taskByOwner[owner] = &tasks[i]
 	}
+	var legacyTasks []model.Task
+	for _, task := range taskByOwner {
+		if task == nil || task.PrivateData.SettledQuota != nil || task.PrivateData.BillingAdjustmentFailed || taskVideoLogInfo(task) == nil {
+			continue
+		}
+		if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
+			legacyTasks = append(legacyTasks, *task)
+		}
+	}
+	settlements, err := model.GetTaskSettlementLogs(legacyTasks)
+	if err != nil {
+		return nil, err
+	}
+	legacyQuota := make(map[taskOwner]int)
+	for _, settlement := range settlements {
+		var detail struct {
+			TaskID      string `json:"task_id"`
+			ActualQuota *int   `json:"actual_quota"`
+		}
+		if common.UnmarshalJsonStr(settlement.Other, &detail) != nil || detail.ActualQuota == nil || *detail.ActualQuota < 0 || *detail.ActualQuota > common.MaxQuota {
+			continue
+		}
+		owner := taskOwner{detail.TaskID, settlement.UserId}
+		task := taskByOwner[owner]
+		if task != nil && task.Quota == *detail.ActualQuota {
+			legacyQuota[owner] = *detail.ActualQuota
+		}
+	}
 	if consolidate {
 		rows := make([]*model.Log, 0, len(logs))
 		firstByOwner := make(map[taskOwner]*model.Log)
@@ -125,17 +153,26 @@ func projectVideoTaskLogs(logs []*model.Log, consolidate bool) ([]*model.Log, er
 		if common.UnmarshalJsonStr(log.Other, &other) != nil || other == nil {
 			continue
 		}
-		pending := task.Status != model.TaskStatusSuccess && (task.Status != model.TaskStatusFailure || task.Quota != 0)
+		settledQuota := task.PrivateData.SettledQuota
+		if settledQuota == nil {
+			if quota, ok := legacyQuota[owner]; ok {
+				settledQuota = &quota
+			}
+		}
+		pending := task.PrivateData.BillingAdjustmentFailed || settledQuota == nil || task.Status != model.TaskStatusSuccess && task.Status != model.TaskStatusFailure
 		log.Quota = task.Quota
+		if !pending {
+			log.Quota = *settledQuota
+		}
 		if task.Status != model.TaskStatusSuccess && task.Status != model.TaskStatusFailure {
 			log.Quota = 0
 		}
 		other["task_status"] = task.Status
 		other["task_billing_pending"] = pending
 		if !pending {
-			other["actual_quota"] = task.Quota
+			other["actual_quota"] = log.Quota
 			if other["billing_source"] == "subscription" {
-				other["subscription_consumed"] = task.Quota
+				other["subscription_consumed"] = log.Quota
 			}
 		}
 		encoded, err := common.Marshal(other)
@@ -306,6 +343,30 @@ func GetLogByKey(c *gin.Context) {
 	})
 }
 
+func getLogStatistics(logType int, startTimestamp, endTimestamp int64, modelName, username, tokenName string, channel int, group, requestId string) (model.Stat, error) {
+	stat, logs, err := model.SumUsedQuota(logType, startTimestamp, endTimestamp, modelName, username, tokenName, channel, group, requestId)
+	if err != nil {
+		return stat, err
+	}
+	logs, err = projectVideoTaskLogs(logs, true)
+	if err != nil {
+		return stat, err
+	}
+	for _, log := range logs {
+		if log.Type != model.LogTypeConsume {
+			continue
+		}
+		var other struct {
+			Pending bool `json:"task_billing_pending"`
+		}
+		if common.UnmarshalJsonStr(log.Other, &other) == nil && other.Pending {
+			continue
+		}
+		stat.Quota += log.Quota
+	}
+	return stat, nil
+}
+
 func GetLogsStat(c *gin.Context) {
 	logType, _ := strconv.Atoi(c.Query("type"))
 	startTimestamp, _ := strconv.ParseInt(c.Query("start_timestamp"), 10, 64)
@@ -315,7 +376,8 @@ func GetLogsStat(c *gin.Context) {
 	modelName := c.Query("model_name")
 	channel, _ := strconv.Atoi(c.Query("channel"))
 	group := c.Query("group")
-	stat, err := model.SumUsedQuota(logType, startTimestamp, endTimestamp, modelName, username, tokenName, channel, group)
+	requestId := c.Query("request_id")
+	stat, err := getLogStatistics(logType, startTimestamp, endTimestamp, modelName, username, tokenName, channel, group, requestId)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -343,7 +405,8 @@ func GetLogsSelfStat(c *gin.Context) {
 	modelName := c.Query("model_name")
 	channel, _ := strconv.Atoi(c.Query("channel"))
 	group := c.Query("group")
-	quotaNum, err := model.SumUsedQuota(logType, startTimestamp, endTimestamp, modelName, username, tokenName, channel, group)
+	requestId := c.Query("request_id")
+	quotaNum, err := getLogStatistics(logType, startTimestamp, endTimestamp, modelName, username, tokenName, channel, group, requestId)
 	if err != nil {
 		common.ApiError(c, err)
 		return
