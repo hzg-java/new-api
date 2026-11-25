@@ -2010,6 +2010,15 @@ func TestTaskLogModelAndStatusFilters(t *testing.T) {
 		{"admin exact model", "model_name=client", GetAllTask, 0},
 		{"self task and model", "model_name=client-model&task_id=prefix", GetUserTask, 0},
 		{"self time and model", "model_name=client-model&start_timestamp=101", GetUserTask, 0},
+		{"admin username", "username=filter-owner", GetAllTask, 5},
+		{"admin other username", "username=filter-other", GetAllTask, 1},
+		{"admin username combined", "username=filter-owner&model_name=client-model&status=SUCCESS", GetAllTask, 1},
+		{"admin missing username", "username=missing-owner", GetAllTask, 0},
+		{"admin exact username", "username=filter", GetAllTask, 0},
+		{"admin quoted username", "username=filter-owner%27%20OR%201%3D1--", GetAllTask, 0},
+		{"admin trimmed username", "username=%20filter-owner%20", GetAllTask, 5},
+		{"admin blank username", "username=%20%20", GetAllTask, 6},
+		{"self ignores username", "username=filter-other&user_id=8", GetUserTask, 5},
 		{"self reset", "", GetUserTask, 5},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2030,6 +2039,15 @@ func TestTaskLogModelAndStatusFilters(t *testing.T) {
 			require.True(t, response.Success)
 			assert.Equal(t, tc.want, response.Data.Total)
 			assert.Len(t, response.Data.Items, min(tc.want, 1))
+			for _, item := range response.Data.Items {
+				if strings.Contains(tc.name, "username") {
+					wantUserID := 7
+					if tc.name == "admin other username" {
+						wantUserID = 8
+					}
+					assert.Equal(t, wantUserID, item.UserId)
+				}
+			}
 			if tc.name == "self combined" {
 				require.Len(t, response.Data.Items, 1)
 				assert.Equal(t, "match", response.Data.Items[0].TaskID)

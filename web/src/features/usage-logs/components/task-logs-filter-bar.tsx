@@ -108,6 +108,9 @@ export function TaskLogsFilterBar<TData>(props: TaskLogsFilterBarProps<TData>) {
             ...(searchParams.filter ? { taskId: searchParams.filter } : {}),
             ...(searchParams.model ? { model: searchParams.model } : {}),
             ...(searchParams.status ? { status: searchParams.status } : {}),
+            ...(searchParams.username
+              ? { username: searchParams.username }
+              : {}),
           }
 
     setFilters(next)
@@ -119,6 +122,7 @@ export function TaskLogsFilterBar<TData>(props: TaskLogsFilterBarProps<TData>) {
     searchParams.filter,
     searchParams.model,
     searchParams.status,
+    searchParams.username,
   ])
 
   const handleChange = useCallback(
@@ -129,7 +133,10 @@ export function TaskLogsFilterBar<TData>(props: TaskLogsFilterBarProps<TData>) {
   )
 
   const handleApply = useCallback(() => {
-    const filterParams = buildSearchParams(filters, props.logCategory)
+    const filterParams = buildSearchParams(
+      { ...filters, username: isAdmin ? filters.username : undefined },
+      props.logCategory
+    )
     navigate({
       to: '/usage-logs/$section',
       params: { section: props.logCategory },
@@ -139,7 +146,7 @@ export function TaskLogsFilterBar<TData>(props: TaskLogsFilterBarProps<TData>) {
       },
     })
     queryClient.invalidateQueries({ queryKey: ['logs'] })
-  }, [filters, navigate, props.logCategory, queryClient])
+  }, [filters, isAdmin, navigate, props.logCategory, queryClient])
 
   const handleReset = useCallback(() => {
     const { start, end } = getDefaultTimeRange()
@@ -177,8 +184,14 @@ export function TaskLogsFilterBar<TData>(props: TaskLogsFilterBarProps<TData>) {
     props.logCategory === 'drawing'
       ? t('Filter by MjProxy task ID')
       : t('Filter by task ID')
+  const username =
+    isAdmin && props.logCategory === 'task' ? filters.username : undefined
   const hasAdditionalFilters =
-    !!filterValue || !!filters.channel || !!filters.model || !!filters.status
+    !!filterValue ||
+    !!filters.channel ||
+    !!filters.model ||
+    !!filters.status ||
+    !!username
   const statusItems = [
     { value: '', label: t('All') },
     ...[
@@ -264,6 +277,18 @@ export function TaskLogsFilterBar<TData>(props: TaskLogsFilterBarProps<TData>) {
       />
     </LogsFilterField>
   ) : null
+  const userFilter =
+    isAdmin && props.logCategory === 'task' ? (
+      <LogsFilterField>
+        <LogsFilterInput
+          aria-label={t('Username')}
+          placeholder={t('Username')}
+          value={username || ''}
+          onChange={(e) => handleChange('username', e.target.value)}
+          onKeyDown={handleKeyDown}
+        />
+      </LogsFilterField>
+    ) : null
 
   return (
     <LogsFilterToolbar
@@ -273,6 +298,7 @@ export function TaskLogsFilterBar<TData>(props: TaskLogsFilterBarProps<TData>) {
           {dateRangeFilter}
           {taskIdFilter}
           {modelAndStatusFilters}
+          {userFilter}
           {channelFilter}
         </>
       }
@@ -281,13 +307,18 @@ export function TaskLogsFilterBar<TData>(props: TaskLogsFilterBarProps<TData>) {
         <>
           {taskIdFilter}
           {modelAndStatusFilters}
+          {userFilter}
           {channelFilter}
         </>
       }
       mobileFilterCount={
-        [filterValue, filters.channel, filters.model, filters.status].filter(
-          Boolean
-        ).length
+        [
+          filterValue,
+          filters.channel,
+          filters.model,
+          filters.status,
+          username,
+        ].filter(Boolean).length
       }
       hasActiveFilters={hasAdditionalFilters}
       onSearch={handleApply}

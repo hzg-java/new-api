@@ -259,20 +259,19 @@ export function CommonLogsFilterBar<TData>(
     [handleApply]
   )
 
-  const hasExpandedFilters =
-    !!filters.token || !!filters.username || !!filters.channel
+  const hasExpandedFilters = !!filters.token || (isAdmin && !!filters.channel)
 
   const hasTypeFilter = logType !== LOG_TYPE_ALL_VALUE
   const hasAdditionalFilters =
     !!filters.model ||
     !!filters.requestId ||
     !!filters.group ||
+    (isAdmin && !!filters.username) ||
     hasTypeFilter ||
     hasExpandedFilters
 
   const expandedFilterCount = [
     filters.token,
-    isAdmin ? filters.username : undefined,
     isAdmin ? filters.channel : undefined,
   ].filter(Boolean).length
   const sensitiveInputClass = sensitiveVisible
@@ -439,6 +438,18 @@ export function CommonLogsFilterBar<TData>(
       </Select>
     </LogsFilterField>
   )
+  const usernameFilter = isAdmin ? (
+    <LogsFilterField>
+      <LogsFilterInput
+        aria-label={t('Username')}
+        placeholder={t('Username')}
+        className={sensitiveInputClass}
+        value={filters.username || ''}
+        onChange={(e) => handleChange('username', e.target.value)}
+        onKeyDown={handleKeyDown}
+      />
+    </LogsFilterField>
+  ) : null
   const advancedFilters = (
     <>
       <LogsFilterField>
@@ -450,17 +461,6 @@ export function CommonLogsFilterBar<TData>(
           onKeyDown={handleKeyDown}
         />
       </LogsFilterField>
-      {isAdmin && (
-        <LogsFilterField>
-          <LogsFilterInput
-            placeholder={t('Username')}
-            className={sensitiveInputClass}
-            value={filters.username || ''}
-            onChange={(e) => handleChange('username', e.target.value)}
-            onKeyDown={handleKeyDown}
-          />
-        </LogsFilterField>
-      )}
       {isAdmin && (
         <LogsFilterField>
           <LogsFilterInput
@@ -484,6 +484,7 @@ export function CommonLogsFilterBar<TData>(
         <>
           {dateRangeFilter}
           {modelFilter}
+          {usernameFilter}
           {requestIdFilter}
           {groupFilter}
           {typeFilter}
@@ -494,6 +495,7 @@ export function CommonLogsFilterBar<TData>(
       mobileFilters={
         <>
           {modelFilter}
+          {usernameFilter}
           {requestIdFilter}
           {groupFilter}
           {typeFilter}
@@ -501,9 +503,13 @@ export function CommonLogsFilterBar<TData>(
         </>
       }
       mobileFilterCount={
-        [filters.model, filters.requestId, filters.group, hasTypeFilter].filter(
-          Boolean
-        ).length + expandedFilterCount
+        [
+          filters.model,
+          isAdmin ? filters.username : undefined,
+          filters.requestId,
+          filters.group,
+          hasTypeFilter,
+        ].filter(Boolean).length + expandedFilterCount
       }
       hasAdvancedActiveFilters={hasExpandedFilters}
       advancedFilterCount={expandedFilterCount}

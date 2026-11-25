@@ -271,6 +271,9 @@ export async function fetchLogsByCategory(
           task_id: searchParams.filter as string | undefined,
           model_name: searchParams.model as string | undefined,
           status: searchParams.status as string | undefined,
+          ...(isAdmin && searchParams.username
+            ? { username: String(searchParams.username).trim() }
+            : {}),
         }
       : {}),
   }

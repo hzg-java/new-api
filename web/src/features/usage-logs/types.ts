@@ -70,6 +70,7 @@ export interface TaskLogFilters extends CommonFilters {
   taskId?: string
   model?: string
   status?: string
+  username?: string
 }
 
 /**
@@ -524,6 +525,7 @@ export interface GetTaskLogsParams {
   task_id?: string
   model_name?: string
   status?: string
+  username?: string
   start_timestamp?: number
   end_timestamp?: number
 }

@@ -248,6 +248,194 @@ it.each([true, false])(
   }
 )
 
+it.each([true, false])(
+  'applies an admin task username with other filters and clears it on reset (mobile=%s)',
+  async (mobile) => {
+    useAuthStore.getState().auth.setUser({ id: 1, username: 'admin', role: 10 })
+    const router = await renderMobileFilter(true, mobile)
+    const user = userEvent.setup()
+    if (mobile) await user.click(screen.getByRole('button', { name: 'Filter' }))
+    const input = screen.getByRole('textbox', { name: 'Username' })
+    await user.type(input, '  task-owner  ')
+    expect(router.state.location.search).not.toHaveProperty('username')
+    const scope = mobile
+      ? within(screen.getByRole('dialog', { name: 'Filter' }))
+      : screen
+    await user.click(scope.getByRole('button', { name: 'Search' }))
+    await waitFor(() =>
+      expect(router.state.location.search).toMatchObject({
+        page: 1,
+        filter: 'task-1',
+        model: 'client-model',
+        status: 'QUEUED',
+        username: 'task-owner',
+      })
+    )
+    await fetchLogsByCategory({
+      logCategory: 'task',
+      isAdmin: true,
+      page: 1,
+      pageSize: 20,
+      searchParams: router.state.location.search,
+      columnFilters: [],
+    })
+    const url = new URL(
+      String(vi.mocked(api.get).mock.calls.at(-1)?.[0]),
+      'http://localhost'
+    )
+    expect(url.pathname).toBe('/api/task')
+    expect(url.searchParams.get('username')).toBe('task-owner')
+    expect(url.searchParams.get('model_name')).toBe('client-model')
+    expect(url.searchParams.get('status')).toBe('QUEUED')
+    if (mobile) await user.click(screen.getByRole('button', { name: 'Filter' }))
+    expect(screen.getByRole('textbox', { name: 'Username' })).toHaveValue(
+      'task-owner'
+    )
+    await user.click(screen.getByRole('button', { name: 'Reset' }))
+    await waitFor(() =>
+      expect(router.state.location.search.username).toBeFalsy()
+    )
+  }
+)
+
+it.each([true, false])(
+  'applies an admin common username to logs and statistics and clears it on reset (mobile=%s)',
+  async (mobile) => {
+    useAuthStore.getState().auth.setUser({ id: 1, username: 'admin', role: 10 })
+    const router = await renderMobileFilter(false, mobile)
+    const user = userEvent.setup()
+    if (mobile) await user.click(screen.getByRole('button', { name: 'Filter' }))
+    const input = screen.getByRole('textbox', { name: 'Username' })
+    await user.type(input, '  log-owner  ')
+    expect(router.state.location.search.username).toBeFalsy()
+    if (mobile) {
+      await user.click(
+        within(screen.getByRole('dialog', { name: 'Filter' })).getByRole(
+          'button',
+          { name: 'Search' }
+        )
+      )
+    } else {
+      await user.keyboard('{Enter}')
+    }
+    await waitFor(() =>
+      expect(router.state.location.search).toMatchObject({
+        page: 1,
+        username: 'log-owner',
+        group: 'default',
+        type: ['2'],
+        requestId: 'old',
+      })
+    )
+    const config = {
+      logCategory: 'common' as const,
+      isAdmin: true,
+      page: 1,
+      pageSize: 20,
+      searchParams: router.state.location.search,
+      columnFilters: [],
+    }
+    await fetchLogsByCategory(config)
+    const url = new URL(
+      String(vi.mocked(api.get).mock.calls.at(-1)?.[0]),
+      'http://localhost'
+    )
+    expect(url.pathname).toBe('/api/log')
+    expect(url.searchParams.get('username')).toBe('log-owner')
+    expect(url.searchParams.get('request_id')).toBe('old')
+    await waitFor(() => {
+      const calls = vi
+        .mocked(api.get)
+        .mock.calls.filter(([path]) => path.startsWith('/api/log/stat?'))
+      const query = new URL(String(calls.at(-1)?.[0]), 'http://localhost')
+        .searchParams
+      expect(query.get('username')).toBe('log-owner')
+      expect(query.get('group')).toBe('default')
+      expect(query.get('type')).toBe('2')
+    })
+    if (mobile) await user.click(screen.getByRole('button', { name: 'Filter' }))
+    expect(screen.getByRole('textbox', { name: 'Username' })).toHaveValue(
+      'log-owner'
+    )
+    await user.click(screen.getByRole('button', { name: 'Reset' }))
+    await waitFor(() =>
+      expect(router.state.location.search.username).toBeFalsy()
+    )
+    await fetchLogsByCategory({
+      ...config,
+      searchParams: router.state.location.search,
+    })
+    expect(vi.mocked(api.get).mock.calls.at(-1)?.[0]).not.toContain('username=')
+    await waitFor(() => {
+      const calls = vi
+        .mocked(api.get)
+        .mock.calls.filter(([path]) => path.startsWith('/api/log/stat?'))
+      expect(calls.at(-1)?.[0]).not.toContain('username=')
+    })
+  }
+)
+
+it('hides the common username filter for personal logs and omits it from self requests', async () => {
+  useAuthStore.getState().auth.setUser({ id: 2, username: 'user', role: 1 })
+  await renderMobileFilter(false, false)
+  await userEvent.click(screen.getByRole('button', { name: 'Expand' }))
+  expect(
+    screen.queryByRole('textbox', { name: 'Username' })
+  ).not.toBeInTheDocument()
+  await fetchLogsByCategory({
+    logCategory: 'common',
+    isAdmin: false,
+    page: 1,
+    pageSize: 20,
+    searchParams: { username: 'another-user' },
+    columnFilters: [{ id: 'username', value: 'another-user' }],
+  })
+  const url = new URL(
+    String(vi.mocked(api.get).mock.calls.at(-1)?.[0]),
+    'http://localhost'
+  )
+  expect(url.pathname).toBe('/api/log/self')
+  expect(url.searchParams.has('username')).toBe(false)
+  expect(
+    buildApiParams({
+      page: 1,
+      pageSize: 20,
+      isAdmin: false,
+      searchParams: { username: 'another-user' },
+    })
+  ).not.toHaveProperty('username')
+})
+
+it.each(['', '   ', undefined])(
+  'omits an empty common username (%j)',
+  (username) => {
+    expect(buildSearchParams({ username }, 'common')).not.toHaveProperty(
+      'username'
+    )
+  }
+)
+
+it('hides the task username filter for personal logs and omits it from self requests', async () => {
+  await renderMobileFilter(true, false)
+  expect(
+    screen.queryByRole('textbox', { name: 'Username' })
+  ).not.toBeInTheDocument()
+  await fetchLogsByCategory({
+    logCategory: 'task',
+    isAdmin: false,
+    page: 1,
+    pageSize: 20,
+    searchParams: { username: 'another-user' },
+    columnFilters: [],
+  })
+  const url = new URL(
+    String(vi.mocked(api.get).mock.calls.at(-1)?.[0]),
+    'http://localhost'
+  )
+  expect(url.pathname).toBe('/api/task/self')
+  expect(url.searchParams.has('username')).toBe(false)
+})
+
 it.each([
   { mobile: true, admin: false },
   { mobile: true, admin: true },

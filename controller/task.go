@@ -501,6 +501,18 @@ func GetAllTask(c *gin.Context) {
 	startTimestamp, _ := strconv.ParseInt(c.Query("start_timestamp"), 10, 64)
 	endTimestamp, _ := strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
 	queryParams := model.SyncTaskQueryParams{Platform: constant.TaskPlatform(c.Query("platform")), TaskID: c.Query("task_id"), ModelName: c.Query("model_name"), Status: c.Query("status"), Action: c.Query("action"), StartTimestamp: startTimestamp, EndTimestamp: endTimestamp, ChannelID: c.Query("channel_id")}
+	if username := strings.TrimSpace(c.Query("username")); username != "" {
+		if err := model.DB.Model(&model.User{}).Where("username = ?", username).Pluck("id", &queryParams.UserIDs).Error; err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		if len(queryParams.UserIDs) == 0 {
+			pageInfo.SetTotal(0)
+			pageInfo.SetItems([]*dto.TaskDto{})
+			common.ApiSuccess(c, pageInfo)
+			return
+		}
+	}
 	items := model.TaskGetAllTasks(pageInfo.GetStartIdx(), pageInfo.GetPageSize(), queryParams)
 	pageInfo.SetTotal(int(model.TaskCountAllTasks(queryParams)))
 	pageInfo.SetItems(tasksToDto(items, true, c.GetInt("role")))

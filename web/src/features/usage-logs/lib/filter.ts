@@ -49,13 +49,14 @@ export function buildSearchParams(
     case 'common': {
       const commonFilters = filters as CommonLogFilters
       const requestId = commonFilters.requestId?.trim()
+      const username = commonFilters.username?.trim()
       return {
         ...baseParams,
         ...(commonFilters.model && { model: commonFilters.model }),
         ...(requestId && { requestId }),
         ...(commonFilters.token && { token: commonFilters.token }),
         ...(commonFilters.group && { group: commonFilters.group }),
-        ...(commonFilters.username && { username: commonFilters.username }),
+        ...(username && { username }),
       }
     }
     case 'drawing': {
@@ -67,11 +68,13 @@ export function buildSearchParams(
     }
     case 'task': {
       const taskFilters = filters as TaskLogFilters
+      const username = taskFilters.username?.trim()
       return {
         ...baseParams,
         ...(taskFilters.taskId && { filter: taskFilters.taskId }),
         ...(taskFilters.model && { model: taskFilters.model }),
         ...(taskFilters.status && { status: taskFilters.status }),
+        ...(username && { username }),
       }
     }
     default:
