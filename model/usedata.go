@@ -139,51 +139,6 @@ func increaseQuotaData(quotaData *QuotaData) {
 	}
 }
 
-func GetDashboardUsageSource(startTime, endTime int64, username string, userID int) ([]*QuotaData, []*QuotaData, []*Log, error) {
-	const dimensions = "user_id, username, model_name, created_at, use_group, token_id, channel_id"
-	query := DB.Table("quota_data").Where("created_at >= ? AND created_at <= ?", startTime, endTime)
-	if userID != 0 {
-		query = query.Where("user_id = ?", userID)
-	} else if username != "" {
-		query = query.Where("username = ?", username)
-	}
-	var persisted []*QuotaData
-	err := query.Select(dimensions + ", node_name, sum(count) AS count, sum(quota) AS quota, sum(token_used) AS token_used").Group(dimensions + ", node_name").Find(&persisted).Error
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	groupColumn := (&gorm.Statement{DB: LOG_DB}).Quote("group")
-	bucket := "(created_at / 3600) * 3600"
-	if common.UsingLogDatabase(common.DatabaseTypeMySQL) {
-		bucket = "FLOOR(created_at / 3600) * 3600"
-	} else if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
-		bucket = "intDiv(created_at, 3600) * 3600"
-	}
-	startHour := startTime
-	if remainder := startHour % 3600; remainder != 0 {
-		startHour += 3600 - remainder
-	}
-	logsQuery := LOG_DB.Model(&Log{}).Where("created_at >= ? AND created_at < ?", startHour, endTime-endTime%3600+3600)
-	if userID != 0 {
-		logsQuery = logsQuery.Where("user_id = ?", userID)
-	} else if username != "" {
-		logsQuery = logsQuery.Where("username = ?", username)
-	}
-	var ordinary []*QuotaData
-	ordinaryDimensions := "user_id, username, model_name, token_id, channel_id, " + groupColumn
-	err = logsQuery.Session(&gorm.Session{}).
-		Where("type = ? AND COALESCE(other, '') NOT LIKE ?", LogTypeConsume, `%"task_id"%`).
-		Select(ordinaryDimensions + " AS use_group, " + bucket + " AS created_at, count(*) AS count, sum(quota) AS quota, sum(prompt_tokens) + sum(completion_tokens) AS token_used").
-		Group(ordinaryDimensions + ", " + bucket).Find(&ordinary).Error
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	var tasks []*Log
-	err = logsQuery.Session(&gorm.Session{}).Where("type IN ? AND other LIKE ?", []int{LogTypeConsume, LogTypeRefund}, `%"task_id"%`).
-		Select("id", "user_id", "username", "model_name", "created_at", "token_id", "channel_id", "group", "type", "other", "quota", "prompt_tokens", "completion_tokens").Find(&tasks).Error
-	return persisted, ordinary, tasks, err
-}
-
 func GetQuotaDataByUsername(username string, startTime int64, endTime int64) (quotaData []*QuotaData, err error) {
 	var quotaDatas []*QuotaData
 	// 从quota_data表中查询数据

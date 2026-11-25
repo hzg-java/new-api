@@ -17,17 +17,25 @@ import (
 )
 
 func TestLogStatsTotalTokensFollowFilters(t *testing.T) {
-	setupManageUserTestDB(t)
+	if os.Getenv("MATERIAL_TEST_POSTGRES") == "1" {
+		db := setupMaterialConcurrentPostgres(t)
+		previousLogDB := model.LOG_DB
+		model.LOG_DB = db
+		t.Cleanup(func() { model.LOG_DB = previousLogDB })
+		require.NoError(t, db.AutoMigrate(&model.Log{}))
+	} else {
+		setupManageUserTestDB(t)
+	}
 	now := time.Now().Unix()
 	logs := []model.Log{
-		{Type: model.LogTypeConsume, CreatedAt: now - 3600, Username: "owner", ModelName: "model-a", TokenName: "key-a", ChannelId: 2, Group: "default", RequestId: "request-old", PromptTokens: 100, CompletionTokens: 50, Quota: 10},
-		{Type: model.LogTypeConsume, CreatedAt: now - 10, Username: "owner", ModelName: "model-a", TokenName: "key-a", ChannelId: 2, Group: "default", RequestId: "request-recent", PromptTokens: 20, CompletionTokens: 30, Quota: 5},
-		{Type: model.LogTypeConsume, CreatedAt: now - 7200, Username: "owner", ModelName: "model-a", TokenName: "key-a", ChannelId: 2, Group: "default", PromptTokens: 900, Quota: 90},
-		{Type: model.LogTypeConsume, CreatedAt: now - 10, Username: "another", ModelName: "model-a", TokenName: "key-a", ChannelId: 2, Group: "default", PromptTokens: 800, Quota: 80},
-		{Type: model.LogTypeTopup, CreatedAt: now - 10, Username: "owner", ModelName: "model-a", TokenName: "key-a", ChannelId: 2, Group: "default", PromptTokens: 700, Quota: 70},
-		{Type: model.LogTypeConsume, CreatedAt: now - 10, Username: "owner", ModelName: "model-b", TokenName: "key-a", ChannelId: 2, Group: "default", PromptTokens: 600, Quota: 60},
-		{Type: model.LogTypeConsume, CreatedAt: now - 10, Username: "owner", ModelName: "model-a", TokenName: "key-b", ChannelId: 2, Group: "default", PromptTokens: 500, Quota: 50},
-		{Type: model.LogTypeConsume, CreatedAt: now - 10, Username: "owner", ModelName: "model-a", TokenName: "key-a", ChannelId: 3, Group: "default", PromptTokens: 400, Quota: 40},
+		{UserId: 7, Type: model.LogTypeConsume, CreatedAt: now - 3600, Username: "owner", ModelName: "model-a", TokenName: "key-a", ChannelId: 2, Group: "default", RequestId: "request-old", PromptTokens: 100, CompletionTokens: 50, Quota: 10},
+		{UserId: 7, Type: model.LogTypeConsume, CreatedAt: now - 10, Username: "owner", ModelName: "model-a", TokenName: "key-a", ChannelId: 2, Group: "default", RequestId: "request-recent", PromptTokens: 20, CompletionTokens: 30, Quota: 5},
+		{UserId: 7, Type: model.LogTypeConsume, CreatedAt: now - 7200, Username: "owner", ModelName: "model-a", TokenName: "key-a", ChannelId: 2, Group: "default", PromptTokens: 900, Quota: 90},
+		{UserId: 8, Type: model.LogTypeConsume, CreatedAt: now - 10, Username: "another", ModelName: "model-a", TokenName: "key-a", ChannelId: 2, Group: "default", PromptTokens: 800, Quota: 80},
+		{UserId: 7, Type: model.LogTypeTopup, CreatedAt: now - 10, Username: "owner", ModelName: "model-a", TokenName: "key-a", ChannelId: 2, Group: "default", PromptTokens: 700, Quota: 70},
+		{UserId: 7, Type: model.LogTypeConsume, CreatedAt: now - 10, Username: "owner", ModelName: "model-b", TokenName: "key-a", ChannelId: 2, Group: "default", PromptTokens: 600, Quota: 60},
+		{UserId: 7, Type: model.LogTypeConsume, CreatedAt: now - 10, Username: "owner", ModelName: "model-a", TokenName: "key-b", ChannelId: 2, Group: "default", PromptTokens: 500, Quota: 50},
+		{UserId: 7, Type: model.LogTypeConsume, CreatedAt: now - 10, Username: "owner", ModelName: "model-a", TokenName: "key-a", ChannelId: 3, Group: "default", PromptTokens: 400, Quota: 40},
 	}
 	require.NoError(t, model.LOG_DB.Create(&logs).Error)
 	for _, self := range []bool{false, true} {
@@ -50,7 +58,7 @@ func TestLogStatsTotalTokensFollowFilters(t *testing.T) {
 				recorder := httptest.NewRecorder()
 				c, _ := gin.CreateTestContext(recorder)
 				c.Request = httptest.NewRequest("GET", "/?start_timestamp="+strconv.FormatInt(now-4000, 10)+"&end_timestamp="+strconv.FormatInt(now+1, 10)+"&username=owner&model_name="+tc.model+"&token_name=key-a&channel=2&p=2&page_size=1"+tc.query, nil)
-				c.Set("username", "owner")
+				c.Set("id", 7)
 				if self {
 					GetLogsSelfStat(c)
 				} else {
@@ -314,8 +322,12 @@ func TestLogStatsIncludeActualVideoTokensOnce(t *testing.T) {
 				recorder := httptest.NewRecorder()
 				c, _ := gin.CreateTestContext(recorder)
 				c.Request = httptest.NewRequest("GET", "/?"+query.Encode(), nil)
-				c.Set("username", query.Get("username"))
 				if self {
+					userID := 7
+					if tc.name == "other-owner" {
+						userID = 8
+					}
+					c.Set("id", userID)
 					GetLogsSelfStat(c)
 				} else {
 					GetLogsStat(c)
@@ -330,7 +342,7 @@ func TestLogStatsIncludeActualVideoTokensOnce(t *testing.T) {
 			})
 		}
 	}
-	stat, err := getLogStatistics(model.LogTypeUnknown, now-4000, now+1, "", "", "", 0, "", "")
+	stat, err := getLogStatistics(model.UsageLogFilter{Start: now - 4000, End: now + 1})
 	require.NoError(t, err)
 	assert.EqualValues(t, 710, stat.TotalTokens)
 	var afterLogs []model.Log
@@ -339,4 +351,92 @@ func TestLogStatsIncludeActualVideoTokensOnce(t *testing.T) {
 	require.NoError(t, model.DB.Order("id").Find(&afterTasks).Error)
 	assert.Equal(t, beforeLogs, afterLogs)
 	assert.Equal(t, beforeTasks, afterTasks)
+}
+
+func TestDashboardTimeRangeMatchesUsageLogSummary(t *testing.T) {
+	db := setupMaterialConcurrentPostgres(t)
+	previousLogDB := model.LOG_DB
+	previousLogType := common.LogDatabaseType()
+	model.LOG_DB = db
+	common.SetDatabaseTypes(common.DatabaseTypePostgreSQL, common.DatabaseTypePostgreSQL)
+	t.Cleanup(func() {
+		model.LOG_DB = previousLogDB
+		common.SetDatabaseTypes(common.DatabaseTypePostgreSQL, previousLogType)
+	})
+	require.NoError(t, db.AutoMigrate(&model.Task{}, &model.Log{}, &model.QuotaData{}))
+	const hour int64 = 1795536000
+	quota := 60
+	require.NoError(t, db.Create(&model.Task{TaskID: "video", UserId: 7, Action: constant.TaskActionTextToVideo, Status: model.TaskStatusSuccess, Quota: quota, Data: []byte(`{"usage":{"total_tokens":120}}`), PrivateData: model.TaskPrivateData{SettledQuota: &quota}}).Error)
+	logs := []model.Log{
+		{UserId: 7, Username: "owner", Type: model.LogTypeConsume, CreatedAt: hour - 1, ModelName: "video", Quota: 100, Other: `{"task_id":"video"}`},
+		{UserId: 7, Username: "owner", Type: model.LogTypeConsume, CreatedAt: hour + 9, ModelName: "text", Quota: 80},
+		{UserId: 7, Username: "owner", Type: model.LogTypeConsume, CreatedAt: hour + 10, ModelName: "text", Quota: 25, PromptTokens: 10},
+		{UserId: 7, Username: "owner", Type: model.LogTypeRefund, CreatedAt: hour + 15, ModelName: "video", Quota: 40, Other: `{"task_id":"video","actual_quota":60}`},
+		{UserId: 7, Username: "owner", Type: model.LogTypeConsume, CreatedAt: hour + 20, ModelName: "image", Quota: 5, CompletionTokens: 2, Other: `{"task_id":"image"}`},
+		{UserId: 7, Username: "owner", Type: model.LogTypeConsume, CreatedAt: hour + 21, ModelName: "text", Quota: 90},
+		{UserId: 8, Username: "another", Type: model.LogTypeConsume, CreatedAt: hour + 20, ModelName: "text", Quota: 70, CompletionTokens: 3},
+	}
+	require.NoError(t, db.Create(&logs).Error)
+	legacy := model.QuotaData{UserID: 7, Username: "owner", ModelName: "legacy", CreatedAt: hour, Count: 1, Quota: 99, TokenUsed: 90}
+	require.NoError(t, db.Create(&legacy).Error)
+	for _, tc := range []struct {
+		name                 string
+		start, end           int64
+		username             string
+		self                 bool
+		quota, tokens, count int
+	}{
+		{"partial hour, all users", hour + 10, hour + 20, "", false, 160, 135, 4},
+		{"partial hour, filtered user", hour + 10, hour + 20, "owner", false, 90, 132, 3},
+		{"partial hour, own user", hour + 10, hour + 20, "", true, 90, 132, 3},
+		{"whole range, video counted once", hour - 1, hour + 21, "owner", false, 260, 132, 5},
+		{"no matching logs", hour + 22, hour + 30, "owner", false, 0, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			query := url.Values{"start_timestamp": {strconv.FormatInt(tc.start, 10)}, "end_timestamp": {strconv.FormatInt(tc.end, 10)}}
+			if tc.username != "" {
+				query.Set("username", tc.username)
+			}
+			call := func(handler gin.HandlerFunc, into any) {
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				c.Set("id", 7)
+				c.Set("username", "owner")
+				c.Request = httptest.NewRequest("GET", "/?"+query.Encode(), nil)
+				handler(c)
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), into))
+			}
+			statHandler, dashboardHandler := GetLogsStat, GetAllQuotaDates
+			if tc.self {
+				query.Set("username", "another")
+				statHandler, dashboardHandler = GetLogsSelfStat, GetUserQuotaDates
+			}
+			var logsResponse struct {
+				Success bool       `json:"success"`
+				Data    model.Stat `json:"data"`
+			}
+			call(statHandler, &logsResponse)
+			require.True(t, logsResponse.Success)
+			assert.Equal(t, tc.quota, logsResponse.Data.Quota)
+			assert.EqualValues(t, tc.tokens, logsResponse.Data.TotalTokens)
+			var dashboard struct {
+				Success bool              `json:"success"`
+				Data    []model.QuotaData `json:"data"`
+			}
+			call(dashboardHandler, &dashboard)
+			require.True(t, dashboard.Success)
+			var gotQuota, gotTokens, gotCount int
+			for _, row := range dashboard.Data {
+				gotQuota += row.Quota
+				gotTokens += row.TokenUsed
+				gotCount += row.Count
+			}
+			assert.Equal(t, logsResponse.Data.Quota, gotQuota)
+			assert.EqualValues(t, logsResponse.Data.TotalTokens, gotTokens)
+			assert.Equal(t, tc.count, gotCount)
+		})
+	}
+	var after model.QuotaData
+	require.NoError(t, db.First(&after, legacy.Id).Error)
+	assert.Equal(t, legacy, after)
 }

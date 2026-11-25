@@ -345,85 +345,76 @@ func GetLogByKey(c *gin.Context) {
 	})
 }
 
-func getLogStatistics(logType int, startTimestamp, endTimestamp int64, modelName, username, tokenName string, channel int, group, requestId string) (model.Stat, error) {
-	stat, logs, err := model.SumUsedQuota(logType, startTimestamp, endTimestamp, modelName, username, tokenName, channel, group, requestId)
+func getUsageRows(filter model.UsageLogFilter, byHour bool) ([]*model.UsageLogRow, error) {
+	rows, err := model.GetUsageLogRows(filter, byHour)
 	if err != nil {
-		return stat, err
+		return nil, err
 	}
-	logs, err = projectVideoTaskLogs(logs, true)
+	var tasks []*model.Log
+	usage := make([]*model.UsageLogRow, 0, len(rows))
+	for _, row := range rows {
+		if row.Other == "" {
+			usage = append(usage, row)
+		} else {
+			tasks = append(tasks, &row.Log)
+		}
+	}
+	tasks, err = projectVideoTaskLogs(tasks, true)
 	if err != nil {
-		return stat, err
+		return nil, err
 	}
-	for _, log := range logs {
-		if log.Type != model.LogTypeConsume {
+	for _, task := range tasks {
+		if task.Type != model.LogTypeConsume {
 			continue
 		}
-		stat.TotalTokens += int64(log.PromptTokens) + int64(log.CompletionTokens)
 		var other struct {
 			Pending bool `json:"task_billing_pending"`
 		}
-		if common.UnmarshalJsonStr(log.Other, &other) == nil && other.Pending {
-			continue
+		if common.UnmarshalJsonStr(task.Other, &other) == nil && other.Pending {
+			task.Quota = 0
 		}
-		stat.Quota += log.Quota
+		usage = append(usage, &model.UsageLogRow{Log: *task, Count: 1})
+	}
+	return usage, nil
+}
+
+func getLogStatistics(filter model.UsageLogFilter) (model.Stat, error) {
+	rows, err := getUsageRows(filter, false)
+	if err != nil {
+		return model.Stat{}, err
+	}
+	stat, err := model.GetUsageLogRates(filter)
+	if err != nil {
+		return model.Stat{}, err
+	}
+	for _, row := range rows {
+		stat.Quota += row.Quota
+		stat.TotalTokens += int64(row.PromptTokens) + int64(row.CompletionTokens)
 	}
 	return stat, nil
 }
 
-func GetLogsStat(c *gin.Context) {
-	logType, _ := strconv.Atoi(c.Query("type"))
-	startTimestamp, _ := strconv.ParseInt(c.Query("start_timestamp"), 10, 64)
-	endTimestamp, _ := strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
-	tokenName := c.Query("token_name")
-	username := c.Query("username")
-	modelName := c.Query("model_name")
-	channel, _ := strconv.Atoi(c.Query("channel"))
-	group := c.Query("group")
-	requestId := c.Query("request_id")
-	stat, err := getLogStatistics(logType, startTimestamp, endTimestamp, modelName, username, tokenName, channel, group, requestId)
+func writeLogStatistics(c *gin.Context, filter model.UsageLogFilter) {
+	filter.Type, _ = strconv.Atoi(c.Query("type"))
+	filter.Start, _ = strconv.ParseInt(c.Query("start_timestamp"), 10, 64)
+	filter.End, _ = strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
+	filter.ChannelID, _ = strconv.Atoi(c.Query("channel"))
+	filter.Model = c.Query("model_name")
+	filter.TokenName = c.Query("token_name")
+	filter.Group = c.Query("group")
+	filter.RequestID = c.Query("request_id")
+	stat, err := getLogStatistics(filter)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	//tokenNum := model.SumUsedToken(logType, startTimestamp, endTimestamp, modelName, username, "")
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
-		"data": gin.H{
-			"quota":        stat.Quota,
-			"rpm":          stat.Rpm,
-			"tpm":          stat.Tpm,
-			"total_tokens": stat.TotalTokens,
-		},
-	})
-	return
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": stat})
+}
+
+func GetLogsStat(c *gin.Context) {
+	writeLogStatistics(c, model.UsageLogFilter{Username: c.Query("username")})
 }
 
 func GetLogsSelfStat(c *gin.Context) {
-	username := c.GetString("username")
-	logType, _ := strconv.Atoi(c.Query("type"))
-	startTimestamp, _ := strconv.ParseInt(c.Query("start_timestamp"), 10, 64)
-	endTimestamp, _ := strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
-	tokenName := c.Query("token_name")
-	modelName := c.Query("model_name")
-	channel, _ := strconv.Atoi(c.Query("channel"))
-	group := c.Query("group")
-	requestId := c.Query("request_id")
-	quotaNum, err := getLogStatistics(logType, startTimestamp, endTimestamp, modelName, username, tokenName, channel, group, requestId)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	//tokenNum := model.SumUsedToken(logType, startTimestamp, endTimestamp, modelName, username, tokenName)
-	c.JSON(200, gin.H{
-		"success": true,
-		"message": "",
-		"data": gin.H{
-			"quota":        quotaNum.Quota,
-			"rpm":          quotaNum.Rpm,
-			"tpm":          quotaNum.Tpm,
-			"total_tokens": quotaNum.TotalTokens,
-		},
-	})
-	return
+	writeLogStatistics(c, model.UsageLogFilter{UserID: c.GetInt("id")})
 }
