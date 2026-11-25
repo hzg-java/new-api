@@ -5724,6 +5724,7 @@
     "socks5://user:pass@host:port": "socks5://user:pass@host:port",
     "Soft Errors": "软错误",
     "Some channels failed: {{errorMsg}}": "部分渠道失败：{{errorMsg}}",
+    "Some historical usage could not be verified and is shown without correction.": "部分历史用量无法核实，已按原始数据展示，未作修正。",
     "Some matching models are hidden or have no available channel.": "部分匹配模型已隐藏或暂无可用渠道。",
     "Some plugin information could not be read": "部分插件信息无法读取",
     "Something went wrong!": "出现错误！",

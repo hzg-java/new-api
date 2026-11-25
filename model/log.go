@@ -78,6 +78,7 @@ type Log struct {
 	RequestId         string `json:"request_id,omitempty" gorm:"type:varchar(64);index:idx_logs_request_id;default:''"`
 	UpstreamRequestId string `json:"upstream_request_id,omitempty" gorm:"type:varchar(128);index:idx_logs_upstream_request_id;default:''"`
 	Other             string `json:"other"`
+	VideoTask         bool   `json:"-" gorm:"-"`
 }
 
 // don't use iota, avoid change log type value
@@ -674,6 +675,66 @@ func GetTaskSettlementLogs(tasks []Task) (logs []*Log, err error) {
 		logs = append(logs, batch...)
 	}
 	return logs, nil
+}
+
+func GetDashboardTaskHistory(logs []*Log) ([]*Log, error) {
+	type owner struct {
+		id     string
+		userID int
+	}
+	seen := make(map[owner]bool)
+	owners := make([]owner, 0)
+	for _, log := range logs {
+		var other struct {
+			TaskID string `json:"task_id"`
+		}
+		if common.UnmarshalJsonStr(log.Other, &other) != nil || other.TaskID == "" {
+			continue
+		}
+		key := owner{other.TaskID, log.UserId}
+		if !seen[key] {
+			seen[key] = true
+			owners = append(owners, key)
+		}
+	}
+	var history []*Log
+	for start := 0; start < len(owners); start += 100 {
+		conditions := make([]string, 0)
+		args := make([]any, 0)
+		batchOwners := make(map[owner]bool)
+		for _, key := range owners[start:min(start+100, len(owners))] {
+			batchOwners[key] = true
+			encoded, err := common.Marshal(key.id)
+			if err != nil {
+				return nil, err
+			}
+			pattern := string(encoded)
+			condition := "(user_id = ? AND other LIKE ? ESCAPE '!')"
+			if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+				pattern = strings.NewReplacer(`\`, `\\`, "%", `\%`, "_", `\_`).Replace(pattern)
+				condition = "(user_id = ? AND other LIKE ?)"
+			} else {
+				pattern = strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(pattern)
+			}
+			conditions = append(conditions, condition)
+			args = append(args, key.userID, "%"+pattern+"%")
+		}
+		var batch []*Log
+		err := LOG_DB.Model(&Log{}).Select("id", "user_id", "username", "model_name", "created_at", "token_id", "channel_id", "group", "type", "other", "quota", "prompt_tokens", "completion_tokens").
+			Where("type IN ?", []int{LogTypeConsume, LogTypeRefund}).Where("("+strings.Join(conditions, " OR ")+")", args...).Find(&batch).Error
+		if err != nil {
+			return nil, err
+		}
+		for _, log := range batch {
+			var other struct {
+				TaskID string `json:"task_id"`
+			}
+			if common.UnmarshalJsonStr(log.Other, &other) == nil && batchOwners[owner{other.TaskID, log.UserId}] {
+				history = append(history, log)
+			}
+		}
+	}
+	return history, nil
 }
 
 type Stat struct {

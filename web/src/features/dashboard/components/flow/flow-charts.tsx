@@ -61,6 +61,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { getFlowQuotaDates } from '@/features/dashboard/api'
+import { UsageHistoryWarning } from '@/features/dashboard/components/ui/usage-history-warning'
 import {
   buildDashboardFlowData,
   buildFlowSankeySpec,
@@ -662,6 +663,13 @@ export function FlowCharts(props: FlowChartsProps) {
         </div>
       </div>
 
+      <UsageHistoryWarning
+        unreconciled={
+          !isLoading &&
+          !isError &&
+          flowRows?.some((row) => row.unreconciled === true) === true
+        }
+      />
       <div className='overflow-hidden rounded-lg border'>
         <div className='flex w-full flex-col gap-2 border-b px-3 py-2 sm:px-5 sm:py-3 lg:flex-row lg:items-center lg:justify-between'>
           <div className='flex min-w-0 items-center gap-2'>

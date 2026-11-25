@@ -36,6 +36,7 @@ import {
   vi,
 } from 'vitest'
 
+import type { QuotaDataItem } from '@/features/dashboard/types'
 import { api } from '@/lib/api'
 import { ROLE } from '@/lib/roles'
 import { STATUS_QUERY_KEY } from '@/lib/status-query'
@@ -51,6 +52,7 @@ const originalGetAnimations = Object.getOwnPropertyDescriptor(
 )
 let client: QueryClient
 let keyLookupError: Error | null
+let quotaRows: QuotaDataItem[]
 
 beforeAll(() => {
   Object.defineProperty(HTMLElement.prototype, 'getAnimations', {
@@ -86,6 +88,7 @@ beforeEach(() => {
     defaultOptions: { queries: { retry: false } },
   })
   keyLookupError = null
+  quotaRows = []
   vi.spyOn(api, 'get').mockImplementation(async (url) => {
     switch (url) {
       case '/api/token/?p=1&size=10':
@@ -112,7 +115,7 @@ beforeEach(() => {
       case '/api/user/models':
         return { data: { success: true, data: ['gpt-4o-mini'] } }
       case '/api/data/self':
-        return { data: { success: true, data: [] } }
+        return { data: { success: true, data: quotaRows } }
       case '/api/perf-metrics/summary':
         return { data: { success: true, data: { models: [] } } }
       default:
@@ -141,6 +144,36 @@ async function renderOverview() {
     </QueryClientProvider>
   )
 }
+
+describe('overview usage history warning', () => {
+  it('shows one warning beside retained historical usage in the active overview', async () => {
+    quotaRows = [
+      { created_at: 1794268800, quota: 500000 },
+      { created_at: 1794268800, quota: 1000000, unreconciled: true },
+    ]
+    await renderOverview()
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Some historical usage could not be verified and is shown without correction.'
+    )
+    expect(screen.getAllByRole('alert')).toHaveLength(1)
+    expect(screen.getAllByText('$3').length).toBeGreaterThan(0)
+  })
+
+  it.each([
+    ['absent', [{ created_at: 1794268800, quota: 500000 }]],
+    ['false', [{ created_at: 1794268800, quota: 500000, unreconciled: false }]],
+  ])(
+    'hides the overview warning when the row flag is %s',
+    async (_label, rows) => {
+      quotaRows = rows
+      await renderOverview()
+
+      expect((await screen.findAllByText('$1')).length).toBeGreaterThan(0)
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    }
+  )
+})
 
 describe('overview content visibility', () => {
   it.each([ROLE.USER, ROLE.ADMIN])(

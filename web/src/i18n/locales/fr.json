@@ -5724,6 +5724,7 @@
     "socks5://user:pass@host:port": "socks5://user:pass@host:port",
     "Soft Errors": "Erreurs douces",
     "Some channels failed: {{errorMsg}}": "Certains canaux ont échoué : {{errorMsg}}",
+    "Some historical usage could not be verified and is shown without correction.": "Certaines données d’utilisation historiques n’ont pas pu être vérifiées et sont affichées sans correction.",
     "Some matching models are hidden or have no available channel.": "Certains modèles correspondants sont masqués ou n’ont aucun canal disponible.",
     "Some plugin information could not be read": "Certaines informations du plugin sont illisibles",
     "Something went wrong!": "Quelque chose s'est mal passé !",

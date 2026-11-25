@@ -27,6 +27,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useTheme } from '@/context/theme-provider'
 import { getUserQuotaDataByUsers } from '@/features/dashboard/api'
+import { UsageHistoryWarning } from '@/features/dashboard/components/ui/usage-history-warning'
 import {
   TIME_GRANULARITY_OPTIONS,
   TIME_RANGE_PRESETS,
@@ -222,6 +223,12 @@ export function UserCharts(props: UserChartsProps) {
         )}
       </div>
 
+      <UsageHistoryWarning
+        unreconciled={
+          !isLoading &&
+          userData?.some((row) => row.unreconciled === true) === true
+        }
+      />
       <div className='grid gap-3'>
         {USER_CHARTS.map((chart) => {
           const spec = chartData[chart.specKey]

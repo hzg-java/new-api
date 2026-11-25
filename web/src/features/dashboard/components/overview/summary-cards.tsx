@@ -25,6 +25,7 @@ import { useTranslation } from 'react-i18next'
 import { StaggerContainer, StaggerItem } from '@/components/page-transition'
 import { Button } from '@/components/ui/button'
 import { getUserQuotaDates } from '@/features/dashboard/api'
+import { UsageHistoryWarning } from '@/features/dashboard/components/ui/usage-history-warning'
 import { useSummaryCardsConfig } from '@/features/dashboard/hooks/use-dashboard-config'
 import type { QuotaDataItem } from '@/features/dashboard/types'
 import { useStatus } from '@/hooks/use-status'
@@ -286,6 +287,13 @@ export function SummaryCards() {
               </StaggerItem>
             ))}
           </StaggerContainer>
+          <UsageHistoryWarning
+            unreconciled={
+              usageTrendQuery.data?.data.some(
+                (row) => row.unreconciled === true
+              ) === true
+            }
+          />
         </div>
 
         <div className='flex flex-col justify-between gap-3 border-t bg-[linear-gradient(135deg,color-mix(in_oklch,var(--overview-accent-2)_12%,var(--background))_0%,color-mix(in_oklch,oklch(0.82_0.04_155)_8%,var(--background))_48%,color-mix(in_oklch,var(--overview-accent-1)_7%,var(--background))_100%)] p-3 sm:gap-4 sm:p-5 xl:border-t-0 xl:border-l'>

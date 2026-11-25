@@ -149,6 +149,7 @@ func projectVideoTaskLogs(logs []*model.Log, consolidate bool) ([]*model.Log, er
 		if info == nil {
 			continue
 		}
+		log.VideoTask = true
 		var other map[string]any
 		if common.UnmarshalJsonStr(log.Other, &other) != nil || other == nil {
 			continue

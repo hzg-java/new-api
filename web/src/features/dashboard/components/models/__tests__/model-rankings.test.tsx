@@ -1,13 +1,15 @@
-import { act, render, screen, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import i18next from 'i18next'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { processChartData } from '@/features/dashboard/lib/charts'
 import type { QuotaDataItem } from '@/features/dashboard/types'
+import { api } from '@/lib/api'
 import { useSystemConfigStore } from '@/stores/system-config-store'
 
 import { ConsumptionDistributionChart } from '../consumption-distribution-chart'
+import { LogStatCards } from '../log-stat-cards'
 import { ModelCharts } from '../model-charts'
 
 vi.mock('@visactor/react-vchart', () => ({
@@ -32,6 +34,55 @@ beforeEach(() => {
 afterEach(async () => {
   useSystemConfigStore.setState(useSystemConfigStore.getInitialState(), true)
   await i18next.changeLanguage('en')
+})
+
+describe('model usage history warning', () => {
+  it('shows the warning for a flagged row and removes it when the selected range is verified', async () => {
+    vi.spyOn(api, 'get')
+      .mockResolvedValueOnce({
+        data: {
+          success: true,
+          data: [data[0], { ...data[1], unreconciled: true }],
+        },
+      })
+      .mockResolvedValueOnce({
+        data: { success: true, data: [{ ...data[0], unreconciled: false }] },
+      })
+    const onDataUpdate = vi.fn()
+    const view = render(<LogStatCards onDataUpdate={onDataUpdate} />)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Some historical usage could not be verified and is shown without correction.'
+    )
+    expect(screen.getByText('$5')).toBeVisible()
+    expect(screen.getByText('5', { selector: '[title="5"]' })).toBeVisible()
+
+    view.rerender(
+      <LogStatCards
+        filters={{ username: 'verified' }}
+        onDataUpdate={onDataUpdate}
+      />
+    )
+    await waitFor(() => expect(screen.getByText('$1')).toBeVisible())
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['absent', [data[0]]],
+    ['false', [{ ...data[0], unreconciled: false }]],
+    ['empty', []],
+  ])('hides the warning for %s reconciliation flags', async (_label, rows) => {
+    vi.spyOn(api, 'get').mockResolvedValue({
+      data: { success: true, data: rows },
+    })
+    const onDataUpdate = vi.fn()
+    render(<LogStatCards onDataUpdate={onDataUpdate} />)
+
+    await waitFor(() =>
+      expect(onDataUpdate).toHaveBeenLastCalledWith(rows, false)
+    )
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
 })
 
 describe('model chart ranking data', () => {
