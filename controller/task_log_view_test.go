@@ -828,10 +828,8 @@ func TestLogTaskEventsAdminSubmissionView(t *testing.T) {
 }
 
 func TestTaskEventTimelinePreservesSafeSnapshotsAndOwnership(t *testing.T) {
-	db, _ := openTaskDialectDatabase(t, &model.Task{}, &model.TaskEvent{})
-	previousDB := model.DB
-	model.DB = db
-	t.Cleanup(func() { model.DB = previousDB })
+	db := setupMaterialConcurrentPostgres(t)
+	require.NoError(t, db.AutoMigrate(&model.Task{}, &model.TaskEvent{}))
 	task := &model.Task{TaskID: "public-id", UserId: 7, Status: model.TaskStatusSuccess}
 	require.NoError(t, db.Create(task).Error)
 	other := &model.Task{TaskID: "public-id", UserId: 8, Status: model.TaskStatusSuccess}
@@ -843,6 +841,9 @@ func TestTaskEventTimelinePreservesSafeSnapshotsAndOwnership(t *testing.T) {
 	require.NoError(t, model.RecordTaskEventDetail(task.ID, "accepted", 1700000001, map[string]any{"id": task.TaskID, "status": "queued"}))
 	require.NoError(t, model.RecordTaskEvent(task.ID, "result", 1700000010, map[string]any{"status": "SUCCESS", "total_tokens": 12}))
 	require.NoError(t, model.RecordTaskEvent(task.ID, "result", 1700000011, map[string]any{"status": "FAILURE"}))
+	require.NoError(t, model.RecordTaskEventDetail(task.ID, "result", 1700000010, model.TaskEventClientResponse{
+		Response: json.RawMessage(`{"status_code":200,"body":{"id":"public-id","status":"completed","model":"public-model","api_key":"credential-canary"}}`),
+	}))
 
 	for _, tc := range []struct {
 		name                 string
@@ -850,13 +851,13 @@ func TestTaskEventTimelinePreservesSafeSnapshotsAndOwnership(t *testing.T) {
 		tokenID              int
 		wantCount            int
 	}{
-		{"owner", 7, common.RoleCommonUser, 200, 0, 2},
+		{"owner", 7, common.RoleCommonUser, 200, 0, 3},
 		{"same public ID, different owner", 8, common.RoleCommonUser, 404, 0, 0},
 		{"foreign user", 9, common.RoleCommonUser, 404, 0, 0},
 		{"admin", 8, common.RoleAdminUser, 200, 0, 3},
 		{"root", 9, common.RoleRootUser, 200, 0, 3},
-		{"admin owner token", 7, common.RoleAdminUser, 200, 1, 2},
-		{"root owner token", 7, common.RoleRootUser, 200, 1, 2},
+		{"admin owner token", 7, common.RoleAdminUser, 200, 1, 3},
+		{"root owner token", 7, common.RoleRootUser, 200, 1, 3},
 		{"api token", 9, common.RoleRootUser, 404, 1, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -881,12 +882,17 @@ func TestTaskEventTimelinePreservesSafeSnapshotsAndOwnership(t *testing.T) {
 			assert.Equal(t, "accepted", response.Data[1].Kind)
 			assert.JSONEq(t, `{"model":"public-model","prompt":"hello"}`, response.Data[0].Payload)
 			assert.JSONEq(t, `{"id":"public-id","status":"queued"}`, response.Data[1].Payload)
-			if tc.wantCount == 3 {
-				assert.Equal(t, "result", response.Data[2].Kind)
+			assert.Equal(t, "result", response.Data[2].Kind)
+			assert.JSONEq(t, `{"status_code":200,"body":{"id":"public-id","status":"completed","model":"public-model","api_key":"[REDACTED]"}}`, response.Data[2].ClientResponse)
+			assert.NotContains(t, recorder.Body.String(), "credential-canary")
+			assert.Contains(t, recorder.Header().Get("Cache-Control"), "no-store")
+			if tc.role >= common.RoleAdminUser && tc.tokenID == 0 {
 				assert.Contains(t, response.Data[2].Payload, "SUCCESS")
 			} else {
-				assert.NotContains(t, recorder.Body.String(), `"kind":"result"`)
+				assert.JSONEq(t, `{}`, response.Data[2].Payload)
 				assert.NotContains(t, recorder.Body.String(), "SUCCESS")
+				assert.Nil(t, response.Data[2].DetailComplete)
+				assert.Empty(t, response.Data[2].DetailUnavailable)
 			}
 			assert.NotContains(t, recorder.Body.String(), "foreign-model")
 			assert.NotContains(t, recorder.Body.String(), "FAILURE")
@@ -1230,7 +1236,8 @@ func TestTaskEventFinalClientResponses(t *testing.T) {
 					admin, ordinary := events[0], events[0]
 					require.NoError(t, admin.ProjectDetail(true))
 					require.NoError(t, ordinary.ProjectDetail(false))
-					assert.Empty(t, ordinary.ClientResponse)
+					assert.JSONEq(t, admin.ClientResponse, ordinary.ClientResponse)
+					assert.JSONEq(t, `{}`, ordinary.Payload)
 					expected, err := model.RedactTaskEventDetail(json.RawMessage(recorder.Body.Bytes()))
 					require.NoError(t, err)
 					var captured struct {
@@ -1319,6 +1326,55 @@ func TestTaskEventFinalClientResponses(t *testing.T) {
 	})
 }
 
+func TestTaskEventClientResponseVisibility(t *testing.T) {
+	for _, tc := range []struct {
+		name, kind, response string
+	}{
+		{"success", "result", `{"status_code":200,"content_type":"application/json","body":{"id":"public-id","model":"client-model","status":"completed","seed":9007199254740993,"scale":1.2300,"enabled":false,"api_key":"credential-canary","url":"https://cdn.example/video?token=url-canary&width=720"}}`},
+		{"failure", "result", `{"status_code":400,"body":{"error":{"code":"invalid_request","message":"Request failed"}}}`},
+		{"unavailable", "result", `{"unavailable":"size_limit_exceeded"}`},
+		{"historical", "result", ""},
+		{"request", "request", `{"body":{"status":"completed"}}`},
+		{"accepted", "accepted", `{"body":{"status":"completed"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := map[string]any{
+				"complete":         true,
+				"payload":          map[string]any{"status": "SUCCESS", "data": map[string]any{"model": "mapped-canary", "text": "upstream-result-canary"}},
+				"upstream_request": map[string]any{"model": "mapped-canary"},
+			}
+			if tc.response != "" {
+				info["client_response"] = json.RawMessage(tc.response)
+			}
+			encoded, err := common.Marshal(map[string]any{"admin_info": info})
+			require.NoError(t, err)
+			event := model.TaskEvent{Kind: tc.kind, Payload: string(encoded)}
+			require.NoError(t, event.ProjectDetail(false))
+			assert.Empty(t, event.UpstreamRequest)
+			if tc.kind != "result" {
+				assert.Empty(t, event.ClientResponse)
+				return
+			}
+			assert.JSONEq(t, `{}`, event.Payload)
+			assert.Nil(t, event.DetailComplete)
+			assert.Empty(t, event.DetailUnavailable)
+			if tc.response == "" {
+				assert.Empty(t, event.ClientResponse)
+				return
+			}
+			expected, err := model.RedactTaskEventDetail(json.RawMessage(tc.response))
+			require.NoError(t, err)
+			assert.JSONEq(t, string(expected), event.ClientResponse)
+			assert.NotContains(t, event.ClientResponse, "canary")
+			if tc.name == "success" {
+				assert.Contains(t, event.ClientResponse, "9007199254740993")
+				assert.Contains(t, event.ClientResponse, "1.2300")
+				assert.Contains(t, event.ClientResponse, `"enabled":false`)
+			}
+		})
+	}
+}
+
 func TestTaskEventUpstreamRequestProjection(t *testing.T) {
 	for _, admin := range []bool{true, false} {
 		event := model.TaskEvent{Kind: "request", Payload: `{"model":"client-model","admin_info":{"complete":true,"payload":{"model":"client-model","prompt":"original","generate_audio":false},"upstream_request":{"model":"mapped-model","content":[{"type":"image_url","image_url":{"url":"asset://resolved-material"}}],"seed":9007199254740993,"scale":1.2300,"duration":0,"generate_audio":false,"api_key":"credential-canary"}}}`}
@@ -1352,15 +1408,19 @@ func TestTaskEventBusinessDetailProjection(t *testing.T) {
 		{"request", `{"kind":"multipart","fields":{"prompt":["first","second"],"model":["client-model"],"channel_id":["ops-canary"]},"files":[{"field":"image","filename":"input.png","mime_type":"image/png","size":42}],"unavailable":"uploaded_file_bytes_omitted"}`, `{"kind":"multipart","fields":{"prompt":["first","second"],"model":["client-model"]},"files":[{"field":"image","filename":"input.png","mime_type":"image/png","size":42}],"unavailable":"uploaded_file_bytes_omitted"}`},
 		{"accepted", `{"status_code":200,"content_type":"application/json","body":{"id":"public-id","status":"queued","model":"mapped-canary","admin_info":{"channel":"ops-canary"},"unknown":{"prompt":"ops-canary"}}}`, `{"status_code":200,"content_type":"application/json","body":{"id":"public-id","status":"queued"}}`},
 		{"accepted", `{"events":[{"event":"response.completed","data":{"status":"completed","model":"mapped-canary","output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}]}}]}`, `{"events":[{"event":"response.completed","data":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}]}}]}`},
-		{"result", `{"task_id":"public-id","status":"SUCCESS","data":{"id":"vendor-id","model":"mapped-canary","content":{"video_url":"https://cdn.example/video?token=credential-canary&width=720","last_frame_url":"https://cdn.example/frame"},"usage":{"total_tokens":9007199254740993,"price":"ops-canary"},"resolution":"720p","duration":5,"node_name":"ops-canary","unknown":"ops-canary"}}`, `{"task_id":"public-id","status":"SUCCESS","data":{"id":"vendor-id","content":{"video_url":"https://cdn.example/video?token=%5BREDACTED%5D&width=720","last_frame_url":"https://cdn.example/frame"},"usage":{"total_tokens":9007199254740993},"resolution":"720p","duration":5}}`},
+		{"result", `{"task_id":"public-id","status":"SUCCESS","data":{"id":"vendor-id","model":"mapped-canary","content":{"video_url":"https://cdn.example/video?token=credential-canary&width=720","last_frame_url":"https://cdn.example/frame"},"usage":{"total_tokens":9007199254740993,"price":"ops-canary"},"resolution":"720p","duration":5,"node_name":"ops-canary","unknown":"ops-canary"}}`, `{}`},
 	} {
 		t.Run(tc.kind+tc.detail[:12], func(t *testing.T) {
 			stored := `{"admin_info":{"complete":true,"payload":` + tc.detail + `}}`
 			event := model.TaskEvent{Kind: tc.kind, Payload: stored}
 			require.NoError(t, event.ProjectDetail(false))
 			assert.JSONEq(t, tc.want, event.Payload)
-			require.NotNil(t, event.DetailComplete)
-			assert.True(t, *event.DetailComplete)
+			if tc.kind == "result" {
+				assert.Nil(t, event.DetailComplete)
+			} else {
+				require.NotNil(t, event.DetailComplete)
+				assert.True(t, *event.DetailComplete)
+			}
 			assert.NotContains(t, event.Payload, "canary")
 			admin := model.TaskEvent{Kind: tc.kind, Payload: stored}
 			require.NoError(t, admin.ProjectDetail(true))

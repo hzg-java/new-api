@@ -127,7 +127,7 @@ export function TaskTimeline(props: { events: TaskEvent[] }) {
     (state) => (state.auth.user?.role ?? ROLE.GUEST) >= ROLE.ADMIN
   )
   const visibleEvents = props.events.filter(
-    (event) => isAdmin || event.kind !== 'result'
+    (event) => isAdmin || event.kind !== 'result' || event.client_response
   )
   const labels = {
     request: t('User Request'),
@@ -157,7 +157,11 @@ export function TaskTimeline(props: { events: TaskEvent[] }) {
                   aria-hidden='true'
                 />
                 <div className='mb-2 flex flex-wrap items-center justify-between gap-2'>
-                  <h4 className='text-sm font-medium'>{labels[event.kind]}</h4>
+                  <h4 className='text-sm font-medium'>
+                    {!isAdmin && event.kind === 'result'
+                      ? t('Final Client Response')
+                      : labels[event.kind]}
+                  </h4>
                   <time
                     className='text-muted-foreground font-mono text-xs'
                     dateTime={new Date(event.timestamp * 1000).toISOString()}
@@ -165,7 +169,8 @@ export function TaskTimeline(props: { events: TaskEvent[] }) {
                     {formatTaskTimestamp(event.timestamp)}
                   </time>
                 </div>
-                {event.detail_complete === false ? (
+                {(isAdmin || event.kind !== 'result') &&
+                event.detail_complete === false ? (
                   <p className='text-muted-foreground mb-2 text-xs'>
                     {t('Not recorded')}
                     {event.detail_unavailable ? (
@@ -175,21 +180,23 @@ export function TaskTimeline(props: { events: TaskEvent[] }) {
                     ) : null}
                   </p>
                 ) : null}
-                <CodeBlock
-                  code={formatTaskEventPayload(event.payload)}
-                  language='json'
-                  title={labels[event.kind]}
-                  enableCollapse={false}
-                  maxExpandedLines={14}
-                  showToolbar
-                  showLineNumbers
-                >
-                  <CopyButton
-                    value={event.payload}
-                    className='size-8'
-                    iconClassName='size-3.5'
-                  />
-                </CodeBlock>
+                {isAdmin || event.kind !== 'result' ? (
+                  <CodeBlock
+                    code={formatTaskEventPayload(event.payload)}
+                    language='json'
+                    title={labels[event.kind]}
+                    enableCollapse={false}
+                    maxExpandedLines={14}
+                    showToolbar
+                    showLineNumbers
+                  >
+                    <CopyButton
+                      value={event.payload}
+                      className='size-8'
+                      iconClassName='size-3.5'
+                    />
+                  </CodeBlock>
+                ) : null}
                 {isAdmin &&
                 event.kind === 'request' &&
                 event.upstream_request ? (
@@ -209,7 +216,7 @@ export function TaskTimeline(props: { events: TaskEvent[] }) {
                     />
                   </CodeBlock>
                 ) : null}
-                {isAdmin && event.kind === 'result' && event.client_response ? (
+                {event.kind === 'result' && event.client_response ? (
                   <CodeBlock
                     code={formatTaskEventPayload(event.client_response)}
                     language='json'

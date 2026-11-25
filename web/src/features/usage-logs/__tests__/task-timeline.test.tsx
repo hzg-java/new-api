@@ -379,7 +379,7 @@ describe('task event content', () => {
   })
 
   test.each([ROLE.USER, null])(
-    'hides result, actual request and injected client responses but preserves business details for role %s',
+    'hides upstream results, actual requests and unfinished client responses for role %s',
     (role) => {
       useAuthStore
         .getState()
@@ -404,7 +404,6 @@ describe('task event content', () => {
               kind: 'result',
               timestamp: 1700000002,
               payload: '{"output":"result-canary"}',
-              client_response: '{"body":"client-response-canary"}',
             },
           ]}
         />
@@ -433,6 +432,54 @@ describe('task event content', () => {
       expect(
         screen.getAllByRole('button', { name: 'Copy to clipboard' })
       ).toHaveLength(2)
+    }
+  )
+
+  test.each([
+    '{"status_code":200,"body":{"status":"completed","id":9007199254740993,"scale":1.2300,"enabled":false}}',
+    '{"status_code":400,"body":{"error":{"message":"Request failed"}}}',
+    '{"unavailable":"size_limit_exceeded"}',
+  ])(
+    'ordinary users can view and exactly copy a final client response without upstream details: %s',
+    async (clientResponse) => {
+      const user = userEvent.setup()
+      useAuthStore
+        .getState()
+        .auth.setUser({ id: 7, username: 'user', role: ROLE.USER })
+      render(
+        <TaskTimeline
+          events={[
+            {
+              kind: 'result',
+              timestamp: 1700000002,
+              payload: '{"output":"upstream-result-canary"}',
+              client_response: clientResponse,
+              upstream_request: '{"model":"upstream-request-canary"}',
+              detail_complete: false,
+              detail_unavailable: 'upstream-detail-canary',
+            },
+          ]}
+        />
+      )
+      expect(screen.getAllByRole('listitem')).toHaveLength(1)
+      const response = screen.getByRole('textbox', {
+        name: 'Final Client Response',
+      })
+      expect(response).toHaveAttribute('aria-readonly', 'true')
+      expect(
+        response
+          .querySelector('.cm-content')
+          ?.textContent?.replaceAll(/\s/g, '')
+      ).toBe(clientResponse.replaceAll(/\s/g, ''))
+      expect(
+        screen.queryByRole('textbox', { name: 'Task Result' })
+      ).not.toBeInTheDocument()
+      expect(screen.queryByText(/canary/)).not.toBeInTheDocument()
+      expect(screen.queryByText('Not recorded')).not.toBeInTheDocument()
+      await user.click(
+        screen.getByRole('button', { name: 'Copy to clipboard' })
+      )
+      expect(await navigator.clipboard.readText()).toBe(clientResponse)
     }
   )
 

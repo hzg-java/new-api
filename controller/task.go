@@ -153,12 +153,12 @@ func GetDashboardTaskEvents(c *gin.Context) {
 	admin := c.GetInt("token_id") == 0 && c.GetInt("role") >= common.RoleAdminUser
 	visibleEvents := make([]model.TaskEvent, 0, len(events))
 	for _, event := range events {
-		if !admin && event.Kind == "result" {
-			continue
-		}
 		if err := event.ProjectDetail(admin); err != nil {
 			common.ApiError(c, err)
 			return
+		}
+		if !admin && event.Kind == "result" && event.ClientResponse == "" {
+			continue
 		}
 		visibleEvents = append(visibleEvents, event)
 	}

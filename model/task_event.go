@@ -318,12 +318,18 @@ func (event *TaskEvent) ProjectDetail(admin bool) error {
 		event.UpstreamRequest = string(redacted)
 	}
 	event.ClientResponse = ""
-	if admin && event.Kind == "result" && len(detail.ClientResponse) > 0 {
+	if event.Kind == "result" && len(detail.ClientResponse) > 0 {
 		redacted, err := redactTaskEventJSON(detail.ClientResponse)
 		if err != nil {
 			return err
 		}
 		event.ClientResponse = string(redacted)
+	}
+	if !admin && event.Kind == "result" {
+		event.Payload = "{}"
+		event.DetailComplete = nil
+		event.DetailUnavailable = ""
+		return nil
 	}
 	encoded := detail.Payload
 	if len(encoded) == 0 {
