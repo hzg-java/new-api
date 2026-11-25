@@ -145,8 +145,8 @@ func PrepareVideoMaterials(ctx context.Context, userID int, channel MaterialChan
 				issues = append(issues, MaterialPreparationIssue{Index: input.Index, Field: input.Field, Usage: input.Usage, Status: "unavailable", Reason: "Material reference is unavailable in the selected resource space"})
 				continue
 			}
-		} else if ValidateMaterialPreparationSource(source) != nil {
-			issues = append(issues, MaterialPreparationIssue{Index: input.Index, Field: input.Field, Usage: input.Usage, Status: "unavailable", Reason: "Material source must be a public HTTPS image URL"})
+		} else if validateMaterialPreparationSource(source, true) != nil {
+			issues = append(issues, MaterialPreparationIssue{Index: input.Index, Field: input.Field, Usage: input.Usage, Status: "unavailable", Reason: "Material source must be a public HTTP or HTTPS image URL"})
 		}
 		if err != nil {
 			issues = append(issues, MaterialPreparationIssue{Index: input.Index, Field: input.Field, Usage: input.Usage, Status: "unavailable", Reason: "Video material lookup failed; retry to check the existing material"})
@@ -498,8 +498,8 @@ func ValidateVideoMaterialBody(body any) error {
 			}
 			continue
 		}
-		if ValidateMaterialPreparationSource(source) != nil {
-			return fmt.Errorf("%s must be a public HTTPS image URL", input.Field)
+		if validateMaterialPreparationSource(source, true) != nil {
+			return fmt.Errorf("%s must be a public HTTP or HTTPS image URL", input.Field)
 		}
 	}
 	return nil

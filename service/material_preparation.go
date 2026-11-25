@@ -132,8 +132,8 @@ func PrepareMaterial(ctx context.Context, material *model.Material, scope string
 	if current.Deleting {
 		return nil
 	}
-	if material.LibraryType != model.MaterialLibraryAIGC || material.FileType != model.MaterialFileImage || ValidateMaterialPreparationSource(material.SourceURL) != nil {
-		return finishMaterialPreparation(db, material, binding, owner, "failed", "Only public HTTPS AIGC images can be prepared", false)
+	if material.LibraryType != model.MaterialLibraryAIGC || material.FileType != model.MaterialFileImage || validateMaterialPreparationSource(material.SourceURL, true) != nil {
+		return finishMaterialPreparation(db, material, binding, owner, "failed", "AIGC material preparation requires a public HTTP or HTTPS image URL", false)
 	}
 	if material.Status == model.MaterialStatusPending && binding.State != "pending" && binding.State != "ready" {
 		binding.StartedAt = common.GetTimestamp()
@@ -528,13 +528,21 @@ func (MaterialPreparationHandler) Run(ctx context.Context, task *model.SystemTas
 }
 
 func ValidateMaterialPreparationSource(source string) error {
+	return validateMaterialPreparationSource(source, false)
+}
+
+func validateMaterialPreparationSource(source string, allowHTTP bool) error {
+	invalidSourceMessage := "material source must be a public HTTPS image URL"
+	if allowHTTP {
+		invalidSourceMessage = "material source must be a public HTTP or HTTPS image URL"
+	}
 	target, err := url.Parse(source)
-	if err != nil || target.Scheme != "https" || target.Hostname() == "" || target.User != nil || strings.Contains(source, "#") || target.Opaque != "" {
-		return errors.New("material source must be a public HTTPS image URL")
+	if err != nil || (target.Scheme != "https" && (!allowHTTP || target.Scheme != "http")) || target.Hostname() == "" || target.User != nil || strings.Contains(source, "#") || target.Opaque != "" {
+		return errors.New(invalidSourceMessage)
 	}
 	protection := common.SSRFProtection{ApplyIPFilterForDomain: true}
 	if err := protection.ValidateURL(source); err != nil {
-		return errors.New("material source must be a public HTTPS image URL")
+		return errors.New(invalidSourceMessage)
 	}
 	return ValidateSSRFProtectedFetchURL(source)
 }

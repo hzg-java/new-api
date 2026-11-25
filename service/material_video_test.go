@@ -8,9 +8,44 @@ import (
 
 	taskdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestValidateVideoMaterialBodyImageURL(t *testing.T) {
+	fetch := system_setting.GetFetchSetting()
+	previous := *fetch
+	*fetch = system_setting.FetchSetting{EnableSSRFProtection: true, AllowedPorts: []string{"80", "443", "8080"}}
+	t.Cleanup(func() { *fetch = previous })
+
+	for _, tc := range []struct {
+		name, source string
+		allowed      bool
+	}{
+		{"public HTTP", "http://8.8.8.8/reference.png", true},
+		{"public HTTPS", "https://8.8.8.8/reference.png", true},
+		{"HTTP port allowed", "http://8.8.8.8:8080/reference.png", true},
+		{"HTTP port not allowed", "http://8.8.8.8:8888/reference.png", false},
+		{"private HTTP", "http://10.0.0.1/reference.png", false},
+		{"embedded credentials", "http://user:pass@8.8.8.8/reference.png", false},
+		{"fragment", "http://8.8.8.8/reference.png#frame", false},
+		{"inline image", "data:image/png;base64,AAAA", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := map[string]any{"content": []any{
+				map[string]any{"type": "text", "text": "prompt"},
+				map[string]any{"type": "image_url", "image_url": map[string]any{"url": tc.source}},
+			}}
+			err := ValidateVideoMaterialBody(body)
+			if tc.allowed {
+				assert.NoError(t, err)
+				return
+			}
+			assert.EqualError(t, err, "content[1].image_url.url must be a public HTTP or HTTPS image URL")
+		})
+	}
+}
 
 func TestVideoMaterialFailure(t *testing.T) {
 	for _, tc := range []struct {
