@@ -179,28 +179,29 @@ func TestMobileCloudMaterialFailures(t *testing.T) {
 func TestMobileCloudMaterialConnectionFailures(t *testing.T) {
 	const private = "test-ak test-sk test-pool proxy-password https://private.example/path?Signature=private-signature"
 	for _, tc := range []struct {
-		name, expected string
-		cause          error
+		name, expected, errorKind string
+		cause                     error
 	}{
-		{"DNS", "DNS resolution failed", &net.DNSError{Name: private, Server: private, Err: "no such host"}},
-		{"certificate authority", "TLS certificate verification failed", &tls.CertificateVerificationError{UnverifiedCertificates: []*x509.Certificate{{DNSNames: []string{private}}}, Err: x509.UnknownAuthorityError{}}},
-		{"certificate hostname", "TLS certificate verification failed", x509.HostnameError{Certificate: &x509.Certificate{}, Host: private}},
-		{"certificate expiry", "TLS certificate verification failed", x509.CertificateInvalidError{Cert: &x509.Certificate{}, Reason: x509.Expired, Detail: private}},
-		{"TLS protocol", "TLS handshake failed", tls.RecordHeaderError{Msg: private}},
-		{"TLS alert", "TLS handshake failed", tls.AlertError(40)},
-		{"proxy", "proxy connection failed", &net.OpError{Op: "proxyconnect", Net: "tcp", Err: errors.New(private)}},
-		{"proxy DNS", "proxy connection failed: DNS resolution failed", &net.OpError{Op: "proxyconnect", Net: "tcp", Err: &net.DNSError{Name: private, Err: "no such host"}}},
-		{"proxy timeout", "proxy connection failed: connection timed out", &net.OpError{Op: "proxyconnect", Net: "tcp", Err: os.ErrDeadlineExceeded}},
-		{"connection reset", "connection reset by peer", &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}},
-		{"EOF", "connection closed before an HTTP response (EOF)", io.EOF},
-		{"unexpected EOF", "connection closed before an HTTP response (EOF)", io.ErrUnexpectedEOF},
-		{"transport timeout", "connection timed out", &net.OpError{Op: "dial", Net: "tcp", Err: os.ErrDeadlineExceeded}},
-		{"unknown", "mobile cloud material upstream connection failed", errors.New(private)},
-		{"canceled", "mobile cloud material request canceled: context canceled", context.Canceled},
-		{"deadline", "mobile cloud material request timed out: context deadline exceeded", context.DeadlineExceeded},
+		{"DNS", "DNS resolution failed", "dns_error", &net.DNSError{Name: private, Server: private, Err: "no such host"}},
+		{"certificate authority", "TLS certificate verification failed", "tls_certificate_error", &tls.CertificateVerificationError{UnverifiedCertificates: []*x509.Certificate{{DNSNames: []string{private}}}, Err: x509.UnknownAuthorityError{}}},
+		{"certificate hostname", "TLS certificate verification failed", "tls_certificate_error", x509.HostnameError{Certificate: &x509.Certificate{}, Host: private}},
+		{"certificate expiry", "TLS certificate verification failed", "tls_certificate_error", x509.CertificateInvalidError{Cert: &x509.Certificate{}, Reason: x509.Expired, Detail: private}},
+		{"TLS protocol", "TLS handshake failed", "tls_handshake_error", tls.RecordHeaderError{Msg: private}},
+		{"TLS alert", "TLS handshake failed", "tls_handshake_error", tls.AlertError(40)},
+		{"proxy", "proxy connection failed", "proxy_error", &net.OpError{Op: "proxyconnect", Net: "tcp", Err: errors.New(private)}},
+		{"proxy DNS", "proxy connection failed: DNS resolution failed", "dns_error", &net.OpError{Op: "proxyconnect", Net: "tcp", Err: &net.DNSError{Name: private, Err: "no such host"}}},
+		{"proxy timeout", "proxy connection failed: connection timed out", "timeout", &net.OpError{Op: "proxyconnect", Net: "tcp", Err: os.ErrDeadlineExceeded}},
+		{"connection reset", "connection reset by peer", "connection_reset", &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}},
+		{"EOF", "connection closed before an HTTP response (EOF)", "eof", io.EOF},
+		{"unexpected EOF", "connection closed before an HTTP response (EOF)", "unexpected_eof", io.ErrUnexpectedEOF},
+		{"transport timeout", "connection timed out", "timeout", &net.OpError{Op: "dial", Net: "tcp", Err: os.ErrDeadlineExceeded}},
+		{"unknown", "mobile cloud material upstream connection failed", "transport_error", errors.New(private)},
+		{"canceled", "mobile cloud material request canceled: context canceled", "canceled", context.Canceled},
+		{"deadline", "mobile cloud material request timed out: context deadline exceeded", "deadline_exceeded", context.DeadlineExceeded},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			client, err := NewMobileCloudMaterialClient("https://private.example", "test-ak", "test-sk", "test-pool")
+			buffer := captureMobileCloudMaterialLogs(t)
+			client, err := NewMobileCloudMaterialClient("https://ecloud.10086.cn:443", "test-ak", "test-sk", "test-pool")
 			require.NoError(t, err)
 			calls := 0
 			client.httpClient.Transport = mobileCloudMaterialRoundTripper(func(r *http.Request) (*http.Response, error) {
@@ -216,10 +217,15 @@ func TestMobileCloudMaterialConnectionFailures(t *testing.T) {
 			}
 			assert.EqualError(t, err, expected)
 			assert.Equal(t, 1, calls, "failed mutations must not be replayed")
+			logs := buffer.String()
+			assert.Contains(t, logs, "error_kind="+tc.errorKind+" ")
+			assert.Contains(t, logs, `target_host="ecloud.10086.cn:443"`)
+			assert.Contains(t, logs, fmt.Sprintf("go_version=%q goos=%s goarch=%s", runtime.Version(), runtime.GOOS, runtime.GOARCH))
 			var rejection *MobileCloudMaterialRejection
 			assert.NotErrorAs(t, err, &rejection, "transport failures do not confirm an upstream rejection")
 			for _, secret := range []string{"test-ak", "test-sk", "test-pool", "proxy-password", "private.example", "private-signature", "Signature="} {
 				assert.NotContains(t, err.Error(), secret)
+				assert.NotContains(t, logs, secret)
 			}
 			if tc.cause == context.Canceled || tc.cause == context.DeadlineExceeded {
 				assert.ErrorIs(t, err, tc.cause)
@@ -230,13 +236,15 @@ func TestMobileCloudMaterialConnectionFailures(t *testing.T) {
 	}
 	if runtime.GOOS == "windows" {
 		t.Run("Windows connection reset", func(t *testing.T) {
-			client, err := NewMobileCloudMaterialClient("https://private.example", "test-ak", "test-sk", "test-pool")
+			buffer := captureMobileCloudMaterialLogs(t)
+			client, err := NewMobileCloudMaterialClient("https://ecloud.10086.cn", "test-ak", "test-sk", "test-pool")
 			require.NoError(t, err)
 			client.httpClient.Transport = mobileCloudMaterialRoundTripper(func(*http.Request) (*http.Response, error) {
 				return nil, &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("wsarecv", syscall.Errno(10054))}
 			})
 			_, err = client.GetAsset(t.Context(), "asset-1")
 			assert.EqualError(t, err, "mobile cloud material upstream connection failed: connection reset by peer")
+			assert.Contains(t, buffer.String(), "error_kind=connection_reset ")
 		})
 	}
 }
@@ -291,11 +299,11 @@ func TestMobileCloudMaterialStageDiagnostics(t *testing.T) {
 		},
 		{
 			name: "TLS EOF", stage: "tls", cause: io.EOF,
-			expected: []string{"outcome=transport_error", "dns=ok", "tcp=ok", "peer_ip=192.0.2.10", "upstream_tls=error", "request_write=not_started", "first_byte_after_ms=-1"},
+			expected: []string{"outcome=transport_error", "error_kind=eof", "dns=ok", "tcp=ok", "peer_ip=192.0.2.10", "upstream_tls=error", "request_write=not_started", "first_byte_after_ms=-1"},
 		},
 		{
 			name: "EOF after request write", stage: "write", cause: io.EOF,
-			expected: []string{"outcome=transport_error", "upstream_tls=ok", "upstream_tls_version=TLS1.3", "request_write=ok", "first_byte_after_ms=-1"},
+			expected: []string{"outcome=transport_error", "error_kind=eof", "upstream_tls=ok", "upstream_tls_version=TLS1.3", "request_write=ok", "first_byte_after_ms=-1"},
 		},
 		{
 			name: "write failure", stage: "write", cause: errors.New("test-ak test-sk private-token"),
@@ -304,12 +312,32 @@ func TestMobileCloudMaterialStageDiagnostics(t *testing.T) {
 		{
 			name: "body failure", stage: "response",
 			response: &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(mobileCloudMaterialReadError{errors.New("test-sk private-token")})},
-			expected: []string{"outcome=response_read_error", "upstream_tls=ok", "request_write=ok", "http_status=200"},
+			expected: []string{"outcome=response_read_error", "error_kind=transport_error", "upstream_tls=ok", "request_write=ok", "http_status=200"},
+		},
+		{
+			name: "body interrupted", stage: "response",
+			response: &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(mobileCloudMaterialReadError{io.ErrUnexpectedEOF})},
+			expected: []string{"outcome=response_read_error", "error_kind=unexpected_eof", "http_status=200"},
+		},
+		{
+			name: "body reset", stage: "response",
+			response: &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(mobileCloudMaterialReadError{syscall.ECONNRESET})},
+			expected: []string{"outcome=response_read_error", "error_kind=connection_reset", "http_status=200"},
+		},
+		{
+			name: "body timeout", stage: "response",
+			response: &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(mobileCloudMaterialReadError{os.ErrDeadlineExceeded})},
+			expected: []string{"outcome=response_read_error", "error_kind=timeout", "http_status=200"},
+		},
+		{
+			name: "invalid JSON response", stage: "response",
+			response: &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"state":`))},
+			expected: []string{"outcome=invalid_response", "error_kind=invalid_response", "http_status=200"},
 		},
 		{
 			name: "upstream rejection", stage: "response",
 			response: &http.Response{StatusCode: http.StatusForbidden, Body: io.NopCloser(strings.NewReader(`{"state":"ERROR","errorMessage":"test-ak test-sk private-token"}`))},
-			expected: []string{"outcome=upstream_rejected", "http_status=403"},
+			expected: []string{"outcome=upstream_rejected", "error_kind=upstream_rejected", "http_status=403"},
 		},
 		{
 			name: "canceled", cause: context.Canceled,
@@ -318,7 +346,7 @@ func TestMobileCloudMaterialStageDiagnostics(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			buffer := captureMobileCloudMaterialLogs(t)
-			client, err := NewMobileCloudMaterialClient("https://private.example", "test-ak", "test-sk", "test-pool")
+			client, err := NewMobileCloudMaterialClient("https://ecloud.10086.cn", "test-ak", "test-sk", "test-pool")
 			require.NoError(t, err)
 			calls := 0
 			client.httpClient.Transport = mobileCloudMaterialRoundTripper(func(r *http.Request) (*http.Response, error) {
@@ -403,7 +431,7 @@ func TestMobileCloudMaterialCredentialDiagnostics(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			buffer := captureMobileCloudMaterialLogs(t)
 			t.Setenv("MOBILE_CLOUD_MATERIAL_MASTER_KEY", "private-encryption-master-key")
-			client, err := NewMobileCloudMaterialClient("https://private.example", tc.accessKey, tc.secretKey, tc.poolID)
+			client, err := NewMobileCloudMaterialClient("https://ecloud.10086.cn", tc.accessKey, tc.secretKey, tc.poolID)
 			require.NoError(t, err)
 			client.now = func() time.Time { return time.Date(2026, 11, 10, 3, 4, 5, 0, time.UTC) }
 			client.httpClient.Transport = mobileCloudMaterialRoundTripper(func(*http.Request) (*http.Response, error) { return nil, io.EOF })
@@ -448,6 +476,9 @@ func TestMobileCloudMaterialStageDiagnosticsSuccess(t *testing.T) {
 	assert.Contains(t, logs, "request_write=ok")
 	assert.Contains(t, logs, "http_status=200")
 	assert.Contains(t, logs, "outcome=completed")
+	assert.Contains(t, logs, "error_kind=none ")
+	assert.Contains(t, logs, fmt.Sprintf("target_host=%q", client.endpoint.Host))
+	assert.Contains(t, logs, fmt.Sprintf("go_version=%q goos=%s goarch=%s", runtime.Version(), runtime.GOOS, runtime.GOARCH))
 	assert.Regexp(t, `upstream_tls_done_after_ms=\d+`, logs)
 	assert.Regexp(t, `write_done_after_ms=\d+`, logs)
 	assert.Regexp(t, `first_byte_after_ms=\d+`, logs)
@@ -469,7 +500,7 @@ func TestMobileCloudMaterialStageDiagnosticsProxySelection(t *testing.T) {
 		name, expectedProxy, expectedAddress string
 		useProxy, proxyError                 bool
 	}{
-		{name: "direct", expectedProxy: "direct", expectedAddress: "private.example:443"},
+		{name: "direct", expectedProxy: "direct", expectedAddress: "ecloud.10086.cn:443"},
 		{name: "proxy", expectedProxy: "enabled", expectedAddress: "proxy.example:8080", useProxy: true},
 		{name: "proxy selection error", expectedProxy: "error", proxyError: true},
 	} {
@@ -488,7 +519,7 @@ func TestMobileCloudMaterialStageDiagnosticsProxySelection(t *testing.T) {
 			}
 			http.DefaultTransport = base
 			t.Cleanup(func() { http.DefaultTransport = previous })
-			client, err := NewMobileCloudMaterialClient("https://private.example", "test-ak", "test-sk", "test-pool")
+			client, err := NewMobileCloudMaterialClient("https://ecloud.10086.cn", "test-ak", "test-sk", "test-pool")
 			require.NoError(t, err)
 			var dialAddress string
 			client.httpClient.Transport.(*http.Transport).DialContext = func(_ context.Context, _, addr string) (net.Conn, error) {
@@ -522,13 +553,14 @@ func TestMobileCloudMaterialStageDiagnosticsHTTPSProxy(t *testing.T) {
 	base.Proxy = http.ProxyURL(proxyURL)
 	http.DefaultTransport = base
 	t.Cleanup(func() { http.DefaultTransport = previous })
-	client, err := NewMobileCloudMaterialClient("https://private.example", "test-ak", "test-sk", "test-pool")
+	client, err := NewMobileCloudMaterialClient("https://ecloud.10086.cn", "test-ak", "test-sk", "test-pool")
 	require.NoError(t, err)
 	client.httpClient.Transport.(*http.Transport).TLSClientConfig.RootCAs = proxy.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
 	_, err = client.CreateAssetGroup(t.Context(), "private-name", nil)
 	require.Error(t, err)
 	logs := buffer.String()
 	assert.Contains(t, logs, "proxy=enabled proxy_connect_status=407")
+	assert.Contains(t, logs, "error_kind=proxy_error ")
 	assert.Contains(t, logs, "peer_role=proxy")
 	assert.Contains(t, logs, "proxy_tls=ok")
 	assert.Contains(t, logs, "upstream_tls=not_started")
@@ -540,7 +572,7 @@ func TestMobileCloudMaterialStageDiagnosticsHTTPSProxy(t *testing.T) {
 
 func TestMobileCloudMaterialStageDiagnosticsLateCallbacks(t *testing.T) {
 	buffer := captureMobileCloudMaterialLogs(t)
-	client, err := NewMobileCloudMaterialClient("https://private.example", "test-ak", "test-sk", "test-pool")
+	client, err := NewMobileCloudMaterialClient("https://ecloud.10086.cn", "test-ak", "test-sk", "test-pool")
 	require.NoError(t, err)
 	release, finished := make(chan struct{}), make(chan struct{})
 	client.httpClient.Transport = mobileCloudMaterialRoundTripper(func(r *http.Request) (*http.Response, error) {
@@ -582,6 +614,7 @@ func TestMobileCloudMaterialTLSHandshakeFailure(t *testing.T) {
 	client.httpClient.Transport.(*http.Transport).TLSClientConfig.MaxVersion = tls.VersionTLS12
 	_, err = client.CreateAssetGroup(t.Context(), "group", nil)
 	assert.EqualError(t, err, "mobile cloud material upstream connection failed: TLS handshake failed")
+	assert.Contains(t, buffer.String(), "error_kind=tls_handshake_error ")
 	assert.Contains(t, buffer.String(), "upstream_tls=error")
 	assert.Contains(t, buffer.String(), "request_write=not_started")
 	assert.Contains(t, buffer.String(), "first_byte_after_ms=-1")
@@ -596,7 +629,7 @@ func TestMobileCloudMaterialProxyRejection(t *testing.T) {
 		w.WriteHeader(http.StatusProxyAuthRequired)
 	}))
 	defer proxy.Close()
-	client, err := NewMobileCloudMaterialClient("https://private.example", "test-ak", "test-sk", "test-pool")
+	client, err := NewMobileCloudMaterialClient("https://ecloud.10086.cn", "test-ak", "test-sk", "test-pool")
 	require.NoError(t, err)
 	proxyURL, err := url.Parse(proxy.URL)
 	require.NoError(t, err)
@@ -936,17 +969,27 @@ func TestMobileCloudMaterialTransportSecurity(t *testing.T) {
 		assert.NotContains(t, err.Error(), "Signature=")
 	})
 
-	for _, cause := range []error{context.Canceled, context.DeadlineExceeded} {
-		t.Run("body read "+cause.Error(), func(t *testing.T) {
+	for _, tc := range []struct {
+		kind  string
+		cause error
+	}{
+		{"canceled", context.Canceled},
+		{"deadline_exceeded", context.DeadlineExceeded},
+	} {
+		t.Run("body read "+tc.kind, func(t *testing.T) {
+			buffer := captureMobileCloudMaterialLogs(t)
 			client, err := NewMobileCloudMaterialClient(server.URL, "test-ak", "test-sk", "pool-1")
 			require.NoError(t, err)
 			client.httpClient.Transport = mobileCloudMaterialRoundTripper(func(r *http.Request) (*http.Response, error) {
-				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(mobileCloudMaterialReadError{fmt.Errorf("test-ak Signature=private: %w", cause)})}, nil
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(mobileCloudMaterialReadError{fmt.Errorf("test-ak Signature=private: %w", tc.cause)})}, nil
 			})
 			_, err = client.GetAsset(context.Background(), "asset-1")
-			require.ErrorIs(t, err, cause)
+			require.ErrorIs(t, err, tc.cause)
+			assert.Contains(t, buffer.String(), "error_kind="+tc.kind+" ")
 			assert.NotContains(t, err.Error(), "test-ak")
 			assert.NotContains(t, err.Error(), "Signature=")
+			assert.NotContains(t, buffer.String(), "test-ak")
+			assert.NotContains(t, buffer.String(), "Signature=")
 		})
 	}
 }

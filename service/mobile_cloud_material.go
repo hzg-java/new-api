@@ -43,20 +43,22 @@ func (e *mobileCloudMaterialProxyError) Error() string {
 	return fmt.Sprintf("proxy connection failed (HTTP %d)", e.statusCode)
 }
 
-func mobileCloudMaterialConnectionError(err error, tlsHandshakeFailed bool) error {
+func mobileCloudMaterialConnectionError(err error, tlsHandshakeFailed bool) (string, error) {
 	if errors.Is(err, context.Canceled) {
-		return fmt.Errorf("mobile cloud material request canceled: %w", context.Canceled)
+		return "canceled", fmt.Errorf("mobile cloud material request canceled: %w", context.Canceled)
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("mobile cloud material request timed out: %w", context.DeadlineExceeded)
+		return "deadline_exceeded", fmt.Errorf("mobile cloud material request timed out: %w", context.DeadlineExceeded)
 	}
 	var proxyErr *mobileCloudMaterialProxyError
 	var opErr *net.OpError
 	prefix := "mobile cloud material upstream connection failed"
 	if errors.As(err, &proxyErr) {
-		return errors.New(prefix + ": " + proxyErr.Error())
+		return "proxy_error", errors.New(prefix + ": " + proxyErr.Error())
 	}
+	kind := "transport_error"
 	if errors.As(err, &opErr) && opErr.Op == "proxyconnect" {
+		kind = "proxy_error"
 		prefix += ": proxy connection failed"
 	}
 	var dnsErr *net.DNSError
@@ -68,25 +70,27 @@ func mobileCloudMaterialConnectionError(err error, tlsHandshakeFailed bool) erro
 	var alertErr tls.AlertError
 	switch {
 	case errors.As(err, &dnsErr):
-		return errors.New(prefix + ": DNS resolution failed")
+		return "dns_error", errors.New(prefix + ": DNS resolution failed")
 	case errors.As(err, &certificateErr), errors.As(err, &authorityErr), errors.As(err, &hostnameErr), errors.As(err, &invalidCertificateErr):
-		return errors.New(prefix + ": TLS certificate verification failed")
+		return "tls_certificate_error", errors.New(prefix + ": TLS certificate verification failed")
 	case errors.As(err, &recordErr), errors.As(err, &alertErr):
-		return errors.New(prefix + ": TLS handshake failed")
+		return "tls_handshake_error", errors.New(prefix + ": TLS handshake failed")
 	case errors.Is(err, syscall.ECONNRESET), runtime.GOOS == "windows" && errors.Is(err, syscall.Errno(10054)):
-		return errors.New(prefix + ": connection reset by peer")
-	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
-		return errors.New(prefix + ": connection closed before an HTTP response (EOF)")
+		return "connection_reset", errors.New(prefix + ": connection reset by peer")
+	case errors.Is(err, io.EOF):
+		return "eof", errors.New(prefix + ": connection closed before an HTTP response (EOF)")
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return "unexpected_eof", errors.New(prefix + ": connection closed before an HTTP response (EOF)")
 	}
 	for cause := err; cause != nil; cause = errors.Unwrap(cause) {
 		if timeoutErr, ok := cause.(net.Error); ok && timeoutErr.Timeout() {
-			return errors.New(prefix + ": connection timed out")
+			return "timeout", errors.New(prefix + ": connection timed out")
 		}
 	}
 	if tlsHandshakeFailed {
-		return errors.New(prefix + ": TLS handshake failed")
+		return "tls_handshake_error", errors.New(prefix + ": TLS handshake failed")
 	}
-	return errors.New(prefix)
+	return kind, errors.New(prefix)
 }
 
 type MobileCloudMaterialClient struct {
@@ -200,7 +204,7 @@ func (d *mobileCloudMaterialTrace) clientTrace() *httptrace.ClientTrace {
 	}
 }
 
-func (d *mobileCloudMaterialTrace) log(method, path, outcome string, status int) {
+func (d *mobileCloudMaterialTrace) log(method, host, path, outcome, errorKind string, status int) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	route := "unknown"
@@ -220,10 +224,10 @@ func (d *mobileCloudMaterialTrace) log(method, path, outcome string, status int)
 	} else if d.proxy == "enabled" {
 		peerRole = "proxy"
 	}
-	common.SysLog(fmt.Sprintf("mobile_cloud_material_request diagnostic_id=%s method=%s route=%q outcome=%s proxy=%s proxy_connect_status=%d dns=%s dns_done_after_ms=%d tcp=%s tcp_done_after_ms=%d peer_ip=%s peer_role=%s proxy_tls=%s proxy_tls_version=%s proxy_tls_done_after_ms=%d upstream_tls=%s upstream_tls_version=%s upstream_tls_done_after_ms=%d request_write=%s write_done_after_ms=%d first_byte_after_ms=%d http_status=%d elapsed_ms=%d %s",
+	common.SysLog(fmt.Sprintf("mobile_cloud_material_request diagnostic_id=%s method=%s route=%q outcome=%s proxy=%s proxy_connect_status=%d dns=%s dns_done_after_ms=%d tcp=%s tcp_done_after_ms=%d peer_ip=%s peer_role=%s proxy_tls=%s proxy_tls_version=%s proxy_tls_done_after_ms=%d upstream_tls=%s upstream_tls_version=%s upstream_tls_done_after_ms=%d request_write=%s write_done_after_ms=%d first_byte_after_ms=%d http_status=%d elapsed_ms=%d error_kind=%s target_host=%q go_version=%q goos=%s goarch=%s %s",
 		d.diagnosticID, method, route, outcome, d.proxy, d.proxyStatus, d.dns, d.dnsMS, d.tcp, d.tcpMS, d.peerIP, peerRole,
 		d.proxyTLS, strings.ReplaceAll(tls.VersionName(d.proxyTLSVersion), " ", ""), d.proxyTLSMS,
-		d.tls, strings.ReplaceAll(tls.VersionName(d.tlsVersion), " ", ""), d.tlsMS, d.requestWrite, d.writeMS, d.firstByteMS, status, time.Since(d.started).Milliseconds(), d.credentialInfo))
+		d.tls, strings.ReplaceAll(tls.VersionName(d.tlsVersion), " ", ""), d.tlsMS, d.requestWrite, d.writeMS, d.firstByteMS, status, time.Since(d.started).Milliseconds(), errorKind, host, runtime.Version(), runtime.GOOS, runtime.GOARCH, d.credentialInfo))
 }
 
 type MobileCloudCreateAssetInput struct {
@@ -403,8 +407,8 @@ func (c *MobileCloudMaterialClient) request(ctx context.Context, method, path st
 		credentialInfo: fmt.Sprintf("ak_masked=%q ak_bytes=%d sk_bytes=%d ak_trimmed=%t sk_trimmed=%t pool_bytes=%d pool_trimmed=%t signed_at=%s signature_method=HmacSHA256 signature_version=V2.0",
 			maskedAK, len(c.accessKey), len(c.secretKey), c.accessKey == strings.TrimSpace(c.accessKey), c.secretKey == strings.TrimSpace(c.secretKey), len(c.poolID), c.poolID == strings.TrimSpace(c.poolID), query.Get("Timestamp")),
 	}
-	outcome, status := "transport_error", 0
-	defer func() { trace.log(method, path, outcome, status) }()
+	outcome, status, errorKind := "transport_error", 0, "none"
+	defer func() { trace.log(method, target.Host, path, outcome, errorKind, status) }()
 	ctx = context.WithValue(req.Context(), mobileCloudMaterialTraceKey{}, trace)
 	req = req.WithContext(httptrace.WithClientTrace(ctx, trace.clientTrace()))
 	resp, err := c.httpClient.Do(req)
@@ -412,7 +416,8 @@ func (c *MobileCloudMaterialClient) request(ctx context.Context, method, path st
 		trace.mu.Lock()
 		tlsHandshakeFailed := trace.tls == "error" || trace.proxyTLS == "error"
 		trace.mu.Unlock()
-		return mobileCloudMaterialConnectionError(err, tlsHandshakeFailed)
+		errorKind, err = mobileCloudMaterialConnectionError(err, tlsHandshakeFailed)
+		return err
 	}
 	defer resp.Body.Close()
 	status = resp.StatusCode
@@ -420,6 +425,7 @@ func (c *MobileCloudMaterialClient) request(ctx context.Context, method, path st
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		outcome = "response_read_error"
+		errorKind, _ = mobileCloudMaterialConnectionError(err, false)
 		if errors.Is(err, context.Canceled) {
 			return fmt.Errorf("mobile cloud material response canceled: %w", context.Canceled)
 		}
@@ -428,7 +434,7 @@ func (c *MobileCloudMaterialClient) request(ctx context.Context, method, path st
 		}
 		return errors.New("mobile cloud material upstream response could not be read")
 	}
-	outcome = "invalid_response"
+	outcome, errorKind = "invalid_response", "invalid_response"
 	if len(data) > maxResponseBytes {
 		return errors.New("mobile cloud material upstream response exceeds size limit")
 	}
@@ -440,7 +446,7 @@ func (c *MobileCloudMaterialClient) request(ctx context.Context, method, path st
 	decodeErr := common.Unmarshal(data, &envelope)
 	httpFailed := resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices
 	if httpFailed || decodeErr == nil && envelope.State != "OK" {
-		outcome = "upstream_rejected"
+		outcome, errorKind = "upstream_rejected", "upstream_rejected"
 		message := "mobile cloud material upstream rejected the request"
 		if httpFailed {
 			message = fmt.Sprintf("mobile cloud material upstream HTTP status %d", resp.StatusCode)
@@ -473,7 +479,7 @@ func (c *MobileCloudMaterialClient) request(ctx context.Context, method, path st
 	if err := common.Unmarshal(envelope.Body, output); err != nil {
 		return errors.New("mobile cloud material upstream response body is invalid")
 	}
-	outcome = "completed"
+	outcome, errorKind = "completed", "none"
 	return nil
 }
 
