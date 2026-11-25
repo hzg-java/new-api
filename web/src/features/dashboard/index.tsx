@@ -211,7 +211,7 @@ export function Dashboard() {
       const granularity = getSavedGranularity()
       return {
         timeGranularity: granularity,
-        selectedRange: getDefaultDays(granularity),
+        selectedRange: getDefaultDays(),
         topUserLimit: 10,
       }
     }

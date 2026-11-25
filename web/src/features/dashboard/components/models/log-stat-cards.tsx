@@ -26,6 +26,7 @@ import { useModelStatCardsConfig } from '@/features/dashboard/hooks/use-dashboar
 import {
   buildQueryParams,
   calculateDashboardStats,
+  getDashboardDateRange,
   getDefaultDays,
 } from '@/features/dashboard/lib'
 import type {
@@ -83,10 +84,11 @@ export function LogStatCards(props: LogStatCardsProps) {
     setError(false)
     onDataUpdate?.([], true)
 
+    const defaults = getDashboardDateRange(getDefaultDays())
     const timeRange = computeTimeRange(
-      getDefaultDays(filters?.time_granularity),
-      filters?.start_timestamp,
-      filters?.end_timestamp
+      1,
+      filters?.start_timestamp ?? defaults.start,
+      filters?.end_timestamp ?? defaults.end
     )
     const timeDiff = (timeRange.end_timestamp - timeRange.start_timestamp) / 60
     setTimeRangeMinutes(timeDiff)

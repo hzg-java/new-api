@@ -68,6 +68,7 @@ import {
   flowNodeFilterFromSankeyDatum,
   flowSankeyDatumValue,
   getDefaultDays,
+  getDashboardDateRange,
   getFlowStages,
 } from '@/features/dashboard/lib'
 import {
@@ -312,19 +313,14 @@ export function FlowCharts(props: FlowChartsProps) {
     })
   }
 
-  const timeRange = useMemo(
-    () =>
-      computeTimeRange(
-        getDefaultDays(props.filters?.time_granularity),
-        props.filters?.start_timestamp,
-        props.filters?.end_timestamp
-      ),
-    [
-      props.filters?.end_timestamp,
-      props.filters?.start_timestamp,
-      props.filters?.time_granularity,
-    ]
-  )
+  const timeRange = useMemo(() => {
+    const defaults = getDashboardDateRange(getDefaultDays())
+    return computeTimeRange(
+      1,
+      props.filters?.start_timestamp ?? defaults.start,
+      props.filters?.end_timestamp ?? defaults.end
+    )
+  }, [props.filters?.end_timestamp, props.filters?.start_timestamp])
   const flowQueryParams = useMemo(
     () => buildQueryParams(timeRange, props.filters),
     [props.filters, timeRange]
