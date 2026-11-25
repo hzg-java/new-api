@@ -751,11 +751,9 @@ func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelNa
 		return stat, nil, errors.New("查询统计数据失败")
 	}
 	for _, log := range rows {
-		if log.Type == LogTypeConsume {
-			stat.TotalTokens += int64(log.PromptTokens) + int64(log.CompletionTokens)
-		}
 		if log.Other == "" {
 			stat.Quota += log.Quota
+			stat.TotalTokens += int64(log.PromptTokens) + int64(log.CompletionTokens)
 		} else {
 			logs = append(logs, log)
 		}

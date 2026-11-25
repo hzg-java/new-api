@@ -183,7 +183,8 @@ func projectVideoTaskLogs(logs []*model.Log, consolidate bool) ([]*model.Log, er
 		if consolidate {
 			log.Type = model.LogTypeConsume
 		}
-		if log.PromptTokens == 0 && log.CompletionTokens == 0 && info.ConsumedTokens != nil {
+		if info.ConsumedTokens != nil && (consolidate || log.PromptTokens == 0 && log.CompletionTokens == 0) {
+			log.PromptTokens = 0
 			log.CompletionTokens = *info.ConsumedTokens
 			var response struct {
 				Usage struct {
@@ -356,6 +357,7 @@ func getLogStatistics(logType int, startTimestamp, endTimestamp int64, modelName
 		if log.Type != model.LogTypeConsume {
 			continue
 		}
+		stat.TotalTokens += int64(log.PromptTokens) + int64(log.CompletionTokens)
 		var other struct {
 			Pending bool `json:"task_billing_pending"`
 		}

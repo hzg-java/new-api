@@ -196,3 +196,147 @@ func TestLogStatsUseFinalVideoCosts(t *testing.T) {
 	require.NoError(t, model.LOG_DB.Order("id").Find(&after).Error)
 	assert.Equal(t, before, after)
 }
+
+func TestLogStatsIncludeActualVideoTokensOnce(t *testing.T) {
+	if os.Getenv("MATERIAL_TEST_POSTGRES") == "1" {
+		db := setupMaterialConcurrentPostgres(t)
+		previousLogDB := model.LOG_DB
+		model.LOG_DB = db
+		t.Cleanup(func() { model.LOG_DB = previousLogDB })
+		require.NoError(t, db.AutoMigrate(&model.Task{}, &model.Log{}))
+	} else {
+		db := setupManageUserTestDB(t)
+		require.NoError(t, db.AutoMigrate(&model.Task{}))
+	}
+	now := time.Now().Unix()
+	for _, tc := range []struct {
+		id, data string
+		status   model.TaskStatus
+	}{
+		{"total", `{"usage":{"total_tokens":120,"completion_tokens":90}}`, model.TaskStatusSuccess},
+		{"refund", `{"usage":{"total_tokens":80,"completion_tokens":60}}`, model.TaskStatusSuccess},
+		{"completion-only", `{"usage":{"completion_tokens":50}}`, model.TaskStatusSuccess},
+		{"zero", `{"usage":{"total_tokens":0,"completion_tokens":0}}`, model.TaskStatusSuccess},
+		{"unsettled", `{"usage":{"total_tokens":30}}`, model.TaskStatusSuccess},
+		{"adjustment-failed", `{"usage":{"total_tokens":40}}`, model.TaskStatusSuccess},
+		{"legacy", `{"usage":{"total_tokens":60}}`, model.TaskStatusSuccess},
+		{"running", `{"usage":{"total_tokens":900}}`, model.TaskStatusInProgress},
+		{"failed", `{"usage":{"total_tokens":800}}`, model.TaskStatusFailure},
+		{"missing-usage", `{}`, model.TaskStatusSuccess},
+		{"invalid-usage", `{"usage":{"total_tokens":-1}}`, model.TaskStatusSuccess},
+	} {
+		task := model.Task{
+			TaskID: tc.id, UserId: 7, Action: constant.TaskActionTextToVideo, Status: tc.status,
+			Quota: 10, Data: []byte(tc.data),
+			PrivateData: model.TaskPrivateData{BillingAdjustmentFailed: tc.id == "adjustment-failed"},
+		}
+		if tc.id != "unsettled" && tc.id != "legacy" {
+			task.PrivateData.SettledQuota = &task.Quota
+		}
+		require.NoError(t, model.DB.Create(&task).Error)
+		other, err := common.Marshal(map[string]any{"task_id": tc.id, "usage_facts": map[string]int{"tokens": 999}})
+		require.NoError(t, err)
+		log := model.Log{
+			UserId: 7, Username: "owner", Type: model.LogTypeConsume, CreatedAt: now - 3600,
+			ModelName: "video-model", TokenName: "video-key", RequestId: tc.id, Quota: 10, Other: string(other),
+		}
+		if tc.id == "total" || tc.id == "zero" {
+			log.PromptTokens, log.CompletionTokens = 5, 6
+		}
+		require.NoError(t, model.LOG_DB.Create(&log).Error)
+	}
+	quota := 10
+	require.NoError(t, model.DB.Create(&model.Task{
+		TaskID: "total", UserId: 8, Action: constant.TaskActionTextToVideo, Status: model.TaskStatusSuccess,
+		Quota: quota, PrivateData: model.TaskPrivateData{SettledQuota: &quota}, Data: []byte(`{"usage":{"total_tokens":300}}`),
+	}).Error)
+	require.NoError(t, model.DB.Create(&model.Task{
+		TaskID: "image", UserId: 7, Action: "text_to_image", Status: model.TaskStatusSuccess,
+		Data: []byte(`{"usage":{"total_tokens":999}}`),
+	}).Error)
+	logs := []model.Log{
+		{UserId: 7, Username: "owner", Type: model.LogTypeConsume, CreatedAt: now - 10, ModelName: "video-model", TokenName: "video-key", PromptTokens: 5, CompletionTokens: 6, Other: `{"task_id":"total","actual_quota":10,"pre_consumed_quota":5}`},
+		{UserId: 7, Username: "owner", Type: model.LogTypeRefund, CreatedAt: now - 10, ModelName: "video-model", TokenName: "video-key", Other: `{"task_id":"refund","actual_quota":10,"pre_consumed_quota":20}`},
+		{UserId: 7, Username: "owner", Type: model.LogTypeConsume, CreatedAt: now - 10, ModelName: "video-model", TokenName: "video-key", Other: `{"task_id":"completion-only","actual_quota":10,"pre_consumed_quota":5}`},
+		{UserId: 8, Username: "another", Type: model.LogTypeConsume, CreatedAt: now - 10, ModelName: "video-model", TokenName: "video-key", RequestId: "total", Other: `{"task_id":"total"}`},
+		{UserId: 7, Username: "owner", Type: model.LogTypeConsume, CreatedAt: now - 10, ModelName: "text-model", PromptTokens: 10, CompletionTokens: 5},
+		{UserId: 7, Username: "owner", Type: model.LogTypeConsume, CreatedAt: now - 10, ModelName: "image-model", RequestId: "image", PromptTokens: 7, CompletionTokens: 3, Other: `{"task_id":"image"}`},
+		{UserId: 7, Username: "owner", Type: model.LogTypeConsume, CreatedAt: now - 10, ModelName: "text-model", RequestId: "orphan", PromptTokens: 3, CompletionTokens: 2, Other: `{"task_id":"orphan"}`},
+	}
+	require.NoError(t, model.LOG_DB.Create(&logs).Error)
+	var beforeLogs []model.Log
+	var beforeTasks []model.Task
+	require.NoError(t, model.LOG_DB.Order("id").Find(&beforeLogs).Error)
+	require.NoError(t, model.DB.Order("id").Find(&beforeTasks).Error)
+	for _, self := range []bool{false, true} {
+		for _, tc := range []struct {
+			name, query string
+			tokens      int64
+		}{
+			{"all", "", 410},
+			{"consume", "&type=2", 410},
+			{"refund-type", "&type=6", 0},
+			{"model", "&model_name=video-model", 380},
+			{"token", "&token_name=video-key", 380},
+			{"total", "&request_id=total", 120},
+			{"refund", "&request_id=refund", 80},
+			{"completion-only", "&request_id=completion-only", 50},
+			{"zero", "&request_id=zero", 0},
+			{"unsettled", "&request_id=unsettled", 30},
+			{"adjustment-failed", "&request_id=adjustment-failed", 40},
+			{"legacy", "&request_id=legacy", 60},
+			{"running", "&request_id=running", 0},
+			{"failed", "&request_id=failed", 0},
+			{"missing-usage", "&request_id=missing-usage", 0},
+			{"invalid-usage", "&request_id=invalid-usage", 0},
+			{"image", "&request_id=image", 10},
+			{"orphan", "&request_id=orphan", 5},
+			{"missing", "&request_id=missing", 0},
+			{"recent-settlement", "&model_name=video-model&start_timestamp=" + strconv.FormatInt(now-50, 10), 250},
+			{"recent-consume", "&model_name=video-model&type=2&start_timestamp=" + strconv.FormatInt(now-50, 10), 170},
+			{"creation-window", "&request_id=total&end_timestamp=" + strconv.FormatInt(now-100, 10), 120},
+			{"other-owner", "&username=another&model_name=video-model", 300},
+		} {
+			t.Run(tc.name+map[bool]string{false: "/admin", true: "/self"}[self], func(t *testing.T) {
+				query, err := url.ParseQuery(tc.query)
+				require.NoError(t, err)
+				if !query.Has("username") {
+					query.Set("username", "owner")
+				}
+				if !query.Has("start_timestamp") {
+					query.Set("start_timestamp", strconv.FormatInt(now-4000, 10))
+				}
+				if !query.Has("end_timestamp") {
+					query.Set("end_timestamp", strconv.FormatInt(now+1, 10))
+				}
+				query.Set("p", "3")
+				query.Set("page_size", "1")
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				c.Request = httptest.NewRequest("GET", "/?"+query.Encode(), nil)
+				c.Set("username", query.Get("username"))
+				if self {
+					GetLogsSelfStat(c)
+				} else {
+					GetLogsStat(c)
+				}
+				var response struct {
+					Success bool       `json:"success"`
+					Data    model.Stat `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+				require.True(t, response.Success, recorder.Body.String())
+				assert.Equal(t, tc.tokens, response.Data.TotalTokens)
+			})
+		}
+	}
+	stat, err := getLogStatistics(model.LogTypeUnknown, now-4000, now+1, "", "", "", 0, "", "")
+	require.NoError(t, err)
+	assert.EqualValues(t, 710, stat.TotalTokens)
+	var afterLogs []model.Log
+	var afterTasks []model.Task
+	require.NoError(t, model.LOG_DB.Order("id").Find(&afterLogs).Error)
+	require.NoError(t, model.DB.Order("id").Find(&afterTasks).Error)
+	assert.Equal(t, beforeLogs, afterLogs)
+	assert.Equal(t, beforeTasks, afterTasks)
+}
